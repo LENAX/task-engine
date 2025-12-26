@@ -1,19 +1,6 @@
-# 量化任务引擎配置
-mode: "dev"        # 运行模式：dev/test/prod
-http_port: 8080    # HTTP服务端口
-database:
-  type: "sqlite"   # 数据库类型：sqlite/mysql/postgres
-  path: "./data.db" # SQLite路径
-  host: "localhost"
-  port: 3306
-  user: "root"
-  password: "123456"
-  dbname: "quant_task"
 engine:
-  max_concurrency: 100 # 最大并发任务数
-  timeout: 30s         # 任务超时时间
-  breakpoint: true     # 是否开启断点恢复
-plugin:
-  builtin:
-    email_alert: true
-    sms_alert: false
+  max_concurrency: 100
+  timeout_seconds: 30
+storage:
+  type: "sqlite"
+  dsn: "./data.db"
