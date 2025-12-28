@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"time"
@@ -22,26 +23,33 @@ const (
 )
 
 type Task struct {
-	ID          string
-	Name        string
-	Description string
-	Params      map[string]string
-	CreateTime  time.Time
-	Status      string
-	JobFuncID   string // Job函数ID（通过Registry获取函数实例）
+	ID             string
+	Name           string
+	Description    string
+	Params         map[string]string
+	CreateTime     time.Time
+	Status         string
+	JobFuncID      string   // Job函数ID（通过Registry获取函数实例）
+	JobFuncName    string   // Job函数名称（用于快速查找和依赖构建）
+	TimeoutSeconds int      // 超时时间（秒，默认30秒）
+	RetryCount     int      // 重试次数（默认0次，即不重试）
+	Dependencies   []string // 依赖的前置Task名称列表
 }
 
 // NewTask 创建Task实例（对外导出）
 // jobFuncName: 已注册的Job函数名称（用于从数据库加载的场景）
 func NewTask(name, desc, jobFuncID string) *Task {
 	return &Task{
-		ID:          uuid.NewString(),
-		Name:        name,
-		Description: desc,
-		Status:      TaskStatusEnabled,
-		CreateTime:  time.Now(),
-		Params:      make(map[string]string),
-		JobFuncID:   jobFuncID,
+		ID:             uuid.NewString(),
+		Name:           name,
+		Description:    desc,
+		Status:         TaskStatusPending,
+		CreateTime:     time.Now(),
+		Params:         make(map[string]string),
+		JobFuncID:      jobFuncID,
+		TimeoutSeconds: 30, // 默认30秒
+		RetryCount:     0,  // 默认0次，即不重试
+		Dependencies:   make([]string, 0),
 	}
 }
 
@@ -75,13 +83,17 @@ func NewTaskWithFunction(ctx context.Context, name, desc string, jobFunc interfa
 	}
 
 	return &Task{
-		ID:          uuid.NewString(),
-		Name:        name,
-		Description: desc,
-		Status:      TaskStatusEnabled,
-		CreateTime:  time.Now(),
-		Params:      make(map[string]string),
-		JobFuncID:   funcID,
+		ID:             uuid.NewString(),
+		Name:           name,
+		Description:    desc,
+		Status:         TaskStatusPending,
+		CreateTime:     time.Now(),
+		Params:         make(map[string]string),
+		JobFuncID:      funcID,
+		JobFuncName:    funcName,
+		TimeoutSeconds: 30, // 默认30秒
+		RetryCount:     0,  // 默认0次，即不重试
+		Dependencies:   make([]string, 0),
 	}, nil
 }
 
@@ -102,4 +114,81 @@ func (t *Task) GetJobFunction(registry *JobFunctionRegistry) JobFunctionType {
 		return nil
 	}
 	return registry.Get(t.JobFuncID)
+}
+
+// GetID 获取Task的唯一标识（对外导出）
+func (t *Task) GetID() string {
+	return t.ID
+}
+
+// GetName 获取Task的名称（对外导出）
+func (t *Task) GetName() string {
+	return t.Name
+}
+
+// GetJobFuncName 获取Task绑定的Job函数名称（对外导出）
+func (t *Task) GetJobFuncName() string {
+	return t.JobFuncName
+}
+
+// GetParams 获取Task的执行参数（对外导出）
+// 返回map[string]interface{}以兼容设计文档要求
+func (t *Task) GetParams() map[string]interface{} {
+	if t.Params == nil {
+		return make(map[string]interface{})
+	}
+	// 将map[string]string转换为map[string]interface{}
+	result := make(map[string]interface{})
+	for k, v := range t.Params {
+		result[k] = v
+	}
+	return result
+}
+
+// UpdateParams 运行时更新Task的执行参数（对外导出）
+// 接受map[string]interface{}，内部转换为map[string]string
+func (t *Task) UpdateParams(newParams map[string]interface{}) error {
+	if newParams == nil {
+		return fmt.Errorf("参数不能为空")
+	}
+	if t.Params == nil {
+		t.Params = make(map[string]string)
+	}
+	// 将map[string]interface{}转换为map[string]string
+	for k, v := range newParams {
+		// 将值转换为字符串
+		var strValue string
+		switch val := v.(type) {
+		case string:
+			strValue = val
+		case nil:
+			strValue = ""
+		default:
+			// 对于其他类型，使用JSON序列化
+			jsonBytes, err := json.Marshal(val)
+			if err != nil {
+				return fmt.Errorf("参数 %s 序列化失败: %w", k, err)
+			}
+			strValue = string(jsonBytes)
+		}
+		t.Params[k] = strValue
+	}
+	return nil
+}
+
+// GetStatus 获取Task当前的执行状态（对外导出）
+func (t *Task) GetStatus() string {
+	return t.Status
+}
+
+// GetDependencies 获取Task的依赖列表（对外导出）
+// 返回依赖的前置Task名称列表
+func (t *Task) GetDependencies() []string {
+	if t.Dependencies == nil {
+		return make([]string, 0)
+	}
+	// 返回副本，避免外部修改
+	result := make([]string, len(t.Dependencies))
+	copy(result, t.Dependencies)
+	return result
 }
