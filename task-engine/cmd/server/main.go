@@ -12,7 +12,10 @@ import (
 
 func main() {
 	// 1. 创建存储接口实例（内部实现，对外仅依赖接口）
-	repo := sqlite.NewWorkflowRepo()
+	repo, err := sqlite.NewWorkflowRepo("./data.db")
+	if err != nil {
+		log.Fatal("创建存储失败:", err)
+	}
 
 	// 2. 创建引擎（调用对外核心组件）
 	eng, err := engine.NewEngine(100, 30, repo)
@@ -27,9 +30,12 @@ func main() {
 	defer eng.Stop()
 
 	// 4. 构建Workflow（调用对外Builder）
-	wf := builder.NewWorkflowBuilder("测试任务", "极简结构测试").
+	wf, err := builder.NewWorkflowBuilder("测试任务", "极简结构测试").
 		WithParams(map[string]string{"key": "value"}).
 		Build()
+	if err != nil {
+		log.Fatal("构建Workflow失败:", err)
+	}
 
 	// 5. 注册Workflow
 	if err := eng.RegisterWorkflow(context.Background(), wf); err != nil {

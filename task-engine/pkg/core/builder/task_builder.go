@@ -9,10 +9,10 @@ import (
 
 // TaskBuilder Task构建器（对外导出）
 type TaskBuilder struct {
-	name          string
-	description   string
-	jobFuncName   string
-	params        map[string]interface{}
+	name           string
+	description    string
+	jobFuncName    string
+	params         map[string]interface{}
 	timeoutSeconds int
 	retryCount     int
 	dependencies   []string
@@ -24,7 +24,7 @@ func NewTaskBuilder(name, description string) *TaskBuilder {
 		name:           name,
 		description:    description,
 		timeoutSeconds: 30, // 默认30秒
-		retryCount:     0,   // 默认0次，即不重试
+		retryCount:     0,  // 默认0次，即不重试
 		dependencies:   make([]string, 0),
 		params:         make(map[string]interface{}),
 	}
@@ -114,11 +114,11 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 
 	// 创建Task实例
 	t := &task.Task{
-		ID:            uuid.NewString(),
-		Name:          b.name,
-		Description:   b.description,
-		Status:        task.TaskStatusPending,
-		JobFuncName:   b.jobFuncName,
+		ID:             uuid.NewString(),
+		Name:           b.name,
+		Description:    b.description,
+		Status:         task.TaskStatusPending,
+		JobFuncName:    b.jobFuncName,
 		TimeoutSeconds: b.timeoutSeconds,
 		RetryCount:     b.retryCount,
 		Dependencies:   make([]string, len(b.dependencies)),
@@ -145,4 +145,3 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 
 	return t, nil
 }
-
