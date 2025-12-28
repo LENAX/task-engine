@@ -23,16 +23,16 @@ const (
 )
 
 type Task struct {
-	ID            string
-	Name          string
-	Description   string
-	Params        map[string]string
-	CreateTime    time.Time
-	Status        string
-	JobFuncID     string   // Job函数ID（通过Registry获取函数实例）
-	JobFuncName   string   // Job函数名称（用于快速查找和依赖构建）
-	TimeoutSeconds int     // 超时时间（秒，默认30秒）
-	RetryCount     int     // 重试次数（默认0次，即不重试）
+	ID             string
+	Name           string
+	Description    string
+	Params         map[string]string
+	CreateTime     time.Time
+	Status         string
+	JobFuncID      string   // Job函数ID（通过Registry获取函数实例）
+	JobFuncName    string   // Job函数名称（用于快速查找和依赖构建）
+	TimeoutSeconds int      // 超时时间（秒，默认30秒）
+	RetryCount     int      // 重试次数（默认0次，即不重试）
 	Dependencies   []string // 依赖的前置Task名称列表
 }
 
@@ -40,16 +40,16 @@ type Task struct {
 // jobFuncName: 已注册的Job函数名称（用于从数据库加载的场景）
 func NewTask(name, desc, jobFuncID string) *Task {
 	return &Task{
-		ID:            uuid.NewString(),
-		Name:          name,
-		Description:   desc,
-		Status:        TaskStatusPending,
-		CreateTime:    time.Now(),
-		Params:        make(map[string]string),
-		JobFuncID:     jobFuncID,
+		ID:             uuid.NewString(),
+		Name:           name,
+		Description:    desc,
+		Status:         TaskStatusPending,
+		CreateTime:     time.Now(),
+		Params:         make(map[string]string),
+		JobFuncID:      jobFuncID,
 		TimeoutSeconds: 30, // 默认30秒
-		RetryCount:    0,   // 默认0次，即不重试
-		Dependencies:  make([]string, 0),
+		RetryCount:     0,  // 默认0次，即不重试
+		Dependencies:   make([]string, 0),
 	}
 }
 
@@ -83,17 +83,17 @@ func NewTaskWithFunction(ctx context.Context, name, desc string, jobFunc interfa
 	}
 
 	return &Task{
-		ID:            uuid.NewString(),
-		Name:          name,
-		Description:   desc,
-		Status:        TaskStatusPending,
-		CreateTime:    time.Now(),
-		Params:        make(map[string]string),
-		JobFuncID:     funcID,
-		JobFuncName:   funcName,
+		ID:             uuid.NewString(),
+		Name:           name,
+		Description:    desc,
+		Status:         TaskStatusPending,
+		CreateTime:     time.Now(),
+		Params:         make(map[string]string),
+		JobFuncID:      funcID,
+		JobFuncName:    funcName,
 		TimeoutSeconds: 30, // 默认30秒
-		RetryCount:    0,   // 默认0次，即不重试
-		Dependencies:  make([]string, 0),
+		RetryCount:     0,  // 默认0次，即不重试
+		Dependencies:   make([]string, 0),
 	}, nil
 }
 

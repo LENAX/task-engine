@@ -17,36 +17,42 @@ type Task interface {
 	GetDependencies() []string
 }
 
+// TaskInfo 定义Task信息接口（用于DAG构建，避免循环依赖）
+type TaskInfo interface {
+	GetID() string
+	GetName() string
+}
+
 // Workflow Workflow核心结构体（对外导出）
 type Workflow struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Params      map[string]string `json:"params"`
-	CreateTime  time.Time         `json:"create_time"`
-	Status      string            `json:"status"` // ENABLED/DISABLED
-	Tasks       map[string]Task   `json:"tasks"` // Task ID -> Task映射
-	Dependencies map[string][]string  `json:"dependencies"` // 后置Task ID -> 前置Task ID列表
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	Description  string              `json:"description"`
+	Params       map[string]string   `json:"params"`
+	CreateTime   time.Time           `json:"create_time"`
+	Status       string              `json:"status"`       // ENABLED/DISABLED
+	Tasks        map[string]Task     `json:"tasks"`        // Task ID -> Task映射
+	Dependencies map[string][]string `json:"dependencies"` // 后置Task ID -> 前置Task ID列表
 }
 
 // WorkflowInstance Workflow实例（对外导出）
 type WorkflowInstance struct {
-    ID         string    `json:"instance_id"`
-    WorkflowID string    `json:"workflow_id"`
-    Status     string    `json:"status"` // RUNNING/SUCCESS/FAILED
-    StartTime  time.Time `json:"start_time"`
-    EndTime    time.Time `json:"end_time"`
+	ID         string    `json:"instance_id"`
+	WorkflowID string    `json:"workflow_id"`
+	Status     string    `json:"status"` // RUNNING/SUCCESS/FAILED
+	StartTime  time.Time `json:"start_time"`
+	EndTime    time.Time `json:"end_time"`
 }
 
 // NewWorkflow 创建Workflow实例（对外导出）
 func NewWorkflow(name, desc string) *Workflow {
 	return &Workflow{
-		ID:          uuid.NewString(),
-		Name:        name,
-		Description: desc,
-		Status:      "ENABLED",
-		CreateTime:  time.Now(),
-		Tasks:       make(map[string]Task),
+		ID:           uuid.NewString(),
+		Name:         name,
+		Description:  desc,
+		Status:       "ENABLED",
+		CreateTime:   time.Now(),
+		Tasks:        make(map[string]Task),
 		Dependencies: make(map[string][]string),
 	}
 }
@@ -130,7 +136,7 @@ func (w *Workflow) AddSubTask(subTask Task, parentTaskID string) error {
 
 	// 获取子Task的依赖列表（注意：这里需要Task接口支持更新依赖，但接口不能修改，所以依赖关系通过Dependencies字段管理）
 	subTaskDeps := subTask.GetDependencies()
-	
+
 	// 检查是否已存在该依赖（通过Task名称）
 	found := false
 	for _, dep := range subTaskDeps {

@@ -121,6 +121,30 @@ func TestWorkflowBuilder_EmptyWorkflow(t *testing.T) {
 	}
 }
 
+func TestWorkflowBuilder_CycleDependency(t *testing.T) {
+	builder := NewWorkflowBuilder("workflow", "描述")
+
+	// 创建循环依赖：task1 -> task2 -> task1
+	task1, _ := NewTaskBuilder("task1", "任务1").
+		WithJobFunction("func1", nil).
+		WithDependency("task2"). // task1依赖task2
+		Build()
+
+	task2, _ := NewTaskBuilder("task2", "任务2").
+		WithJobFunction("func2", nil).
+		WithDependency("task1"). // task2依赖task1，形成循环
+		Build()
+
+	_, err := builder.
+		WithTask(task1).
+		WithTask(task2).
+		Build()
+
+	if err == nil {
+		t.Fatal("期望返回错误（循环依赖），但未返回")
+	}
+}
+
 func TestWorkflowBuilder_ComplexDependencies(t *testing.T) {
 	builder := NewWorkflowBuilder("workflow", "描述")
 	

@@ -3,6 +3,7 @@ package builder
 import (
 	"fmt"
 
+	"github.com/stevelan1995/task-engine/pkg/core/dag"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
@@ -102,7 +103,18 @@ func (b *WorkflowBuilder) Build() (*workflow.Workflow, error) {
 		b.wf.Dependencies[t.ID] = depIDs
 	}
 
-	// 4. 校验Workflow合法性
+	// 4. 构建DAG并检测循环依赖
+	dagInstance, err := dag.BuildDAG(b.wf.Tasks, b.wf.Dependencies)
+	if err != nil {
+		return nil, fmt.Errorf("构建DAG失败: %w", err)
+	}
+
+	// 检测循环依赖
+	if err := dagInstance.DetectCycle(); err != nil {
+		return nil, fmt.Errorf("检测到循环依赖: %w", err)
+	}
+
+	// 5. 校验Workflow合法性
 	if err := b.wf.Validate(); err != nil {
 		return nil, fmt.Errorf("Workflow校验失败: %w", err)
 	}
