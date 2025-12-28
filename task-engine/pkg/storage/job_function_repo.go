@@ -7,13 +7,12 @@ import (
 
 // JobFunctionMeta Job函数元数据（对外导出）
 type JobFunctionMeta struct {
-	ID          string            // 函数唯一标识（UUID）
-	Name        string            // 函数名称（唯一）
-	Description string            // 函数描述
-	ParamTypes  map[string]string // 参数类型映射（参数索引 -> 类型名，如 "arg0" -> "string"）
-	ReturnType  string            // 返回值类型（如果有返回值）
-	CreateTime  time.Time         // 创建时间
-	UpdateTime  time.Time         // 更新时间
+	ID          string    // 函数唯一标识（UUID）
+	Name        string    // 函数名称（唯一）
+	Description string    // 函数描述
+	CreateTime  time.Time // 创建时间
+	UpdateTime  time.Time // 更新时间
+	// 注意：不再存储ParamTypes和ReturnType，运行时从函数实例通过反射获取
 }
 
 // JobFunctionRepository Job函数元数据存储接口（对外导出）

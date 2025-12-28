@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"time"
 
@@ -87,21 +86,5 @@ func (r *jobFunctionRepo) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
-// 辅助函数：序列化ParamTypes为JSON（用于真实数据库存储）
-func serializeParamTypes(types map[string]string) (string, error) {
-	data, err := json.Marshal(types)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-// 辅助函数：反序列化ParamTypes（用于真实数据库加载）
-func deserializeParamTypes(data string) (map[string]string, error) {
-	var types map[string]string
-	if err := json.Unmarshal([]byte(data), &types); err != nil {
-		return nil, err
-	}
-	return types, nil
-}
+// 注意：不再需要序列化/反序列化ParamTypes，因为元数据中已移除该字段
 

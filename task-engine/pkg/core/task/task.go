@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,10 +58,20 @@ func NewTaskWithFunction(ctx context.Context, name, desc string, jobFunc interfa
 		return nil, fmt.Errorf("registry不能为空")
 	}
 
-	// 自动注册函数
-	funcID, err := registry.Register(ctx, funcName, jobFunc, funcDesc)
-	if err != nil {
-		return nil, fmt.Errorf("注册函数失败: %w", err)
+	// 如果函数名称为空，自动生成
+	if funcName == "" {
+		funcName = generateFunctionName(jobFunc)
+	}
+
+	// 检查函数是否已注册（通过名称）
+	funcID := registry.GetIDByName(funcName)
+	if funcID == "" {
+		// 函数未注册，自动注册
+		var err error
+		funcID, err = registry.Register(ctx, funcName, jobFunc, funcDesc)
+		if err != nil {
+			return nil, fmt.Errorf("自动注册函数失败: %w", err)
+		}
 	}
 
 	return &Task{
@@ -72,6 +83,16 @@ func NewTaskWithFunction(ctx context.Context, name, desc string, jobFunc interfa
 		Params:      make(map[string]string),
 		JobFuncID:   funcID,
 	}, nil
+}
+
+// generateFunctionName 自动生成函数名称（基于函数类型）
+func generateFunctionName(fn interface{}) string {
+	fnType := reflect.TypeOf(fn)
+	if fnType.Kind() != reflect.Func {
+		return "unknown"
+	}
+	// 使用函数类型的字符串表示作为名称（简化版）
+	return fmt.Sprintf("func_%p", fn)
 }
 
 // GetJobFunction 从Registry获取Job函数（对外导出）

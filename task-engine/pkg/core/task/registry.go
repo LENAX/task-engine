@@ -203,46 +203,86 @@ func (r *JobFunctionRegistry) RestoreFromDB(ctx context.Context) ([]*storage.Job
 	return metas, nil
 }
 
-// generateFunctionName 自动生成函数名称（基于函数类型）
-func generateFunctionName(fn interface{}) string {
-	fnType := reflect.TypeOf(fn)
-	if fnType.Kind() != reflect.Func {
-		return "unknown"
-	}
-	// 使用函数类型的字符串表示作为名称（简化版）
-	return fmt.Sprintf("func_%p", fn)
+// JobFunctionDef 函数定义，用于批量注册
+type JobFunctionDef struct {
+	Name        string      // 函数名称
+	Description string      // 函数描述
+	Function    interface{} // 函数实例
 }
 
+// RegisterBatch 批量注册函数（对外导出）
+func (r *JobFunctionRegistry) RegisterBatch(ctx context.Context, functions []JobFunctionDef) error {
+	for _, def := range functions {
+		_, err := r.Register(ctx, def.Name, def.Function, def.Description)
+		if err != nil {
+			return fmt.Errorf("注册函数 %s 失败: %w", def.Name, err)
+		}
+	}
+	return nil
+}
+
+// RestoreFunctions 从数据库恢复函数元数据，并通过函数映射表恢复函数实例（对外导出）
+// funcMap: 函数名称 -> 函数实例的映射
+func (r *JobFunctionRegistry) RestoreFunctions(ctx context.Context, funcMap map[string]interface{}) error {
+	if r.repo == nil {
+		return fmt.Errorf("未配置存储仓库，无法恢复")
+	}
+
+	// 从数据库加载所有函数元数据
+	metas, err := r.repo.ListAll(ctx)
+	if err != nil {
+		return fmt.Errorf("从数据库加载函数元数据失败: %w", err)
+	}
+
+	// 恢复函数实例
+	for _, meta := range metas {
+		fn, exists := funcMap[meta.Name]
+		if !exists {
+			// 函数实例不存在，只加载元数据
+			r.mu.Lock()
+			r.metaMap[meta.ID] = meta
+			r.mu.Unlock()
+			continue
+		}
+
+		// 加载函数实例
+		if err := r.LoadFunction(ctx, meta.ID, fn); err != nil {
+			return fmt.Errorf("恢复函数 %s 失败: %w", meta.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// GetIDByName 根据函数名称获取函数ID（对外导出）
+func (r *JobFunctionRegistry) GetIDByName(name string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for id, meta := range r.metaMap {
+		if meta.Name == name {
+			return id
+		}
+	}
+	return ""
+}
+
+
 // extractFunctionMeta 提取函数元数据
+// 注意：不再提取参数类型和返回值类型，这些信息在运行时从函数实例通过反射获取
 func extractFunctionMeta(fn interface{}, name, description string) (*storage.JobFunctionMeta, error) {
 	fnType := reflect.TypeOf(fn)
 	if fnType.Kind() != reflect.Func {
 		return nil, fmt.Errorf("参数必须是函数类型")
 	}
 
-	// 提取参数类型
-	paramTypes := make(map[string]string)
-	for i := 1; i < fnType.NumIn(); i++ {
-		paramType := fnType.In(i)
-		key := fmt.Sprintf("arg%d", i-1)
-		paramTypes[key] = paramType.Kind().String()
-	}
-
-	// 提取返回值类型
-	var returnType string
-	numOut := fnType.NumOut()
-	if numOut > 1 {
-		// 有返回值（第一个返回值，最后一个必须是error）
-		returnType = fnType.Out(0).Kind().String()
-	} else {
-		// 只返回error
-		returnType = "void"
-	}
+	// 只验证函数签名，不提取参数类型信息
+	// 参数类型信息在运行时通过反射从函数实例获取（在WrapJobFunc中）
 
 	return &storage.JobFunctionMeta{
 		Name:        name,
 		Description: description,
-		ParamTypes:  paramTypes,
-		ReturnType:  returnType,
+		// 不再存储 ParamTypes 和 ReturnType
+		// 运行时从函数实例通过反射获取类型信息
 	}, nil
 }
