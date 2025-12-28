@@ -29,3 +29,10 @@ func (e *SmsAlertPlugin) Execute(data interface{}) error {
 	log.Printf("🔔 发送短信告警：%v", data)
 	return nil
 }
+
+// NewSmsAlertPlugin 创建短信告警插件（对外导出）
+func NewSmsAlertPlugin() Plugin {
+	return &SmsAlertPlugin{
+		name: "sms_alert",
+	}
+}

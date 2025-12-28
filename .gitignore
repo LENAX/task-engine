@@ -1,0 +1,48 @@
+# macOS
+*/.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Go build
+/bin/
+/build/
+/dist/
+/out/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go modules/packages
+/vendor/
+/pkg/
+
+# Editor & tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Coverage/test
+*.coverprofile
+coverage.html
+
+# Logs
+*.log
+
+# Dependency
+go.sum
+
+# By default, ignore all hidden files and folders except .git
+.*
+!.gitignore
+doc/.DS_Store
