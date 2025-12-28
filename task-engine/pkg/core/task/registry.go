@@ -267,7 +267,6 @@ func (r *JobFunctionRegistry) GetIDByName(name string) string {
 	return ""
 }
 
-
 // extractFunctionMeta 提取函数元数据
 // 注意：不再提取参数类型和返回值类型，这些信息在运行时从函数实例通过反射获取
 func extractFunctionMeta(fn interface{}, name, description string) (*storage.JobFunctionMeta, error) {
