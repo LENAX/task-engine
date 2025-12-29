@@ -46,3 +46,4 @@ go.sum
 .*
 !.gitignore
 doc/.DS_Store
+task-engine/server

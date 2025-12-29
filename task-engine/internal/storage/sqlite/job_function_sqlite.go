@@ -158,6 +158,7 @@ func (r *jobFunctionRepo) ListAll(ctx context.Context) ([]*storage.JobFunctionMe
 }
 
 // Delete 实现存储接口（内部实现）
+// 幂等性：删除不存在的记录不会报错
 func (r *jobFunctionRepo) Delete(ctx context.Context, name string) error {
 	query := `DELETE FROM job_function_meta WHERE name = :name`
 	_, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
@@ -166,5 +167,6 @@ func (r *jobFunctionRepo) Delete(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("删除JobFunctionMeta失败: %w", err)
 	}
+	// 不检查 RowsAffected，删除不存在的记录也是幂等的
 	return nil
 }

@@ -16,11 +16,14 @@ type JobFunctionState struct {
 }
 
 // JobFunctionType 是调度用统一函数签名，负责包裹用户逻辑，并异步通知状态
-type JobFunctionType func(ctx context.Context, params map[string]string) <-chan JobFunctionState
+// 参数通过TaskContext传递，提供类型安全的API访问Task信息
+type JobFunctionType func(ctx *TaskContext) <-chan JobFunctionState
 
-// WrapJobFunc 将任意函数（首个参数必须是context.Context）包装为JobFunctionType
-// 支持任意函数签名，只要第一个参数是context.Context即可
-// 其余参数从Task.Params中按参数名匹配并转换类型
+// WrapJobFunc 将任意函数包装为JobFunctionType（对外导出）
+// 支持两种函数签名：
+//  1. 新方式：func(ctx *TaskContext) (result, error) 或 func(ctx *TaskContext) error
+//  2. 旧方式（兼容）：func(ctx context.Context, ...) (result, error) 或 func(ctx context.Context, ...) error
+//     旧方式的额外参数从TaskContext.Params中获取
 func WrapJobFunc(fn interface{}) (JobFunctionType, error) {
 	fnValue := reflect.ValueOf(fn)
 	fnType := fnValue.Type()
@@ -30,19 +33,12 @@ func WrapJobFunc(fn interface{}) (JobFunctionType, error) {
 		return nil, fmt.Errorf("参数必须是函数类型，当前类型: %v", fnType.Kind())
 	}
 
-	// 检查参数数量（至少需要一个context参数）
+	// 检查参数数量
 	if fnType.NumIn() == 0 {
-		return nil, fmt.Errorf("函数至少需要一个context.Context参数")
+		return nil, fmt.Errorf("函数至少需要一个参数")
 	}
 
-	// 检查第一个参数是否为context.Context
-	firstParamType := fnType.In(0)
-	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
-	if !firstParamType.Implements(contextType) && firstParamType != contextType {
-		return nil, fmt.Errorf("函数第一个参数必须是context.Context，当前类型: %v", firstParamType)
-	}
-
-	// 检查返回值（必须至少返回一个error，或者返回(result, error)）
+	// 检查返回值
 	numOut := fnType.NumOut()
 	if numOut == 0 {
 		return nil, fmt.Errorf("函数必须至少返回一个error")
@@ -53,59 +49,92 @@ func WrapJobFunc(fn interface{}) (JobFunctionType, error) {
 		return nil, fmt.Errorf("函数最后一个返回值必须是error，当前类型: %v", lastOutType)
 	}
 
-	// 构建包装函数
-	return func(ctx context.Context, params map[string]string) <-chan JobFunctionState {
+	firstParamType := fnType.In(0)
+	taskContextType := reflect.TypeOf((*TaskContext)(nil))
+
+	// 检查第一个参数是否为*TaskContext（新方式）
+	if firstParamType == taskContextType {
+		return wrapTaskContextFunc(fnValue, fnType, numOut), nil
+	}
+
+	// 检查第一个参数是否为context.Context（旧方式，兼容）
+	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	if firstParamType.Implements(contextType) || firstParamType == contextType {
+		return wrapLegacyFunc(fnValue, fnType, numOut), nil
+	}
+
+	return nil, fmt.Errorf("函数第一个参数必须是*TaskContext或context.Context，当前类型: %v", firstParamType)
+}
+
+// wrapTaskContextFunc 包装使用TaskContext的函数（新方式）
+func wrapTaskContextFunc(fnValue reflect.Value, fnType reflect.Type, numOut int) JobFunctionType {
+	return func(taskCtx *TaskContext) <-chan JobFunctionState {
+		stateCh := make(chan JobFunctionState, 1)
+		go func() {
+			defer close(stateCh)
+
+			// 调用函数，只传入TaskContext
+			args := []reflect.Value{reflect.ValueOf(taskCtx)}
+			results := fnValue.Call(args)
+
+			// 处理返回值
+			var result interface{}
+			var err error
+
+			if numOut == 1 {
+				// 只返回error
+				if results[0].IsNil() {
+					err = nil
+				} else {
+					err = results[0].Interface().(error)
+				}
+			} else {
+				// 返回(result, error)
+				result = results[0].Interface()
+				if !results[1].IsNil() {
+					err = results[1].Interface().(error)
+				}
+			}
+
+			if err != nil {
+				stateCh <- JobFunctionState{
+					Status: "Failed",
+					Error:  err,
+				}
+				return
+			}
+
+			stateCh <- JobFunctionState{
+				Status: "Success",
+				Data:   result,
+			}
+		}()
+		return stateCh
+	}
+}
+
+// wrapLegacyFunc 包装使用context.Context的函数（旧方式，兼容）
+func wrapLegacyFunc(fnValue reflect.Value, fnType reflect.Type, numOut int) JobFunctionType {
+	return func(taskCtx *TaskContext) <-chan JobFunctionState {
 		stateCh := make(chan JobFunctionState, 1)
 		go func() {
 			defer close(stateCh)
 
 			// 准备函数参数
 			args := make([]reflect.Value, fnType.NumIn())
-			args[0] = reflect.ValueOf(ctx) // 第一个参数是context
+			args[0] = reflect.ValueOf(taskCtx.Context()) // 第一个参数是context.Context
 
-			// 处理其余参数
+			// 处理其余参数（从TaskContext.Params中获取）
 			for i := 1; i < fnType.NumIn(); i++ {
 				paramType := fnType.In(i)
-
-				// 从params中获取值，支持多种匹配方式：
-				// 1. 使用索引: "arg0", "arg1", ...
-				// 2. 使用类型名: "string", "int", ...
-				// 3. 使用参数位置: "param1", "param2", ...
-				var paramValue string
-				var found bool
-
-				// 尝试使用索引作为key (arg0, arg1, ...)
-				paramValue, found = params[fmt.Sprintf("arg%d", i-1)]
-				if !found {
-					// 尝试使用参数位置 (param1, param2, ...)
-					paramValue, found = params[fmt.Sprintf("param%d", i)]
-				}
-				if !found {
-					// 尝试使用类型名作为key
-					typeName := paramType.Name()
-					if typeName == "" {
-						typeName = paramType.Kind().String()
-					}
-					paramValue, found = params[typeName]
-				}
-
-				// 如果仍然没找到，尝试使用类型名的小写形式
-				if !found {
-					typeName := paramType.Kind().String()
-					paramValue, found = params[typeName]
-				}
-
-				// 如果还是没找到，使用空字符串（对于可选参数）
-				if !found {
-					paramValue = ""
-				}
+				paramValue := getParamFromTaskContext(taskCtx, i-1, paramType)
 
 				// 转换类型
-				convertedValue, err := convertStringToType(paramValue, paramType)
+				convertedValue, err := convertParamToType(paramValue, paramType)
 				if err != nil {
 					stateCh <- JobFunctionState{
 						Status: "Failed",
-						Error:  fmt.Errorf("参数转换失败 [参数%d, 类型%v, 值'%s']: %w", i-1, paramType, paramValue, err),
+						Error:  fmt.Errorf("参数转换失败 [参数%d, 类型%v]: %w", i-1, paramType, err),
 					}
 					return
 				}
@@ -148,7 +177,50 @@ func WrapJobFunc(fn interface{}) (JobFunctionType, error) {
 			}
 		}()
 		return stateCh
-	}, nil
+	}
+}
+
+// getParamFromTaskContext 从TaskContext中获取参数值
+func getParamFromTaskContext(taskCtx *TaskContext, index int, paramType reflect.Type) interface{} {
+	// 尝试多种key匹配方式
+	keys := []string{
+		fmt.Sprintf("arg%d", index),
+		fmt.Sprintf("param%d", index+1),
+		paramType.Name(),
+		paramType.Kind().String(),
+	}
+
+	for _, key := range keys {
+		if val := taskCtx.GetParam(key); val != nil {
+			return val
+		}
+	}
+
+	return nil
+}
+
+// convertParamToType 将参数值转换为指定类型
+func convertParamToType(value interface{}, targetType reflect.Type) (reflect.Value, error) {
+	if value == nil {
+		return reflect.Zero(targetType), nil
+	}
+
+	valueType := reflect.TypeOf(value)
+	if valueType.AssignableTo(targetType) {
+		return reflect.ValueOf(value), nil
+	}
+
+	// 尝试类型转换
+	if valueType.ConvertibleTo(targetType) {
+		return reflect.ValueOf(value).Convert(targetType), nil
+	}
+
+	// 对于字符串，使用原有的convertStringToType逻辑
+	if str, ok := value.(string); ok {
+		return convertStringToType(str, targetType)
+	}
+
+	return reflect.Value{}, fmt.Errorf("无法将类型 %v 转换为 %v", valueType, targetType)
 }
 
 // convertStringToType 将字符串转换为指定类型

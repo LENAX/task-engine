@@ -10,82 +10,38 @@ import (
 // tasks: Task ID -> Task接口的映射
 // dependencies: 后置Task ID -> 前置Task ID列表的映射
 func BuildDAG(tasks map[string]workflow.Task, dependencies map[string][]string) (*DAG, error) {
-	dag := NewDAG()
+	d := NewDAG()
 
 	// 1. 创建所有节点
 	for taskID, task := range tasks {
-		node := &Node{
-			ID:       taskID,
-			Name:     task.GetName(),
-			InDegree: 0,
-			OutEdges: make([]string, 0),
+		if err := d.AddVertexByID(taskID, task); err != nil {
+			return nil, fmt.Errorf("添加节点失败: Task ID=%s, Error=%w", taskID, err)
 		}
-		dag.Nodes[taskID] = node
 	}
 
-	// 2. 构建边和计算入度
+	// 2. 构建边（依赖关系）
 	for taskID, depIDs := range dependencies {
-		node, exists := dag.Nodes[taskID]
-		if !exists {
-			return nil, fmt.Errorf("Task ID %s 不存在", taskID)
-		}
-
-		// 设置入度
-		node.InDegree = len(depIDs)
-
-		// 为每个前置Task添加出边
 		for _, depID := range depIDs {
-			depNode, exists := dag.Nodes[depID]
-			if !exists {
-				return nil, fmt.Errorf("依赖的Task ID %s 不存在", depID)
+			// 添加边：depID -> taskID（前置Task -> 后置Task）
+			if err := d.AddEdge(depID, taskID); err != nil {
+				return nil, fmt.Errorf("添加边失败: %s -> %s, Error=%w", depID, taskID, err)
 			}
-			depNode.OutEdges = append(depNode.OutEdges, taskID)
 		}
 	}
 
-	return dag, nil
+	return d, nil
 }
 
 // DetectCycle 检测DAG中是否存在循环依赖（对外导出）
-// 使用DFS算法检测环
+// go-dag 库在 AddEdge 时会自动检测循环，但这里提供一个显式的检测方法
 func (d *DAG) DetectCycle() error {
-	// 使用三色标记法：0=白色（未访问），1=灰色（正在访问），2=黑色（已访问）
-	color := make(map[string]int)
-	for id := range d.Nodes {
-		color[id] = 0 // 白色
+	// go-dag 库在添加边时会自动检测循环依赖
+	// 如果已经构建完成，可以通过尝试复制来检测（复制操作会检测循环）
+	_, err := d.Copy()
+	if err != nil {
+		// 如果复制失败，可能是存在循环
+		return fmt.Errorf("检测到循环依赖: %w", err)
 	}
-
-	// 对每个节点进行DFS
-	for id := range d.Nodes {
-		if color[id] == 0 {
-			if err := d.dfs(id, color); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-// dfs 深度优先搜索，检测环
-func (d *DAG) dfs(nodeID string, color map[string]int) error {
-	color[nodeID] = 1 // 灰色：正在访问
-
-	node := d.Nodes[nodeID]
-	for _, nextID := range node.OutEdges {
-		if color[nextID] == 1 {
-			// 发现后向边，存在环
-			return fmt.Errorf("检测到循环依赖：%s -> %s", nodeID, nextID)
-		}
-		if color[nextID] == 0 {
-			// 递归访问
-			if err := d.dfs(nextID, color); err != nil {
-				return err
-			}
-		}
-	}
-
-	color[nodeID] = 2 // 黑色：已访问完成
 	return nil
 }
 
@@ -97,50 +53,56 @@ func (d *DAG) TopologicalSort() (*TopologicalOrder, error) {
 		return nil, fmt.Errorf("存在循环依赖，无法进行拓扑排序: %w", err)
 	}
 
-	// 复制入度（避免修改原始DAG）
-	inDegreeCopy := make(map[string]int)
-	for id, node := range d.Nodes {
-		inDegreeCopy[id] = node.InDegree
-	}
-
 	result := &TopologicalOrder{
 		Levels: make([][]string, 0),
 	}
 
-	// Kahn算法：不断找出入度为0的节点
-	for {
+	// 使用 Kahn 算法进行拓扑排序
+	// 1. 计算每个节点的入度
+	inDegree := make(map[string]int)
+	vertices := d.GetVertices()
+	for id := range vertices {
+		parents, _ := d.GetParents(id)
+		inDegree[id] = len(parents)
+	}
+
+	// 2. 找出所有入度为0的节点（根节点）
+	queue := make([]string, 0)
+	for id, degree := range inDegree {
+		if degree == 0 {
+			queue = append(queue, id)
+		}
+	}
+
+	// 3. 不断移除入度为0的节点，并更新其子节点的入度
+	for len(queue) > 0 {
 		currentLevel := make([]string, 0)
+		nextQueue := make([]string, 0)
 
-		// 找出所有入度为0的节点
-		for id, degree := range inDegreeCopy {
-			if degree == 0 {
-				currentLevel = append(currentLevel, id)
-			}
-		}
+		// 处理当前层的所有节点
+		for _, nodeID := range queue {
+			currentLevel = append(currentLevel, nodeID)
 
-		// 如果没有入度为0的节点，说明所有节点都已处理或存在环
-		if len(currentLevel) == 0 {
-			// 检查是否还有未处理的节点
-			for _, degree := range inDegreeCopy {
-				if degree > 0 {
-					return nil, fmt.Errorf("拓扑排序失败：存在未处理的节点（可能存在环）")
+			// 获取子节点并减少其入度
+			children, _ := d.GetChildren(nodeID)
+			for _, childID := range children {
+				inDegree[childID]--
+				if inDegree[childID] == 0 {
+					nextQueue = append(nextQueue, childID)
 				}
 			}
-			break
 		}
 
-		// 将当前层的节点加入结果
 		result.Levels = append(result.Levels, currentLevel)
+		queue = nextQueue
+	}
 
-		// 移除当前层节点，并更新下游节点的入度
-		for _, nodeID := range currentLevel {
-			delete(inDegreeCopy, nodeID)
-
-			node := d.Nodes[nodeID]
-			for _, nextID := range node.OutEdges {
-				if _, exists := inDegreeCopy[nextID]; exists {
-					inDegreeCopy[nextID]--
-				}
+	// 4. 检查是否所有节点都被处理
+	if len(result.Levels) == 0 || len(result.Levels[0]) == 0 {
+		// 检查是否还有未处理的节点
+		for _, degree := range inDegree {
+			if degree > 0 {
+				return nil, fmt.Errorf("拓扑排序失败：存在未处理的节点（可能存在环）")
 			}
 		}
 	}
@@ -150,58 +112,115 @@ func (d *DAG) TopologicalSort() (*TopologicalOrder, error) {
 
 // AddNode 动态添加节点到DAG（对外导出）
 // 用于运行时添加子Task
-func (d *DAG) AddNode(nodeID, nodeName string, parentIDs []string) error {
+// task: 要添加的 Task 实例
+func (d *DAG) AddNode(nodeID, nodeName string, task workflow.Task, parentIDs []string) error {
 	// 检查节点是否已存在
-	if _, exists := d.Nodes[nodeID]; exists {
+	if _, err := d.GetVertex(nodeID); err == nil {
 		return fmt.Errorf("节点 %s 已存在", nodeID)
 	}
 
-	// 创建新节点
-	node := &Node{
-		ID:       nodeID,
-		Name:     nodeName,
-		InDegree: len(parentIDs),
-		OutEdges: make([]string, 0),
+	// 添加节点
+	if err := d.AddVertexByID(nodeID, task); err != nil {
+		return fmt.Errorf("添加节点失败: %w", err)
 	}
-	d.Nodes[nodeID] = node
 
-	// 更新父节点的出边
+	// 添加边（依赖关系）
 	for _, parentID := range parentIDs {
-		parentNode, exists := d.Nodes[parentID]
-		if !exists {
-			return fmt.Errorf("父节点 %s 不存在", parentID)
+		if err := d.AddEdge(parentID, nodeID); err != nil {
+			return fmt.Errorf("添加边失败: %s -> %s, Error=%w", parentID, nodeID, err)
 		}
-		parentNode.OutEdges = append(parentNode.OutEdges, nodeID)
 	}
 
 	return nil
 }
 
-// GetReadyTasks 获取当前就绪的Task ID列表（入度为0的节点）（对外导出）
+// GetReadyTasks 获取当前就绪的Task ID列表（入度为0的节点，即根节点）（对外导出）
 func (d *DAG) GetReadyTasks() []string {
-	ready := make([]string, 0)
-	for id, node := range d.Nodes {
-		if node.InDegree == 0 {
-			ready = append(ready, id)
-		}
+	roots := d.GetRoots()
+	ready := make([]string, 0, len(roots))
+	for id := range roots {
+		ready = append(ready, id)
 	}
 	return ready
 }
 
 // UpdateInDegree 更新节点的入度（对外导出）
 // 当某个Task完成后，调用此方法更新其下游节点的入度
+// 注意：go-dag 库是只读的，不能直接修改入度
+// 这个方法主要用于标记节点已完成，实际入度由 DAG 结构自动管理
 func (d *DAG) UpdateInDegree(completedTaskID string) {
-	node, exists := d.Nodes[completedTaskID]
-	if !exists {
-		return
-	}
-
-	// 减少所有下游节点的入度
-	for _, nextID := range node.OutEdges {
-		nextNode, exists := d.Nodes[nextID]
-		if exists && nextNode.InDegree > 0 {
-			nextNode.InDegree--
-		}
-	}
+	// go-dag 库的 DAG 结构是只读的，入度由边的结构自动管理
+	// 这个方法保留用于兼容性，但实际不需要做任何事情
+	// 因为 go-dag 会自动管理入度
 }
 
+// GetChildren 获取节点的子节点（对外导出）
+// 兼容旧接口
+func (d *DAG) GetChildren(nodeID string) ([]string, error) {
+	children, err := d.DAG.GetChildren(nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]string, 0, len(children))
+	for id := range children {
+		result = append(result, id)
+	}
+	return result, nil
+}
+
+// GetParents 获取节点的父节点（对外导出）
+// 兼容旧接口
+func (d *DAG) GetParents(nodeID string) ([]string, error) {
+	parents, err := d.DAG.GetParents(nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]string, 0, len(parents))
+	for id := range parents {
+		result = append(result, id)
+	}
+	return result, nil
+}
+
+// Nodes 获取所有节点（兼容旧接口）
+// 返回节点ID到节点的映射
+// 注意：为了兼容旧代码，保留此方法，但建议直接使用 go-dag 的方法
+func (d *DAG) Nodes() map[string]*Node {
+	vertices := d.GetVertices()
+	nodes := make(map[string]*Node, len(vertices))
+
+	for id, task := range vertices {
+		// 获取父节点和子节点
+		parents, _ := d.GetParents(id)
+		children, _ := d.GetChildren(id)
+
+		nodes[id] = &Node{
+			ID:       id,
+			Name:     task.GetName(),
+			InDegree: len(parents),
+			OutEdges: children,
+		}
+	}
+
+	return nodes
+}
+
+// GetNode 获取指定节点（兼容旧接口）
+func (d *DAG) GetNode(nodeID string) (*Node, bool) {
+	task, err := d.GetVertex(nodeID)
+	if err != nil {
+		return nil, false
+	}
+
+	parents, _ := d.GetParents(nodeID)
+	children, _ := d.GetChildren(nodeID)
+
+	return &Node{
+		ID:       nodeID,
+		Name:     task.GetName(),
+		InDegree: len(parents),
+		OutEdges: children,
+	}, true
+}

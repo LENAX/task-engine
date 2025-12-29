@@ -21,7 +21,7 @@ type Executor struct {
 	wg          sync.WaitGroup
 	running     bool
 	shutdown    chan struct{}
-	registry    *task.JobFunctionRegistry // Job函数注册中心
+	registry    *task.FunctionRegistry // Job函数注册中心
 }
 
 // domainPool 业务域子池（内部结构）
@@ -220,7 +220,7 @@ func (e *Executor) GetDomainPoolStatus(domain string) (int, int, error) {
 }
 
 // SetRegistry 设置Job函数注册中心（对外导出）
-func (e *Executor) SetRegistry(registry *task.JobFunctionRegistry) {
+func (e *Executor) SetRegistry(registry *task.FunctionRegistry) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.registry = registry
@@ -370,14 +370,23 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
-	// Task.Params已经是map[string]string，直接使用
-	params := t.Params
-	if params == nil {
-		params = make(map[string]string)
+	// 注入依赖到 context（如果 registry 支持依赖注入）
+	if e.registry != nil {
+		ctx = e.registry.WithDependencies(ctx)
 	}
 
+	// 创建TaskContext
+	taskCtx := task.NewTaskContext(
+		ctx,
+		t.ID,
+		t.Name,
+		pendingTask.WorkflowID,
+		pendingTask.InstanceID,
+		t.Params,
+	)
+
 	// 执行Job函数
-	stateCh := jobFunc(ctx, params)
+	stateCh := jobFunc(taskCtx)
 
 	// 监听执行结果
 	select {

@@ -20,9 +20,23 @@ func TestExecutor_Basic(t *testing.T) {
 
 	exec.Start()
 
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
-		WithJobFunction("func1", nil).
-		Build()
+	// 创建 registry 并注册函数
+	registry := task.NewFunctionRegistry(nil, nil)
+	testFunc := func(ctx *task.TaskContext) (interface{}, error) {
+		return "success", nil
+	}
+	_, err = registry.Register(context.Background(), "func1", testFunc, "测试函数1")
+	if err != nil {
+		t.Fatalf("注册函数失败: %v", err)
+	}
+	exec.SetRegistry(registry)
+
+	taskBuilder := builder.NewTaskBuilderWithRegistry("task1", "任务1", registry)
+	taskBuilder = taskBuilder.WithJobFunction("func1", nil)
+	task1, err := taskBuilder.Build()
+	if err != nil {
+		t.Fatalf("构建任务失败: %v", err)
+	}
 
 	pendingTask := &executor.PendingTask{
 		Task:       task1,
@@ -110,7 +124,7 @@ func TestExecutor_ConcurrentExecution(t *testing.T) {
 	exec.Start()
 
 	// 创建并注册一个简单的Job函数
-	registry := task.NewJobFunctionRegistry(nil)
+	registry := task.NewFunctionRegistry(nil, nil)
 	testFunc := func(ctx context.Context) error {
 		time.Sleep(10 * time.Millisecond) // 模拟工作
 		return nil
@@ -128,9 +142,12 @@ func TestExecutor_ConcurrentExecution(t *testing.T) {
 	// 提交10个任务
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
-		task, _ := builder.NewTaskBuilder("task"+string(rune(i)), "任务").
-			WithJobFunction("func", nil).
-			Build()
+		taskBuilder := builder.NewTaskBuilderWithRegistry("task"+string(rune(i)), "任务", registry)
+		taskBuilder = taskBuilder.WithJobFunction("func", nil)
+		task, err := taskBuilder.Build()
+		if err != nil {
+			t.Fatalf("构建任务失败: %v", err)
+		}
 
 		pendingTask := &executor.PendingTask{
 			Task:       task,
@@ -146,7 +163,7 @@ func TestExecutor_ConcurrentExecution(t *testing.T) {
 			},
 		}
 
-		err := exec.SubmitTask(pendingTask)
+		err = exec.SubmitTask(pendingTask)
 		if err != nil {
 			t.Fatalf("提交任务失败: %v", err)
 		}
@@ -175,10 +192,26 @@ func TestExecutor_Timeout(t *testing.T) {
 	defer exec.Shutdown()
 	exec.Start()
 
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
-		WithJobFunction("func1", nil).
+	// 创建 registry 并注册函数
+	registry := task.NewFunctionRegistry(nil, nil)
+	testFunc := func(ctx *task.TaskContext) (interface{}, error) {
+		time.Sleep(2 * time.Second) // 模拟长时间运行
+		return "success", nil
+	}
+	_, err := registry.Register(context.Background(), "func1", testFunc, "测试函数1")
+	if err != nil {
+		t.Fatalf("注册函数失败: %v", err)
+	}
+	exec.SetRegistry(registry)
+
+	taskBuilder := builder.NewTaskBuilderWithRegistry("task1", "任务1", registry)
+	taskBuilder = taskBuilder.WithJobFunction("func1", nil)
+	task1, err := taskBuilder.
 		WithTimeout(1). // 1秒超时
 		Build()
+	if err != nil {
+		t.Fatalf("构建任务失败: %v", err)
+	}
 
 	var result *executor.TaskResult
 	var resultMu sync.Mutex
@@ -205,7 +238,7 @@ func TestExecutor_Timeout(t *testing.T) {
 		},
 	}
 
-	err := exec.SubmitTask(pendingTask)
+	err = exec.SubmitTask(pendingTask)
 	if err != nil {
 		t.Fatalf("提交任务失败: %v", err)
 	}
@@ -224,11 +257,25 @@ func TestExecutor_Shutdown(t *testing.T) {
 	exec, _ := executor.NewExecutor(5)
 	exec.Start()
 
+	// 创建 registry 并注册函数
+	registry := task.NewFunctionRegistry(nil, nil)
+	testFunc := func(ctx *task.TaskContext) (interface{}, error) {
+		return "success", nil
+	}
+	_, err := registry.Register(context.Background(), "func", testFunc, "测试函数")
+	if err != nil {
+		t.Fatalf("注册函数失败: %v", err)
+	}
+	exec.SetRegistry(registry)
+
 	// 提交一些任务
 	for i := 0; i < 5; i++ {
-		task, _ := builder.NewTaskBuilder("task"+string(rune(i)), "任务").
-			WithJobFunction("func", nil).
-			Build()
+		taskBuilder := builder.NewTaskBuilderWithRegistry("task"+string(rune(i)), "任务", registry)
+		taskBuilder = taskBuilder.WithJobFunction("func", nil)
+		task, err := taskBuilder.Build()
+		if err != nil {
+			t.Fatalf("构建任务失败: %v", err)
+		}
 
 		pendingTask := &executor.PendingTask{
 			Task:       task,
@@ -243,9 +290,12 @@ func TestExecutor_Shutdown(t *testing.T) {
 	_ = exec.Shutdown()
 
 	// 尝试提交新任务应该失败
-	task, _ := builder.NewTaskBuilder("new-task", "新任务").
-		WithJobFunction("func", nil).
-		Build()
+	newTaskBuilder := builder.NewTaskBuilderWithRegistry("new-task", "新任务", registry)
+	newTaskBuilder = newTaskBuilder.WithJobFunction("func", nil)
+	task, err := newTaskBuilder.Build()
+	if err != nil {
+		t.Fatalf("构建任务失败: %v", err)
+	}
 
 	pendingTask := &executor.PendingTask{
 		Task:       task,
@@ -253,7 +303,7 @@ func TestExecutor_Shutdown(t *testing.T) {
 		InstanceID: "inst1",
 	}
 
-	err := exec.SubmitTask(pendingTask)
+	err = exec.SubmitTask(pendingTask)
 	if err == nil {
 		t.Fatal("期望返回错误（Executor已关闭），但未返回")
 	}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 	"github.com/stevelan1995/task-engine/pkg/storage"
 	"github.com/stevelan1995/task-engine/pkg/storage/dao"
 )
@@ -44,7 +45,7 @@ func (r *workflowInstanceRepo) initSchema() error {
 }
 
 // Save 保存WorkflowInstance
-func (r *workflowInstanceRepo) Save(ctx context.Context, instance *storage.WorkflowInstance) error {
+func (r *workflowInstanceRepo) Save(ctx context.Context, instance *workflow.WorkflowInstance) error {
 	// 序列化断点数据
 	var breakpointJSON string
 	if instance.Breakpoint != nil {
@@ -108,7 +109,7 @@ func (r *workflowInstanceRepo) GetByID(ctx context.Context, id string) (*storage
 	}
 
 	// 转换为业务实体
-	instance := &storage.WorkflowInstance{
+	instance := &workflow.WorkflowInstance{
 		ID:         dao.ID,
 		WorkflowID: dao.WorkflowID,
 		Status:     dao.Status,
@@ -122,7 +123,7 @@ func (r *workflowInstanceRepo) GetByID(ctx context.Context, id string) (*storage
 		instance.EndTime = &dao.EndTime.Time
 	}
 	if dao.Breakpoint.Valid && dao.Breakpoint.String != "" {
-		var breakpoint storage.BreakpointData
+		var breakpoint workflow.BreakpointData
 		if err := json.Unmarshal([]byte(dao.Breakpoint.String), &breakpoint); err != nil {
 			return nil, fmt.Errorf("反序列化断点数据失败: %w", err)
 		}
@@ -136,20 +137,28 @@ func (r *workflowInstanceRepo) GetByID(ctx context.Context, id string) (*storage
 }
 
 // UpdateStatus 更新WorkflowInstance状态
+// 幂等性：如果记录不存在，不会报错（UPDATE 不会影响不存在的记录）
 func (r *workflowInstanceRepo) UpdateStatus(ctx context.Context, id string, status string) error {
 	query := `UPDATE workflow_instance SET status = :status WHERE id = :id`
-	_, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
+	result, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
 		"status": status,
 		"id":     id,
 	})
 	if err != nil {
 		return fmt.Errorf("更新WorkflowInstance状态失败: %w", err)
 	}
+	// 检查是否实际更新了记录（可选，用于日志或警告）
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// 记录不存在，但不报错（幂等性）
+		// 如果需要严格检查，可以返回错误，但通常幂等性更重要
+	}
 	return nil
 }
 
 // UpdateBreakpoint 更新断点数据
-func (r *workflowInstanceRepo) UpdateBreakpoint(ctx context.Context, id string, breakpoint *storage.BreakpointData) error {
+// 幂等性：如果记录不存在，不会报错（UPDATE 不会影响不存在的记录）
+func (r *workflowInstanceRepo) UpdateBreakpoint(ctx context.Context, id string, breakpoint *workflow.BreakpointData) error {
 	var breakpointJSON string
 	if breakpoint != nil {
 		jsonBytes, err := json.Marshal(breakpoint)
@@ -160,18 +169,23 @@ func (r *workflowInstanceRepo) UpdateBreakpoint(ctx context.Context, id string, 
 	}
 
 	query := `UPDATE workflow_instance SET breakpoint = :breakpoint WHERE id = :id`
-	_, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
+	result, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
 		"breakpoint": breakpointJSON,
 		"id":         id,
 	})
 	if err != nil {
 		return fmt.Errorf("更新断点数据失败: %w", err)
 	}
+	// 检查是否实际更新了记录（可选）
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// 记录不存在，但不报错（幂等性）
+	}
 	return nil
 }
 
 // ListByStatus 根据状态查询WorkflowInstance列表
-func (r *workflowInstanceRepo) ListByStatus(ctx context.Context, status string) ([]*storage.WorkflowInstance, error) {
+func (r *workflowInstanceRepo) ListByStatus(ctx context.Context, status string) ([]*workflow.WorkflowInstance, error) {
 	var daos []dao.WorkflowInstanceDAO
 	query := `
 	SELECT id, workflow_id, status, start_time, end_time, breakpoint, error_message, create_time
@@ -182,9 +196,9 @@ func (r *workflowInstanceRepo) ListByStatus(ctx context.Context, status string) 
 		return nil, fmt.Errorf("查询WorkflowInstance列表失败: %w", err)
 	}
 
-	instances := make([]*storage.WorkflowInstance, 0, len(daos))
+	instances := make([]*workflow.WorkflowInstance, 0, len(daos))
 	for _, dao := range daos {
-		instance := &storage.WorkflowInstance{
+		instance := &workflow.WorkflowInstance{
 			ID:         dao.ID,
 			WorkflowID: dao.WorkflowID,
 			Status:     dao.Status,
@@ -198,7 +212,7 @@ func (r *workflowInstanceRepo) ListByStatus(ctx context.Context, status string) 
 			instance.EndTime = &dao.EndTime.Time
 		}
 		if dao.Breakpoint.Valid && dao.Breakpoint.String != "" {
-			var breakpoint storage.BreakpointData
+			var breakpoint workflow.BreakpointData
 			if err := json.Unmarshal([]byte(dao.Breakpoint.String), &breakpoint); err != nil {
 				return nil, fmt.Errorf("反序列化断点数据失败: %w", err)
 			}
@@ -215,11 +229,13 @@ func (r *workflowInstanceRepo) ListByStatus(ctx context.Context, status string) 
 }
 
 // Delete 删除WorkflowInstance
+// 幂等性：删除不存在的记录不会报错
 func (r *workflowInstanceRepo) Delete(ctx context.Context, id string) error {
 	query := `DELETE FROM workflow_instance WHERE id = ?`
 	_, err := r.db.ExecContext(ctx, query, id)
 	if err != nil {
 		return fmt.Errorf("删除WorkflowInstance失败: %w", err)
 	}
+	// 不检查 RowsAffected，删除不存在的记录也是幂等的
 	return nil
 }
