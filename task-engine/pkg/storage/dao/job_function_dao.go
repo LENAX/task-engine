@@ -15,4 +15,3 @@ type JobFunctionDAO struct {
 	CreateTime  time.Time `db:"create_time"`
 	UpdateTime  time.Time `db:"update_time"`
 }
-

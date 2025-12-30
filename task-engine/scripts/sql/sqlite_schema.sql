@@ -53,10 +53,20 @@ CREATE TABLE IF NOT EXISTS job_function_meta (
     update_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Task Handler元数据表
+CREATE TABLE IF NOT EXISTS task_handler_meta (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    update_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 创建索引
 CREATE INDEX IF NOT EXISTS idx_workflow_instance_workflow_id ON workflow_instance(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_instance_status ON workflow_instance(status);
 CREATE INDEX IF NOT EXISTS idx_task_instance_workflow_instance_id ON task_instance(workflow_instance_id);
 CREATE INDEX IF NOT EXISTS idx_task_instance_status ON task_instance(status);
 CREATE INDEX IF NOT EXISTS idx_job_function_meta_name ON job_function_meta(name);
+CREATE INDEX IF NOT EXISTS idx_task_handler_meta_name ON task_handler_meta(name);
 

@@ -1,10 +1,8 @@
 package task
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,26 +24,28 @@ type Task struct {
 	ID             string
 	Name           string
 	Description    string
-	Params         map[string]string
+	Params         map[string]any
 	CreateTime     time.Time
 	Status         string
-	JobFuncID      string   // Job函数ID（通过Registry获取函数实例）
-	JobFuncName    string   // Job函数名称（用于快速查找和依赖构建）
-	TimeoutSeconds int      // 超时时间（秒，默认30秒）
-	RetryCount     int      // 重试次数（默认0次，即不重试）
-	Dependencies   []string // 依赖的前置Task名称列表
+	StatusHandlers map[string]string // 状态处理函数映射（status -> handlerID）
+	JobFuncID      string            // Job函数ID（通过Registry获取函数实例）
+	JobFuncName    string            // Job函数名称（用于快速查找和依赖构建）
+	TimeoutSeconds int               // 超时时间（秒，默认30秒）
+	RetryCount     int               // 重试次数（默认0次，即不重试）
+	Dependencies   []string          // 依赖的前置Task名称列表
 }
 
 // NewTask 创建Task实例（对外导出）
 // jobFuncName: 已注册的Job函数名称（用于从数据库加载的场景）
-func NewTask(name, desc, jobFuncID string) *Task {
+func NewTask(name, desc, jobFuncID string, params map[string]any, statusHandlers map[string]string) *Task {
 	return &Task{
 		ID:             uuid.NewString(),
 		Name:           name,
 		Description:    desc,
 		Status:         TaskStatusPending,
+		StatusHandlers: statusHandlers,
 		CreateTime:     time.Now(),
-		Params:         make(map[string]string),
+		Params:         params,
 		JobFuncID:      jobFuncID,
 		TimeoutSeconds: 30, // 默认30秒
 		RetryCount:     0,  // 默认0次，即不重试
@@ -61,60 +61,50 @@ func NewTask(name, desc, jobFuncID string) *Task {
 // funcDesc: 函数描述（可选）
 // registry: 函数注册中心
 // 返回: Task实例和错误
-func NewTaskWithFunction(ctx context.Context, name, desc string, jobFunc interface{}, funcName, funcDesc string, registry *JobFunctionRegistry) (*Task, error) {
-	if registry == nil {
-		return nil, fmt.Errorf("registry不能为空")
-	}
+// func NewTaskWithFunction(ctx context.Context, name, desc string, jobFunc interface{}, funcName, funcDesc string, registry *FunctionRegistry) (*Task, error) {
+// 	if registry == nil {
+// 		return nil, fmt.Errorf("registry不能为空")
+// 	}
 
-	// 如果函数名称为空，自动生成
-	if funcName == "" {
-		funcName = generateFunctionName(jobFunc)
-	}
+// 	// 如果函数名称为空，自动生成
+// 	if funcName == "" {
+// 		funcName = generateFunctionName(jobFunc)
+// 	}
 
-	// 检查函数是否已注册（通过名称）
-	funcID := registry.GetIDByName(funcName)
-	if funcID == "" {
-		// 函数未注册，自动注册
-		var err error
-		funcID, err = registry.Register(ctx, funcName, jobFunc, funcDesc)
-		if err != nil {
-			return nil, fmt.Errorf("自动注册函数失败: %w", err)
-		}
-	}
+// 	// 检查函数是否已注册（通过名称）
+// 	funcID := registry.GetIDByName(funcName)
+// 	if funcID == "" {
+// 		// 函数未注册，自动注册
+// 		var err error
+// 		funcID, err = registry.Register(ctx, funcName, jobFunc, funcDesc)
+// 		if err != nil {
+// 			return nil, fmt.Errorf("自动注册函数失败: %w", err)
+// 		}
+// 	}
 
-	return &Task{
-		ID:             uuid.NewString(),
-		Name:           name,
-		Description:    desc,
-		Status:         TaskStatusPending,
-		CreateTime:     time.Now(),
-		Params:         make(map[string]string),
-		JobFuncID:      funcID,
-		JobFuncName:    funcName,
-		TimeoutSeconds: 30, // 默认30秒
-		RetryCount:     0,  // 默认0次，即不重试
-		Dependencies:   make([]string, 0),
-	}, nil
-}
-
-// generateFunctionName 自动生成函数名称（基于函数类型）
-func generateFunctionName(fn interface{}) string {
-	fnType := reflect.TypeOf(fn)
-	if fnType.Kind() != reflect.Func {
-		return "unknown"
-	}
-	// 使用函数类型的字符串表示作为名称（简化版）
-	return fmt.Sprintf("func_%p", fn)
-}
+// 	return &Task{
+// 		ID:             uuid.NewString(),
+// 		Name:           name,
+// 		Description:    desc,
+// 		Status:         TaskStatusPending,
+// 		CreateTime:     time.Now(),
+// 		Params:         make(map[string]any),
+// 		JobFuncID:      funcID,
+// 		JobFuncName:    funcName,
+// 		TimeoutSeconds: 30, // 默认30秒
+// 		RetryCount:     0,  // 默认0次，即不重试
+// 		Dependencies:   make([]string, 0),
+// 	}, nil
+// }
 
 // GetJobFunction 从Registry获取Job函数（对外导出）
 // 如果函数未注册，返回nil
-func (t *Task) GetJobFunction(registry *JobFunctionRegistry) JobFunctionType {
-	if registry == nil || t.JobFuncID == "" {
-		return nil
-	}
-	return registry.Get(t.JobFuncID)
-}
+// func (t *Task) GetJobFunction(registry *FunctionRegistry) JobFunctionType {
+// 	if registry == nil || t.JobFuncID == "" {
+// 		return nil
+// 	}
+// 	return registry.Get(t.JobFuncID)
+// }
 
 // GetID 获取Task的唯一标识（对外导出）
 func (t *Task) GetID() string {
@@ -137,7 +127,7 @@ func (t *Task) GetParams() map[string]interface{} {
 	if t.Params == nil {
 		return make(map[string]interface{})
 	}
-	// 将map[string]string转换为map[string]interface{}
+	// 将map[string]any转换为map[string]interface{}
 	result := make(map[string]interface{})
 	for k, v := range t.Params {
 		result[k] = v
@@ -146,15 +136,15 @@ func (t *Task) GetParams() map[string]interface{} {
 }
 
 // UpdateParams 运行时更新Task的执行参数（对外导出）
-// 接受map[string]interface{}，内部转换为map[string]string
-func (t *Task) UpdateParams(newParams map[string]interface{}) error {
+// 接受map[string]interface{}，内部转换为map[string]any
+func (t *Task) UpdateParams(newParams map[string]any) error {
 	if newParams == nil {
 		return fmt.Errorf("参数不能为空")
 	}
 	if t.Params == nil {
-		t.Params = make(map[string]string)
+		t.Params = make(map[string]any)
 	}
-	// 将map[string]interface{}转换为map[string]string
+	// 将map[string]interface{}转换为map[string]any
 	for k, v := range newParams {
 		// 将值转换为字符串
 		var strValue string

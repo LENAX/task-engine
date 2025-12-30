@@ -5,7 +5,7 @@ import (
 
 	"github.com/stevelan1995/task-engine/pkg/core/dag"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
-	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+    "github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
 
 // WorkflowBuilder Workflow构建器（对外导出）
@@ -16,7 +16,7 @@ type WorkflowBuilder struct {
 
 // NewWorkflowBuilder 创建构建器（对外导出）
 func NewWorkflowBuilder(name, desc string) *WorkflowBuilder {
-	return &WorkflowBuilder{
+    return &WorkflowBuilder{
 		wf:    workflow.NewWorkflow(name, desc),
 		tasks: make([]*task.Task, 0),
 	}
@@ -40,8 +40,8 @@ func (b *WorkflowBuilder) WithTask(t *task.Task) *WorkflowBuilder {
 
 // WithParams 设置自定义参数（链式构建，对外导出）
 func (b *WorkflowBuilder) WithParams(params map[string]string) *WorkflowBuilder {
-	b.wf.Params = params
-	return b
+    b.wf.Params = params
+    return b
 }
 
 // Build 完成Workflow构建（对外导出）

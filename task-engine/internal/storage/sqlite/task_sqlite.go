@@ -207,22 +207,29 @@ func (r *taskRepo) GetByWorkflowInstanceID(ctx context.Context, instanceID strin
 }
 
 // UpdateStatus 更新Task状态
+// 幂等性：如果记录不存在，不会报错（UPDATE 不会影响不存在的记录）
 func (r *taskRepo) UpdateStatus(ctx context.Context, id string, status string) error {
 	query := `UPDATE task_instance SET status = :status WHERE id = :id`
-	_, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
+	result, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
 		"status": status,
 		"id":     id,
 	})
 	if err != nil {
 		return fmt.Errorf("更新Task状态失败: %w", err)
 	}
+	// 检查是否实际更新了记录（可选）
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// 记录不存在，但不报错（幂等性）
+	}
 	return nil
 }
 
 // UpdateStatusWithError 更新Task状态和错误信息
+// 幂等性：如果记录不存在，不会报错（UPDATE 不会影响不存在的记录）
 func (r *taskRepo) UpdateStatusWithError(ctx context.Context, id string, status string, errorMsg string) error {
 	query := `UPDATE task_instance SET status = :status, error_msg = :error_msg WHERE id = :id`
-	_, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
+	result, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
 		"status":    status,
 		"error_msg": errorMsg,
 		"id":        id,
@@ -230,15 +237,22 @@ func (r *taskRepo) UpdateStatusWithError(ctx context.Context, id string, status 
 	if err != nil {
 		return fmt.Errorf("更新Task状态和错误信息失败: %w", err)
 	}
+	// 检查是否实际更新了记录（可选）
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// 记录不存在，但不报错（幂等性）
+	}
 	return nil
 }
 
 // Delete 删除Task实例
+// 幂等性：删除不存在的记录不会报错
 func (r *taskRepo) Delete(ctx context.Context, id string) error {
 	query := `DELETE FROM task_instance WHERE id = ?`
 	_, err := r.db.ExecContext(ctx, query, id)
 	if err != nil {
 		return fmt.Errorf("删除Task失败: %w", err)
 	}
+	// 不检查 RowsAffected，删除不存在的记录也是幂等的
 	return nil
 }

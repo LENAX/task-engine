@@ -12,13 +12,14 @@ import (
 
 func main() {
 	// 1. 创建存储接口实例（内部实现，对外仅依赖接口）
-	repo, err := sqlite.NewWorkflowRepo("./data.db")
+	repos, err := sqlite.NewRepositories("./data.db")
 	if err != nil {
 		log.Fatal("创建存储失败:", err)
 	}
+	defer repos.Close()
 
 	// 2. 创建引擎（调用对外核心组件）
-	eng, err := engine.NewEngine(100, 30, repo)
+	eng, err := engine.NewEngine(100, 30, repos.Workflow, repos.WorkflowInstance, repos.Task)
 	if err != nil {
 		log.Fatal("创建引擎失败:", err)
 	}

@@ -35,13 +35,25 @@ type Workflow struct {
 	Dependencies map[string][]string `json:"dependencies"` // 后置Task ID -> 前置Task ID列表
 }
 
+// BreakpointData 断点数据（对外导出）
+type BreakpointData struct {
+	CompletedTaskNames []string               `json:"completed_task_names"` // 已完成的Task名称列表
+	RunningTaskNames   []string               `json:"running_task_names"`   // 暂停时正在运行的Task名称
+	DAGSnapshot        map[string]interface{} `json:"dag_snapshot"`         // DAG拓扑快照（JSON格式）
+	ContextData        map[string]interface{} `json:"context_data"`         // 上下文数据（Task间传递的中间结果）
+	LastUpdateTime     time.Time              `json:"last_update_time"`     // 最后更新时间
+}
+
 // WorkflowInstance Workflow实例（对外导出）
 type WorkflowInstance struct {
-	ID         string    `json:"instance_id"`
-	WorkflowID string    `json:"workflow_id"`
-	Status     string    `json:"status"` // RUNNING/SUCCESS/FAILED
-	StartTime  time.Time `json:"start_time"`
-	EndTime    time.Time `json:"end_time"`
+	ID           string          `json:"instance_id"`   // 实例ID（系统自动生成的UUID）
+	WorkflowID   string          `json:"workflow_id"`   // Workflow ID
+	Status       string          `json:"status"`        // 状态（Ready/Running/Paused/Terminated/Success/Failed）
+	Breakpoint   *BreakpointData `json:"breakpoint"`    // 断点数据（仅Paused/Terminated状态有值）
+	StartTime    time.Time       `json:"start_time"`    // 启动时间
+	EndTime      *time.Time      `json:"end_time"`      // 结束时间（成功/终止/失败时设置）
+	ErrorMessage string          `json:"error_message"` // 错误信息（失败时设置）
+	CreateTime   time.Time       `json:"create_time"`   // 创建时间
 }
 
 // NewWorkflow 创建Workflow实例（对外导出）
@@ -59,13 +71,27 @@ func NewWorkflow(name, desc string) *Workflow {
 
 // Run 运行Workflow（对外导出）
 func (w *Workflow) Run() (*WorkflowInstance, error) {
+	now := time.Now()
 	instance := &WorkflowInstance{
 		ID:         uuid.NewString(),
 		WorkflowID: w.ID,
-		Status:     "RUNNING",
-		StartTime:  time.Now(),
+		Status:     "Ready", // 初始状态为Ready，等待启动
+		StartTime:  now,
+		CreateTime: now,
 	}
 	return instance, nil
+}
+
+// NewWorkflowInstance 创建WorkflowInstance实例（对外导出）
+func NewWorkflowInstance(workflowID string) *WorkflowInstance {
+	now := time.Now()
+	return &WorkflowInstance{
+		ID:         uuid.NewString(),
+		WorkflowID: workflowID,
+		Status:     "Ready",
+		StartTime:  now,
+		CreateTime: now,
+	}
 }
 
 // GetID 获取Workflow的唯一标识（对外导出）

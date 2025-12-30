@@ -358,4 +358,3 @@ func TestJobFunctionRepository_CRUD(t *testing.T) {
 		t.Fatal("删除后仍能查询到元数据")
 	}
 }
-

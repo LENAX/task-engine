@@ -7,8 +7,8 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/stevelan1995/task-engine/pkg/core/workflow"
-	"github.com/stevelan1995/task-engine/pkg/storage"
+    "github.com/stevelan1995/task-engine/pkg/core/workflow"
+    "github.com/stevelan1995/task-engine/pkg/storage"
 	"github.com/stevelan1995/task-engine/pkg/storage/dao"
 )
 
@@ -92,7 +92,7 @@ func (r *workflowRepo) Save(ctx context.Context, wf *workflow.Workflow) error {
 	if err != nil {
 		return fmt.Errorf("保存Workflow失败: %w", err)
 	}
-	return nil
+    return nil
 }
 
 // GetByID 实现存储接口（内部实现）
@@ -139,11 +139,13 @@ func (r *workflowRepo) GetByID(ctx context.Context, id string) (*workflow.Workfl
 }
 
 // Delete 实现存储接口（内部实现）
+// 幂等性：删除不存在的记录不会报错
 func (r *workflowRepo) Delete(ctx context.Context, id string) error {
 	query := `DELETE FROM workflow_definition WHERE id = ?`
 	_, err := r.db.ExecContext(ctx, query, id)
 	if err != nil {
 		return fmt.Errorf("删除Workflow失败: %w", err)
 	}
-	return nil
+	// 不检查 RowsAffected，删除不存在的记录也是幂等的
+    return nil
 }
