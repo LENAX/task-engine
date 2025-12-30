@@ -26,7 +26,7 @@ func ExecuteTaskHandler(registry *FunctionRegistry, task *Task, status string, r
 	}
 
 	// 检查是否有配置该状态的Handler
-	if task.StatusHandlers == nil || len(task.StatusHandlers) == 0 {
+	if len(task.StatusHandlers) == 0 {
 		return nil // 没有配置Handler，直接返回
 	}
 

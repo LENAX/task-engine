@@ -39,7 +39,7 @@ func TestTaskBuilder_Basic(t *testing.T) {
 		t.Fatalf("注册函数失败: %v", err)
 	}
 
-	task, err := builder.NewTaskBuilderWithRegistry("test-task", "测试任务", registry).
+	task, err := builder.NewTaskBuilder("test-task", "测试任务", registry).
 		WithJobFunction("readFile", map[string]interface{}{"fileName": "test.txt"}).
 		WithTimeout(60).
 		WithRetryCount(3).
@@ -101,7 +101,7 @@ func TestTaskBuilder_WithDependency(t *testing.T) {
 		t.Fatalf("注册函数失败: %v", err)
 	}
 
-	task, err := builder.NewTaskBuilderWithRegistry("task2", "任务2", registry).
+	task, err := builder.NewTaskBuilder("task2", "任务2", registry).
 		WithJobFunction("httpRequest", map[string]interface{}{"url": "https://www.baidu.com"}).
 		WithDependency("task1").
 		Build()
@@ -147,7 +147,7 @@ func TestTaskBuilder_WithDependencies(t *testing.T) {
 		t.Fatalf("注册函数失败: %v", err)
 	}
 
-	task, err := builder.NewTaskBuilderWithRegistry("task3", "任务3", registry).
+	task, err := builder.NewTaskBuilder("task3", "任务3", registry).
 		WithJobFunction("dbQuery", map[string]interface{}{"query": "SELECT * FROM users"}).
 		WithDependencies([]string{"task1", "task2"}).
 		Build()
@@ -166,7 +166,7 @@ func TestTaskBuilder_EmptyName(t *testing.T) {
 	registry := task.NewFunctionRegistry(nil, nil)
 	// WithJobFunction 不再返回错误，校验延迟到 Build() 时进行
 	// Build 应该返回错误（因为名称为空或函数未注册）
-	_, err := builder.NewTaskBuilderWithRegistry("", "描述", registry).
+	_, err := builder.NewTaskBuilder("", "描述", registry).
 		WithJobFunction("func", nil).
 		Build()
 	if err == nil {
@@ -175,7 +175,8 @@ func TestTaskBuilder_EmptyName(t *testing.T) {
 }
 
 func TestTaskBuilder_EmptyJobFuncName(t *testing.T) {
-	builder := builder.NewTaskBuilder("task", "描述")
+	registry := task.NewFunctionRegistry(nil, nil)
+	builder := builder.NewTaskBuilder("task", "描述", registry)
 
 	_, err := builder.Build()
 
@@ -203,7 +204,7 @@ func TestTaskBuilder_DefaultValues(t *testing.T) {
 		t.Fatalf("注册函数失败: %v", err)
 	}
 
-	task, err := builder.NewTaskBuilderWithRegistry("task", "描述", registry).
+	task, err := builder.NewTaskBuilder("task", "描述", registry).
 		WithJobFunction("writeFile", nil).
 		Build()
 
@@ -268,7 +269,7 @@ func TestTaskBuilder_WithTaskHandler_Logging(t *testing.T) {
 	}
 
 	// 创建TaskBuilder并设置Handler
-	taskInstance, err := builder.NewTaskBuilderWithRegistry("download-task", "下载任务", registry).
+	taskInstance, err := builder.NewTaskBuilder("download-task", "下载任务", registry).
 		WithJobFunction("downloadFile", map[string]interface{}{"url": "https://example.com/file.zip"}).
 		WithTaskHandler(task.TaskStatusSuccess, "logHandler").
 		WithTaskHandler(task.TaskStatusFailed, "logHandler").
@@ -349,7 +350,7 @@ func TestTaskBuilder_WithTaskHandler_Database(t *testing.T) {
 	}
 
 	// 创建TaskBuilder并设置Handler
-	taskInstance, err := builder.NewTaskBuilderWithRegistry("process-task", "处理任务", registry).
+	taskInstance, err := builder.NewTaskBuilder("process-task", "处理任务", registry).
 		WithJobFunction("processData", map[string]interface{}{"data": "test data"}).
 		WithTaskHandler(task.TaskStatusSuccess, "dbHandler").
 		WithTaskHandler(task.TaskStatusFailed, "dbHandler").
@@ -433,7 +434,7 @@ func TestTaskBuilder_WithTaskHandler_Combined(t *testing.T) {
 	}
 
 	// 创建TaskBuilder并设置多个Handler
-	taskInstance, err := builder.NewTaskBuilderWithRegistry("upload-task", "上传任务", registry).
+	taskInstance, err := builder.NewTaskBuilder("upload-task", "上传任务", registry).
 		WithJobFunction("uploadFile", map[string]interface{}{"filePath": "/tmp/file.txt"}).
 		WithTaskHandler(task.TaskStatusSuccess, "logHandler").
 		WithTaskHandler(task.TaskStatusSuccess, "dbHandler").

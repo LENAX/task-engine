@@ -21,24 +21,12 @@ type TaskBuilder struct {
 	registry       *task.FunctionRegistry
 }
 
-// NewTaskBuilder 创建Task构建器（对外导出，不包含registry，向后兼容）
-// 注意：如果不传入registry，将无法验证JobFunction和TaskHandler是否存在
-func NewTaskBuilder(name, description string) *TaskBuilder {
-	return &TaskBuilder{
-		name:           name,
-		description:    description,
-		timeoutSeconds: 30, // 默认30秒
-		retryCount:     0,  // 默认0次，即不重试
-		dependencies:   make([]string, 0),
-		params:         make(map[string]interface{}),
-		statusHandlers: make(map[string]string),
-		registry:       nil,
+// NewTaskBuilder 创建Task构建器（对外导出，必须包含registry）
+// registry: 函数注册中心，用于验证JobFunction和TaskHandler是否存在（不能为nil）
+func NewTaskBuilder(name, description string, registry *task.FunctionRegistry) *TaskBuilder {
+	if registry == nil {
+		panic("registry不能为nil，TaskBuilder必须使用registry")
 	}
-}
-
-// NewTaskBuilderWithRegistry 创建Task构建器（对外导出，包含registry用于验证）
-// registry: 函数注册中心，用于验证JobFunction和TaskHandler是否存在
-func NewTaskBuilderWithRegistry(name, description string, registry *task.FunctionRegistry) *TaskBuilder {
 	return &TaskBuilder{
 		name:           name,
 		description:    description,
@@ -141,42 +129,42 @@ func (b *TaskBuilder) WithTaskHandler(status, handlerName string) *TaskBuilder {
 		b.statusHandlers = make(map[string]string)
 	}
 
-	// 如果包含registry，检查Handler是否存在
-	if b.registry != nil {
-		// 先通过名称查找Handler ID
-		handlerID := b.registry.GetTaskHandlerIDByName(handlerName)
-		if handlerID == "" {
-			// 如果通过名称找不到，尝试直接使用handlerName作为ID检查
-			if !b.registry.TaskHandlerExists(handlerName) {
-				// Handler不存在，但先保存名称，在Build()时统一报错
-				b.statusHandlers[status] = handlerName
-				return b
-			}
-			// 如果handlerName是ID，直接使用
-			handlerID = handlerName
-		}
-
-		// 验证Handler确实存在
-		if !b.registry.TaskHandlerExists(handlerID) {
+	// 检查Handler是否存在
+	// 先通过名称查找Handler ID
+	handlerID := b.registry.GetTaskHandlerIDByName(handlerName)
+	if handlerID == "" {
+		// 如果通过名称找不到，尝试直接使用handlerName作为ID检查
+		if !b.registry.TaskHandlerExists(handlerName) {
 			// Handler不存在，但先保存名称，在Build()时统一报错
 			b.statusHandlers[status] = handlerName
 			return b
 		}
-
-		// Handler存在，保存ID
-		b.statusHandlers[status] = handlerID
-	} else {
-		// 没有registry，只保存名称（可能是ID或名称）
-		b.statusHandlers[status] = handlerName
+		// 如果handlerName是ID，直接使用
+		handlerID = handlerName
 	}
+
+	// 验证Handler确实存在
+	if !b.registry.TaskHandlerExists(handlerID) {
+		// Handler不存在，但先保存名称，在Build()时统一报错
+		b.statusHandlers[status] = handlerName
+		return b
+	}
+
+	// Handler存在，保存ID
+	b.statusHandlers[status] = handlerID
 
 	return b
 }
 
 // Build 完成Task构建（对外导出）
 // 自动生成Task UUID作为唯一标识，校验Task名称唯一性
-// 如果TaskBuilder包含registry，会验证所有引用的JobFunction和TaskHandler是否存在
+// 会验证所有引用的JobFunction和TaskHandler是否存在
 func (b *TaskBuilder) Build() (*task.Task, error) {
+	// 校验registry
+	if b.registry == nil {
+		return nil, fmt.Errorf("registry不能为nil，TaskBuilder必须使用registry")
+	}
+
 	// 校验名称
 	if b.name == "" {
 		return nil, fmt.Errorf("Task名称不能为空")
@@ -187,8 +175,8 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 		return nil, fmt.Errorf("Job函数名称不能为空")
 	}
 
-	// 如果包含registry，验证所有引用是否存在
-	if b.registry != nil {
+	// 验证所有引用是否存在
+	{
 		// 验证JobFunction是否存在（延迟校验）
 		// 尝试通过名称查找函数ID
 		funcID := b.registry.GetIDByName(b.jobFuncName)

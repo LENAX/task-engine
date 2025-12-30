@@ -10,6 +10,7 @@ import (
 	"github.com/stevelan1995/task-engine/internal/storage/sqlite"
 	"github.com/stevelan1995/task-engine/pkg/core/builder"
 	"github.com/stevelan1995/task-engine/pkg/core/engine"
+	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
 
@@ -76,7 +77,8 @@ func TestWorkflowController_StateTransitions(t *testing.T) {
 	ctx := context.Background()
 
 	// 创建测试Workflow
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
+	registry := task.NewFunctionRegistry(nil, nil)
+	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
 
@@ -184,7 +186,8 @@ func TestEngine_SubmitWorkflow(t *testing.T) {
 	ctx := context.Background()
 
 	// 创建测试Workflow
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
+	registry := task.NewFunctionRegistry(nil, nil)
+	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
 
@@ -228,7 +231,8 @@ func TestEngine_PauseAndResumeWorkflowInstance(t *testing.T) {
 	ctx := context.Background()
 
 	// 创建并提交Workflow
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
+	registry := task.NewFunctionRegistry(nil, nil)
+	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
 
@@ -286,7 +290,8 @@ func TestEngine_TerminateWorkflowInstance(t *testing.T) {
 	ctx := context.Background()
 
 	// 创建并提交Workflow
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
+	registry := task.NewFunctionRegistry(nil, nil)
+	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
 

@@ -1,22 +1,39 @@
 package unit
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stevelan1995/task-engine/pkg/core/builder"
+	"github.com/stevelan1995/task-engine/pkg/core/task"
 )
 
 func TestWorkflowBuilder_Basic(t *testing.T) {
+	registry := task.NewFunctionRegistry(nil, nil)
+	ctx := context.Background()
+
+	// 注册函数
+	func1 := func(ctx *task.TaskContext) (interface{}, error) { return "result1", nil }
+	func2 := func(ctx *task.TaskContext) (interface{}, error) { return "result2", nil }
+	registry.Register(ctx, "func1", func1, "函数1")
+	registry.Register(ctx, "func2", func2, "函数2")
+
 	wfBuilder := builder.NewWorkflowBuilder("test-workflow", "测试工作流")
 
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
+	task1, err := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
+	if err != nil {
+		t.Fatalf("构建task1失败: %v", err)
+	}
 
-	task2, _ := builder.NewTaskBuilder("task2", "任务2").
+	task2, err := builder.NewTaskBuilder("task2", "任务2", registry).
 		WithJobFunction("func2", nil).
 		WithDependency("task1").
 		Build()
+	if err != nil {
+		t.Fatalf("构建task2失败: %v", err)
+	}
 
 	workflow, err := wfBuilder.
 		WithName("updated-name").
@@ -55,13 +72,22 @@ func TestWorkflowBuilder_Basic(t *testing.T) {
 }
 
 func TestWorkflowBuilder_DuplicateTaskName(t *testing.T) {
+	registry := task.NewFunctionRegistry(nil, nil)
+	ctx := context.Background()
+
+	// 注册函数
+	func1 := func(ctx *task.TaskContext) (interface{}, error) { return "result1", nil }
+	func2 := func(ctx *task.TaskContext) (interface{}, error) { return "result2", nil }
+	registry.Register(ctx, "func1", func1, "函数1")
+	registry.Register(ctx, "func2", func2, "函数2")
+
 	wfBuilder := builder.NewWorkflowBuilder("workflow", "描述")
 
-	task1, _ := builder.NewTaskBuilder("same-name", "任务1").
+	task1, _ := builder.NewTaskBuilder("same-name", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
 
-	task2, _ := builder.NewTaskBuilder("same-name", "任务2").
+	task2, _ := builder.NewTaskBuilder("same-name", "任务2", registry).
 		WithJobFunction("func2", nil).
 		Build()
 
@@ -76,9 +102,16 @@ func TestWorkflowBuilder_DuplicateTaskName(t *testing.T) {
 }
 
 func TestWorkflowBuilder_MissingDependency(t *testing.T) {
+	registry := task.NewFunctionRegistry(nil, nil)
+	ctx := context.Background()
+
+	// 注册函数
+	func1 := func(ctx *task.TaskContext) (interface{}, error) { return "result1", nil }
+	registry.Register(ctx, "func1", func1, "函数1")
+
 	wfBuilder := builder.NewWorkflowBuilder("workflow", "描述")
 
-	task, _ := builder.NewTaskBuilder("task1", "任务1").
+	task, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		WithDependency("non-existent-task").
 		Build()
@@ -93,9 +126,16 @@ func TestWorkflowBuilder_MissingDependency(t *testing.T) {
 }
 
 func TestWorkflowBuilder_SelfDependency(t *testing.T) {
+	registry := task.NewFunctionRegistry(nil, nil)
+	ctx := context.Background()
+
+	// 注册函数
+	func1 := func(ctx *task.TaskContext) (interface{}, error) { return "result1", nil }
+	registry.Register(ctx, "func1", func1, "函数1")
+
 	wfBuilder := builder.NewWorkflowBuilder("workflow", "描述")
 
-	task, _ := builder.NewTaskBuilder("task1", "任务1").
+	task, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		WithDependency("task1"). // 依赖自己
 		Build()
@@ -124,22 +164,42 @@ func TestWorkflowBuilder_EmptyWorkflow(t *testing.T) {
 }
 
 func TestWorkflowBuilder_ComplexDependencies(t *testing.T) {
+	registry := task.NewFunctionRegistry(nil, nil)
+	ctx := context.Background()
+
+	// 注册函数
+	func1 := func(ctx *task.TaskContext) (interface{}, error) { return "result1", nil }
+	func2 := func(ctx *task.TaskContext) (interface{}, error) { return "result2", nil }
+	func3 := func(ctx *task.TaskContext) (interface{}, error) { return "result3", nil }
+	registry.Register(ctx, "func1", func1, "函数1")
+	registry.Register(ctx, "func2", func2, "函数2")
+	registry.Register(ctx, "func3", func3, "函数3")
+
 	wfBuilder := builder.NewWorkflowBuilder("workflow", "描述")
 
 	// 创建多个Task，形成依赖链：task1 -> task2 -> task3
-	task1, _ := builder.NewTaskBuilder("task1", "任务1").
+	task1, err := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
+	if err != nil {
+		t.Fatalf("构建task1失败: %v", err)
+	}
 
-	task2, _ := builder.NewTaskBuilder("task2", "任务2").
+	task2, err := builder.NewTaskBuilder("task2", "任务2", registry).
 		WithJobFunction("func2", nil).
 		WithDependency("task1").
 		Build()
+	if err != nil {
+		t.Fatalf("构建task2失败: %v", err)
+	}
 
-	task3, _ := builder.NewTaskBuilder("task3", "任务3").
+	task3, err := builder.NewTaskBuilder("task3", "任务3", registry).
 		WithJobFunction("func3", nil).
 		WithDependencies([]string{"task1", "task2"}).
 		Build()
+	if err != nil {
+		t.Fatalf("构建task3失败: %v", err)
+	}
 
 	workflow, err := wfBuilder.
 		WithTask(task1).

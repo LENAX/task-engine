@@ -31,7 +31,7 @@ func TestExecutor_Basic(t *testing.T) {
 	}
 	exec.SetRegistry(registry)
 
-	taskBuilder := builder.NewTaskBuilderWithRegistry("task1", "任务1", registry)
+	taskBuilder := builder.NewTaskBuilder("task1", "任务1", registry)
 	taskBuilder = taskBuilder.WithJobFunction("func1", nil)
 	task1, err := taskBuilder.Build()
 	if err != nil {
@@ -142,7 +142,7 @@ func TestExecutor_ConcurrentExecution(t *testing.T) {
 	// 提交10个任务
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
-		taskBuilder := builder.NewTaskBuilderWithRegistry("task"+string(rune(i)), "任务", registry)
+		taskBuilder := builder.NewTaskBuilder("task"+string(rune(i)), "任务", registry)
 		taskBuilder = taskBuilder.WithJobFunction("func", nil)
 		task, err := taskBuilder.Build()
 		if err != nil {
@@ -204,7 +204,7 @@ func TestExecutor_Timeout(t *testing.T) {
 	}
 	exec.SetRegistry(registry)
 
-	taskBuilder := builder.NewTaskBuilderWithRegistry("task1", "任务1", registry)
+	taskBuilder := builder.NewTaskBuilder("task1", "任务1", registry)
 	taskBuilder = taskBuilder.WithJobFunction("func1", nil)
 	task1, err := taskBuilder.
 		WithTimeout(1). // 1秒超时
@@ -270,7 +270,7 @@ func TestExecutor_Shutdown(t *testing.T) {
 
 	// 提交一些任务
 	for i := 0; i < 5; i++ {
-		taskBuilder := builder.NewTaskBuilderWithRegistry("task"+string(rune(i)), "任务", registry)
+		taskBuilder := builder.NewTaskBuilder("task"+string(rune(i)), "任务", registry)
 		taskBuilder = taskBuilder.WithJobFunction("func", nil)
 		task, err := taskBuilder.Build()
 		if err != nil {
@@ -290,7 +290,7 @@ func TestExecutor_Shutdown(t *testing.T) {
 	_ = exec.Shutdown()
 
 	// 尝试提交新任务应该失败
-	newTaskBuilder := builder.NewTaskBuilderWithRegistry("new-task", "新任务", registry)
+	newTaskBuilder := builder.NewTaskBuilder("new-task", "新任务", registry)
 	newTaskBuilder = newTaskBuilder.WithJobFunction("func", nil)
 	task, err := newTaskBuilder.Build()
 	if err != nil {

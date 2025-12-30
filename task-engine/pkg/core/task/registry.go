@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"log"
 	"reflect"
 	"sync"
 
@@ -94,6 +95,10 @@ func (r *FunctionRegistry) Register(ctx context.Context, name string, fn interfa
 	r.functions[meta.ID] = wrappedFunc
 	r.metaMap[meta.ID] = meta
 	r.mu.Unlock()
+
+	// 打印函数注册日志
+	log.Printf("📝 [函数注册成功] FuncID=%s, FuncName=%s, Description=%s",
+		meta.ID, meta.Name, meta.Description)
 
 	return meta.ID, nil
 }
@@ -338,6 +343,10 @@ func (r *FunctionRegistry) RegisterTaskHandler(ctx context.Context, name string,
 	r.taskHandlers[handlerID] = handler
 	r.handlerMeta[handlerID] = meta
 	r.mu.Unlock()
+
+	// 打印Handler注册日志
+	log.Printf("📝 [TaskHandler注册成功] HandlerID=%s, HandlerName=%s, Description=%s",
+		handlerID, meta.Name, meta.Description)
 
 	return handlerID, nil
 }

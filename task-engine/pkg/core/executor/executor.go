@@ -344,11 +344,20 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 
 	// 获取Job函数
 	jobFunc := e.registry.GetByName(t.JobFuncName)
+	var funcID string
 	if jobFunc == nil {
 		// 尝试通过JobFuncID获取
 		jobFunc = e.registry.Get(t.JobFuncID)
+		funcID = t.JobFuncID
+	} else {
+		// 通过名称获取到函数，查找对应的ID
+		funcID = e.registry.GetIDByName(t.JobFuncName)
+		if funcID == "" {
+			funcID = t.JobFuncName
+		}
 	}
 	if jobFunc == nil {
+		log.Printf("❌ [Task执行失败] TaskID=%s, TaskName=%s, 原因: Job函数 %s 未找到", t.ID, t.Name, t.JobFuncName)
 		result := &TaskResult{
 			TaskID:   t.ID,
 			Status:   "Failed",
@@ -360,6 +369,10 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		}
 		return
 	}
+
+	// 打印函数执行开始日志
+	log.Printf("🚀 [开始执行函数] TaskID=%s, TaskName=%s, JobFuncName=%s, JobFuncID=%s, 参数=%v",
+		t.ID, t.Name, t.JobFuncName, funcID, t.Params)
 
 	// 创建执行上下文
 	ctx := context.Background()
@@ -386,6 +399,7 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	)
 
 	// 执行Job函数
+	log.Printf("📞 [调用函数] TaskID=%s, TaskName=%s, JobFuncName=%s, 开始执行...", t.ID, t.Name, t.JobFuncName)
 	stateCh := jobFunc(taskCtx)
 
 	// 监听执行结果
@@ -402,15 +416,21 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 
 		if state.Status == "Success" {
 			t.Status = task.TaskStatusSuccess
+			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%v",
+				t.ID, t.Name, t.JobFuncName, duration, state.Data)
 			if pendingTask.OnComplete != nil {
 				pendingTask.OnComplete(result)
 			}
 		} else {
 			t.Status = task.TaskStatusFailed
+			log.Printf("❌ [函数执行失败] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 错误=%v",
+				t.ID, t.Name, t.JobFuncName, duration, state.Error)
 			// 检查是否需要重试
 			if pendingTask.RetryCount < pendingTask.MaxRetries {
 				// 重试：计算重试间隔（1s、2s、4s...）
 				retryDelay := time.Duration(1<<uint(pendingTask.RetryCount)) * time.Second
+				log.Printf("🔄 [准备重试] TaskID=%s, TaskName=%s, 当前重试次数=%d, 延迟=%v",
+					t.ID, t.Name, pendingTask.RetryCount, retryDelay)
 				time.Sleep(retryDelay)
 				// 重新提交任务
 				pendingTask.RetryCount++
@@ -425,6 +445,8 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		// 超时
 		duration := time.Since(startTime).Milliseconds()
 		t.Status = task.TaskStatusTimeout
+		log.Printf("⏱️  [函数执行超时] TaskID=%s, TaskName=%s, JobFuncName=%s, 超时时间=%ds, 耗时=%dms",
+			t.ID, t.Name, t.JobFuncName, timeoutSeconds, duration)
 		result := &TaskResult{
 			TaskID:   t.ID,
 			Status:   "TimeoutFailed",
