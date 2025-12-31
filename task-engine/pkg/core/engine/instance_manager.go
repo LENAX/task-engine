@@ -31,6 +31,7 @@ type WorkflowInstanceManager struct {
 	taskRepo             storage.TaskRepository
 	workflowInstanceRepo storage.WorkflowInstanceRepository
 	registry             *task.FunctionRegistry
+	wg                   sync.WaitGroup // 用于等待所有协程完成
 }
 
 // NewWorkflowInstanceManager 创建WorkflowInstanceManager（内部方法）
@@ -96,10 +97,18 @@ func (m *WorkflowInstanceManager) Start() {
 	}
 
 	// 启动任务提交协程
-	go m.taskSubmissionGoroutine()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.taskSubmissionGoroutine()
+	}()
 
 	// 启动控制信号处理协程
-	go m.controlSignalGoroutine()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.controlSignalGoroutine()
+	}()
 }
 
 // taskSubmissionGoroutine 任务提交协程（Goroutine 1）
@@ -124,6 +133,18 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 			availableTasks := m.getAvailableTasks()
 			if len(availableTasks) == 0 {
 				// 检查是否所有任务都已完成
+				// 注意：需要等待一段时间，让Handler有机会添加子任务
+				// 因为Handler是在goroutine中异步执行的
+				time.Sleep(100 * time.Millisecond) // 等待Handler执行完成
+
+				// 再次检查是否有可执行任务（可能在等待期间添加了子任务）
+				availableTasks = m.getAvailableTasks()
+				if len(availableTasks) > 0 {
+					// 有新任务可执行，继续处理
+					continue
+				}
+
+				// 再次检查是否所有任务都已完成
 				if m.isAllTasksCompleted() {
 					m.mu.Lock()
 					m.instance.Status = "Success"
@@ -133,6 +154,16 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 
 					ctx := context.Background()
 					m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Success")
+
+					// 发送状态更新通知（重要：让Controller知道workflow已完成）
+					select {
+					case m.statusUpdateChan <- "Success":
+						// 状态更新已发送
+					default:
+						// 通道已满，记录警告（但不应发生，因为状态更新通道有缓冲）
+						log.Printf("警告: WorkflowInstance %s 状态更新通道已满，状态更新可能丢失", m.instance.ID)
+					}
+
 					log.Printf("WorkflowInstance %s: 所有任务已完成", m.instance.ID)
 					return
 				}
@@ -355,13 +386,36 @@ func (m *WorkflowInstanceManager) getAvailableTasks() []workflow.Task {
 
 // isAllTasksCompleted 检查是否所有任务都已完成
 func (m *WorkflowInstanceManager) isAllTasksCompleted() bool {
+	// 注意：m.workflow.GetTasks() 可能包含动态添加的子任务，所以需要实时获取
 	totalTasks := len(m.workflow.GetTasks())
 	processedCount := 0
 	m.processedNodes.Range(func(key, value interface{}) bool {
 		processedCount++
 		return true
 	})
-	return processedCount >= totalTasks
+
+	// 如果已处理的任务数小于总任务数，说明还有未完成的任务
+	if processedCount < totalTasks {
+		return false
+	}
+
+	// 还需要检查是否有任务在候选队列中但未处理
+	hasUnprocessedCandidate := false
+	m.candidateNodes.Range(func(key, value interface{}) bool {
+		taskID := key.(string)
+		if _, processed := m.processedNodes.Load(taskID); !processed {
+			hasUnprocessedCandidate = true
+			return false // 停止遍历
+		}
+		return true
+	})
+
+	// 如果有未处理的候选任务，说明还有任务未完成
+	if hasUnprocessedCandidate {
+		return false
+	}
+
+	return true
 }
 
 // findTaskIDByName 通过Task名称查找Task ID
@@ -685,4 +739,112 @@ func (m *WorkflowInstanceManager) GetControlSignalChannel() chan<- workflow.Cont
 // 用于Engine转发状态更新到Controller
 func (m *WorkflowInstanceManager) GetStatusUpdateChannel() <-chan string {
 	return m.statusUpdateChan
+}
+
+// AddSubTask 动态添加子任务到WorkflowInstance（内部方法）
+// subTask: 动态生成的子Task
+// parentTaskID: 父Task ID
+func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID string) error {
+	if subTask == nil {
+		return fmt.Errorf("子Task不能为空")
+	}
+	if subTask.GetID() == "" {
+		return fmt.Errorf("子Task ID不能为空")
+	}
+	if subTask.GetName() == "" {
+		return fmt.Errorf("子Task名称不能为空")
+	}
+
+	// 检查父Task是否存在
+	if _, exists := m.workflow.GetTasks()[parentTaskID]; !exists {
+		return fmt.Errorf("父Task %s 不存在", parentTaskID)
+	}
+
+	// 检查子Task ID是否重复
+	if _, exists := m.workflow.GetTasks()[subTask.GetID()]; exists {
+		return fmt.Errorf("子Task ID %s 已存在", subTask.GetID())
+	}
+
+	// 检查子Task名称是否唯一
+	for taskID, t := range m.workflow.GetTasks() {
+		if t.GetName() == subTask.GetName() && taskID != subTask.GetID() {
+			return fmt.Errorf("Task名称 %s 已存在", subTask.GetName())
+		}
+	}
+
+	// 1. 将子Task添加到Workflow的Tasks映射中
+	m.workflow.Tasks[subTask.GetID()] = subTask
+
+	// 2. 更新Workflow的Dependencies映射（子任务依赖父任务）
+	if m.workflow.Dependencies == nil {
+		m.workflow.Dependencies = make(map[string][]string)
+	}
+	// 检查是否已存在该依赖
+	found := false
+	for _, depID := range m.workflow.Dependencies[subTask.GetID()] {
+		if depID == parentTaskID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.workflow.Dependencies[subTask.GetID()] = append(m.workflow.Dependencies[subTask.GetID()], parentTaskID)
+	}
+
+	// 3. 更新DAG，添加子任务节点和依赖关系
+	if err := m.dag.AddNode(subTask.GetID(), subTask.GetName(), subTask, []string{parentTaskID}); err != nil {
+		// 如果DAG添加失败，回滚Workflow的更改
+		delete(m.workflow.Tasks, subTask.GetID())
+		delete(m.workflow.Dependencies, subTask.GetID())
+		return fmt.Errorf("添加子任务到DAG失败: %w", err)
+	}
+
+	// 4. 检查子任务的依赖是否已满足，如果满足则加入候选队列
+	allDepsProcessed := true
+	subTaskDeps := subTask.GetDependencies()
+	for _, depName := range subTaskDeps {
+		depTaskID := m.findTaskIDByName(depName)
+		if depTaskID == "" {
+			allDepsProcessed = false
+			break
+		}
+		// 检查依赖是否已处理（通过processedNodes）
+		if _, processed := m.processedNodes.Load(depTaskID); !processed {
+			allDepsProcessed = false
+			break
+		}
+	}
+
+	// 如果子任务的依赖已满足，加入候选队列
+	if allDepsProcessed {
+		m.candidateNodes.Store(subTask.GetID(), subTask)
+		log.Printf("WorkflowInstance %s: 子任务 %s 已添加，依赖已满足，加入候选队列", m.instance.ID, subTask.GetName())
+	} else {
+		log.Printf("WorkflowInstance %s: 子任务 %s 已添加，等待依赖满足", m.instance.ID, subTask.GetName())
+	}
+
+	return nil
+}
+
+// Shutdown 优雅关闭WorkflowInstanceManager（内部方法）
+// 取消context，等待所有协程完成
+func (m *WorkflowInstanceManager) Shutdown() {
+	// 取消context，通知所有协程退出
+	m.cancel()
+
+	// 等待所有协程完成（最多等待30秒）
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 所有协程已完成
+		log.Printf("WorkflowInstance %s: 所有协程已退出", m.instance.ID)
+	case <-time.After(30 * time.Second):
+		// 超时，记录日志
+		log.Printf("WorkflowInstance %s: 等待协程退出超时", m.instance.ID)
+	}
 }
