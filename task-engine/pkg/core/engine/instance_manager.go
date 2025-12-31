@@ -96,6 +96,15 @@ func (m *WorkflowInstanceManager) Start() {
 		log.Printf("更新WorkflowInstance状态失败: %v", err)
 	}
 
+	// 发送状态更新通知（重要：让Controller知道状态已变为Running）
+	select {
+	case m.statusUpdateChan <- "Running":
+		// 状态更新已发送
+	default:
+		// 通道已满，记录警告（但不应发生，因为状态更新通道有缓冲）
+		log.Printf("警告: WorkflowInstance %s 状态更新通道已满，状态更新可能丢失", m.instance.ID)
+	}
+
 	// 启动任务提交协程
 	m.wg.Add(1)
 	go func() {

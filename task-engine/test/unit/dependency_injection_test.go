@@ -159,11 +159,23 @@ func TestDependencyInjection_DuplicateRegistration(t *testing.T) {
 		t.Fatalf("注册依赖失败: %v", err)
 	}
 
-	// 尝试注册相同类型的依赖（应该失败）
+	// 尝试注册相同类型的依赖（现在允许更新，不返回错误）
+	// 这是设计上的改变，允许重新注册依赖以支持更新场景
 	repo2 := &mockRepositoryImpl{}
 	err := registry.RegisterDependency(repo2)
-	if err == nil {
-		t.Error("期望注册重复依赖时返回错误，但未返回错误")
+	if err != nil {
+		t.Errorf("注册重复依赖应该允许更新，但返回了错误: %v", err)
+	}
+
+	// 验证依赖已被更新（应该获取到repo2而不是repo1）
+	ctx := context.Background()
+	ctx = registry.WithDependencies(ctx)
+	dep, ok := task.GetDependency[*mockRepositoryImpl](ctx)
+	if !ok {
+		t.Error("期望能够获取依赖，但未找到")
+	}
+	if dep != repo2 {
+		t.Error("期望获取到更新后的依赖（repo2），但获取到了旧的依赖（repo1）")
 	}
 }
 
