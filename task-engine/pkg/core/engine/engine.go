@@ -7,11 +7,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stevelan1995/task-engine/pkg/config"
+	"github.com/stevelan1995/task-engine/pkg/core/builder"
 	"github.com/stevelan1995/task-engine/pkg/core/executor"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
+
+// WorkflowDefinition 工作流定义（封装配置文件加载结果）
+type WorkflowDefinition struct {
+	ID         string                 // 工作流ID
+	Config     *config.WorkflowConfig // 工作流配置
+	SourcePath string                 // 配置文件路径
+	Workflow   *workflow.Workflow     // 转换后的Workflow对象
+}
 
 // Engine 调度引擎核心结构体（对外导出）
 type Engine struct {
@@ -20,6 +30,10 @@ type Engine struct {
 	workflowInstanceRepo storage.WorkflowInstanceRepository
 	taskRepo             storage.TaskRepository
 	registry             *task.FunctionRegistry
+	cfg                  *config.EngineConfig   // 框架配置
+	jobRegistry          map[string]interface{} // Job函数注册表（funcKey -> function）
+	callbackRegistry     map[string]interface{} // Callback函数注册表（funcKey -> function）
+	serviceRegistry      map[string]interface{} // 服务依赖注册表（serviceKey -> service）
 	running              bool
 	MaxConcurrency       int
 	Timeout              int
@@ -72,7 +86,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.executor.SetRegistry(e.registry)
 
 	e.running = true
-	log.Println("✅ 量化任务引擎已启动")
+	log.Println("✅ 异步任务调度引擎已启动")
 
 	// 恢复未完成的WorkflowInstance（文档1.2节要求）
 	if err := e.restoreUnfinishedInstances(ctx); err != nil {
@@ -81,6 +95,31 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// GetRegistry 获取函数注册中心（对外导出，用于测试和函数注册）
+func (e *Engine) GetRegistry() *task.FunctionRegistry {
+	return e.registry
+}
+
+// AddSubTaskToInstance 向指定的WorkflowInstance添加子任务（对外导出）
+// instanceID: WorkflowInstance ID
+// subTask: 动态生成的子Task
+// parentTaskID: 父Task ID
+func (e *Engine) AddSubTaskToInstance(ctx context.Context, instanceID string, subTask workflow.Task, parentTaskID string) error {
+	if !e.running {
+		return fmt.Errorf("引擎未启动")
+	}
+
+	e.mu.RLock()
+	manager, exists := e.managers[instanceID]
+	e.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("WorkflowInstance %s 不存在", instanceID)
+	}
+
+	return manager.AddSubTask(subTask, parentTaskID)
 }
 
 // restoreUnfinishedInstances 恢复未完成的WorkflowInstance（内部方法）
@@ -214,9 +253,23 @@ func (e *Engine) Stop() {
 	}
 
 	// 3. 等待所有WorkflowInstance完成终止流程（最多等待30秒）
-	// 注意：这里简化处理，实际应该使用WaitGroup等待所有协程完成
-	// 由于WorkflowInstanceManager内部没有WaitGroup，这里先等待一段时间
-	time.Sleep(2 * time.Second)
+	// 使用WaitGroup等待所有Manager的协程完成
+	done := make(chan struct{})
+	go func() {
+		for _, manager := range instances {
+			manager.Shutdown()
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 所有Manager已完成关闭
+		log.Println("所有WorkflowInstance已关闭")
+	case <-time.After(30 * time.Second):
+		// 超时，记录日志
+		log.Println("等待WorkflowInstance关闭超时")
+	}
 
 	// 4. 保存所有Running状态的WorkflowInstance的断点数据
 	ctx := context.Background()
@@ -247,7 +300,144 @@ func (e *Engine) Stop() {
 	e.controllers = make(map[string]workflow.WorkflowController)
 	e.mu.Unlock()
 
-	log.Println("✅ 量化任务引擎已停止")
+	log.Println("✅ 异步任务任务调度引擎已停止")
+}
+
+// LoadWorkflow 加载工作流定义（从文件）
+func (e *Engine) LoadWorkflow(workflowConfigPath string) (*WorkflowDefinition, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if !e.running {
+		return nil, fmt.Errorf("engine not started, call Start() first")
+	}
+
+	// 1. 加载业务配置
+	wfConfig, err := config.LoadWorkflowConfig(workflowConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("load workflow config failed: %w", err)
+	}
+
+	// 2. 应用默认值（基于框架配置）
+	if e.cfg != nil {
+		defaultTimeout := e.cfg.GetDefaultTaskTimeout()
+		wfConfig.ApplyDefaults(defaultTimeout)
+	}
+
+	// 3. 校验配置合法性
+	// 构建jobRegistry map用于校验（从FunctionRegistry中获取）
+	jobRegistryMap := make(map[string]interface{})
+	// 通过GetIDByName和GetByName方法获取已注册的函数
+	// 遍历配置中的func_key，检查是否已注册
+	for _, jobDef := range wfConfig.Workflows.Jobs {
+		funcID := e.registry.GetIDByName(jobDef.FuncKey)
+		if funcID != "" {
+			// 函数已注册，添加到map中用于校验
+			if fn := e.registry.GetByName(jobDef.FuncKey); fn != nil {
+				jobRegistryMap[jobDef.FuncKey] = fn
+			}
+		}
+	}
+
+	if err := config.ValidateWorkflowConfig(wfConfig, jobRegistryMap, e.cfg.GetDefaultTaskTimeout()); err != nil {
+		return nil, fmt.Errorf("validate workflow config failed: %w", err)
+	}
+
+	// 4. 转换为Workflow对象（使用第一个Workflow定义）
+	if len(wfConfig.Workflows.Definitions) == 0 {
+		return nil, fmt.Errorf("workflow config contains no workflow definitions")
+	}
+
+	wfDef := wfConfig.Workflows.Definitions[0]
+	wf, err := e.convertWorkflowConfigToWorkflow(wfConfig, &wfDef)
+	if err != nil {
+		return nil, fmt.Errorf("convert workflow config to workflow failed: %w", err)
+	}
+
+	return &WorkflowDefinition{
+		ID:         wfDef.WorkflowID,
+		Config:     wfConfig,
+		SourcePath: workflowConfigPath,
+		Workflow:   wf,
+	}, nil
+}
+
+// convertWorkflowConfigToWorkflow 将WorkflowConfig转换为Workflow对象
+func (e *Engine) convertWorkflowConfigToWorkflow(wfConfig *config.WorkflowConfig, wfDef *config.WorkflowDefinition) (*workflow.Workflow, error) {
+	// 使用WorkflowBuilder构建Workflow
+	wfBuilder := builder.NewWorkflowBuilder(wfDef.WorkflowID, wfDef.Description)
+
+	// 转换Tasks
+	for _, taskDef := range wfDef.Tasks {
+		// 获取Job定义
+		jobDef := wfConfig.GetJobByID(taskDef.JobID)
+		if jobDef == nil {
+			return nil, fmt.Errorf("job %s not found", taskDef.JobID)
+		}
+
+		// 创建TaskBuilder
+		taskBuilder := builder.NewTaskBuilder(taskDef.TaskID, "", e.registry)
+		taskBuilder = taskBuilder.WithJobFunction(jobDef.FuncKey, convertParamsToInterface(taskDef.Params))
+
+		// 设置超时时间
+		if jobDef.Timeout > 0 {
+			taskBuilder = taskBuilder.WithTimeout(int(jobDef.Timeout.Seconds()))
+		}
+
+		// 设置依赖
+		if len(taskDef.Dependencies) > 0 {
+			taskBuilder = taskBuilder.WithDependencies(taskDef.Dependencies)
+		}
+
+		// 设置Callbacks（转换为TaskHandler）
+		for _, callback := range taskDef.Callbacks {
+			// 将callback state映射到task status
+			status := mapCallbackStateToTaskStatus(callback.State)
+			if status != "" {
+				taskBuilder = taskBuilder.WithTaskHandler(status, callback.FuncKey)
+			}
+		}
+
+		// 构建Task
+		t, err := taskBuilder.Build()
+		if err != nil {
+			return nil, fmt.Errorf("build task %s failed: %w", taskDef.TaskID, err)
+		}
+
+		// 添加到WorkflowBuilder
+		wfBuilder = wfBuilder.WithTask(t)
+	}
+
+	// 构建Workflow
+	wf, err := wfBuilder.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build workflow failed: %w", err)
+	}
+
+	return wf, nil
+}
+
+// convertParamsToInterface 将map[string]string转换为map[string]interface{}
+func convertParamsToInterface(params map[string]string) map[string]interface{} {
+	result := make(map[string]interface{})
+	for k, v := range params {
+		result[k] = v
+	}
+	return result
+}
+
+// mapCallbackStateToTaskStatus 将callback state映射到task status
+func mapCallbackStateToTaskStatus(state string) string {
+	switch state {
+	case "success":
+		return task.TaskStatusSuccess
+	case "failed":
+		return task.TaskStatusFailed
+	case "timeout":
+		return task.TaskStatusTimeout
+	default:
+		return ""
+	}
 }
 
 // RegisterWorkflow 注册Workflow到引擎（对外导出）
@@ -332,6 +522,73 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 
 	log.Printf("✅ 提交Workflow成功，创建WorkflowInstance: %s，已启动执行", instance.ID)
 	return controller, nil
+}
+
+// WaitForAllWorkflows 等待所有workflow完成后退出（对外导出）
+// timeout: 可选超时参数，如果提供则使用该超时，否则无限等待
+// 返回: 如果有任何workflow失败或超时，返回错误
+func (e *Engine) WaitForAllWorkflows(timeout ...time.Duration) error {
+	e.mu.RLock()
+	// 获取所有controllers的快照
+	controllers := make([]workflow.WorkflowController, 0, len(e.controllers))
+	for _, controller := range e.controllers {
+		controllers = append(controllers, controller)
+	}
+	e.mu.RUnlock()
+
+	// 如果没有workflow，直接返回
+	if len(controllers) == 0 {
+		return nil
+	}
+
+	// 使用WaitGroup并发等待所有workflow
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(controllers))
+
+	// 为每个workflow启动一个goroutine等待
+	for _, controller := range controllers {
+		wg.Add(1)
+		go func(ctrl workflow.WorkflowController) {
+			defer wg.Done()
+			if err := ctrl.Wait(timeout...); err != nil {
+				errChan <- fmt.Errorf("workflow %s 等待失败: %w", ctrl.InstanceID(), err)
+			}
+		}(controller)
+	}
+
+	// 等待所有goroutine完成
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// 如果有超时，使用带超时的等待
+	if len(timeout) > 0 && timeout[0] > 0 {
+		select {
+		case <-done:
+			// 所有workflow完成
+		case <-time.After(timeout[0]):
+			// 超时
+			return fmt.Errorf("等待所有workflow完成超时（%v）", timeout[0])
+		}
+	} else {
+		// 无限等待
+		<-done
+	}
+
+	// 检查是否有错误
+	close(errChan)
+	var errors []error
+	for err := range errChan {
+		errors = append(errors, err)
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("部分workflow失败: %v", errors)
+	}
+
+	return nil
 }
 
 // PauseWorkflowInstance 暂停WorkflowInstance（对外导出）

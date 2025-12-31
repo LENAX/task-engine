@@ -23,10 +23,17 @@ type WorkflowController interface {
 	Resume() error
 	// Terminate 终止当前关联的WorkflowInstance
 	Terminate() error
-	// GetStatus 查询当前关联的WorkflowInstance状态
+	// GetStatus 查询当前关联的WorkflowInstance状态（返回error）
 	GetStatus() (string, error)
+	// Status 查询当前关联的WorkflowInstance状态（非阻塞，不返回error）
+	Status() string
+	// Wait 阻塞等待工作流完成（支持可选超时参数）
+	// timeout: 可选超时参数，如果提供则使用该超时，否则无限等待
+	Wait(timeout ...time.Duration) error
 	// GetInstanceID 获取当前关联的WorkflowInstance唯一标识
 	GetInstanceID() string
+	// InstanceID 获取当前关联的WorkflowInstance唯一标识（别名方法，简化API）
+	InstanceID() string
 	// UpdateStatus 更新状态（内部方法，供Engine使用）
 	// 注意：这不是接口方法，但Engine可以通过类型断言访问
 	UpdateStatus(newStatus string)
@@ -40,6 +47,7 @@ type workflowController struct {
 	status            string
 	controlSignalChan chan ControlSignal
 	statusUpdateChan  chan string
+	doneChan          chan struct{} // 工作流完成信号通道
 	mu                sync.RWMutex
 	onPause           func() error
 	onResume          func() error
@@ -54,6 +62,7 @@ func NewWorkflowController(instanceID string) WorkflowController {
 		status:            "Ready",
 		controlSignalChan: make(chan ControlSignal, 10), // 带缓冲，容量10
 		statusUpdateChan:  make(chan string, 10),
+		doneChan:          make(chan struct{}),
 	}
 }
 
@@ -70,6 +79,7 @@ func NewWorkflowControllerWithCallbacks(
 		status:            "Ready",
 		controlSignalChan: make(chan ControlSignal, 10),
 		statusUpdateChan:  make(chan string, 10),
+		doneChan:          make(chan struct{}),
 		onPause:           onPause,
 		onResume:          onResume,
 		onTerminate:       onTerminate,
@@ -80,6 +90,85 @@ func NewWorkflowControllerWithCallbacks(
 // GetInstanceID 获取WorkflowInstance唯一标识（对外导出）
 func (c *workflowController) GetInstanceID() string {
 	return c.instanceID
+}
+
+// InstanceID 获取WorkflowInstance唯一标识（别名方法，简化API）
+func (c *workflowController) InstanceID() string {
+	return c.instanceID
+}
+
+// Status 查询WorkflowInstance状态（非阻塞，不返回error）
+func (c *workflowController) Status() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.status
+}
+
+// Wait 阻塞等待工作流完成（支持可选超时参数）
+func (c *workflowController) Wait(timeout ...time.Duration) error {
+	var timeoutDuration time.Duration
+	if len(timeout) > 0 {
+		timeoutDuration = timeout[0]
+	}
+
+	// 先检查当前状态是否已完成
+	c.mu.RLock()
+	currentStatus := c.status
+	c.mu.RUnlock()
+
+	if isFinalStatus(currentStatus) {
+		return nil
+	}
+
+	// 如果有超时，使用带超时的循环等待
+	if timeoutDuration > 0 {
+		timer := time.NewTimer(timeoutDuration)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-c.doneChan:
+				// 工作流完成
+				return nil
+			case status := <-c.statusUpdateChan:
+				// 状态更新，检查是否已完成
+				c.mu.Lock()
+				c.status = status
+				c.mu.Unlock()
+				if isFinalStatus(status) {
+					return nil
+				}
+			case <-timer.C:
+				// 超时
+				c.mu.RLock()
+				finalStatus := c.status
+				c.mu.RUnlock()
+				return fmt.Errorf("等待工作流完成超时，当前状态: %s", finalStatus)
+			}
+		}
+	}
+
+	// 无限等待
+	for {
+		select {
+		case <-c.doneChan:
+			// 工作流完成
+			return nil
+		case status := <-c.statusUpdateChan:
+			// 状态更新，检查是否已完成
+			c.mu.Lock()
+			c.status = status
+			c.mu.Unlock()
+			if isFinalStatus(status) {
+				return nil
+			}
+		}
+	}
+}
+
+// isFinalStatus 检查状态是否为最终状态（完成/失败/终止）
+func isFinalStatus(status string) bool {
+	return status == "Success" || status == "Failed" || status == "Terminated"
 }
 
 // GetStatus 查询WorkflowInstance状态（对外导出）
@@ -197,6 +286,16 @@ func (c *workflowController) UpdateStatus(newStatus string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.status = newStatus
+
+	// 如果状态为最终状态，关闭doneChan
+	if isFinalStatus(newStatus) {
+		select {
+		case <-c.doneChan:
+			// 已经关闭，忽略
+		default:
+			close(c.doneChan)
+		}
+	}
 
 	// 发送状态更新信号（非阻塞）
 	select {

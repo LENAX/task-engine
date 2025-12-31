@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
@@ -86,10 +87,8 @@ func (b *TaskBuilder) WithDependency(depTaskName string) *TaskBuilder {
 		return b // 忽略空字符串
 	}
 	// 检查是否已存在
-	for _, dep := range b.dependencies {
-		if dep == depTaskName {
-			return b // 已存在，不重复添加
-		}
+	if slices.Contains(b.dependencies, depTaskName) {
+		return b // 已存在，不重复添加
 	}
 	b.dependencies = append(b.dependencies, depTaskName)
 	return b
