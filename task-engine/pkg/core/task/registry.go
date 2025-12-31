@@ -19,6 +19,7 @@ type FunctionRegistry struct {
 	taskHandlers    map[string]TaskHandlerType          // Task Handler ID -> Task Handler函数
 	handlerMeta     map[string]*storage.TaskHandlerMeta // Task Handler ID -> 元数据
 	dependencies    map[reflect.Type]interface{}        // 依赖类型 -> 依赖实例（用于依赖注入）
+	dependencyKeys  map[string]interface{}              // 依赖字符串key -> 依赖实例（用于字符串key查找）
 	jobFunctionRepo storage.JobFunctionRepository
 	taskHandlerRepo storage.TaskHandlerRepository
 }
@@ -31,6 +32,7 @@ func NewFunctionRegistry(jobFunctionRepo storage.JobFunctionRepository, taskHand
 		taskHandlers:    make(map[string]TaskHandlerType),
 		handlerMeta:     make(map[string]*storage.TaskHandlerMeta),
 		dependencies:    make(map[reflect.Type]interface{}),
+		dependencyKeys:  make(map[string]interface{}),
 		jobFunctionRepo: jobFunctionRepo,
 		taskHandlerRepo: taskHandlerRepo,
 	}
@@ -458,6 +460,14 @@ func extractFunctionMeta(fn interface{}, name, description string) (*storage.Job
 // 依赖通过类型作为 key 进行存储，确保类型安全
 // 示例: registry.RegisterDependency(userRepo)
 func (r *FunctionRegistry) RegisterDependency(dep interface{}) error {
+	return r.RegisterDependencyWithKey("", dep)
+}
+
+// RegisterDependencyWithKey 注册依赖（带字符串key）（对外导出）
+// key: 依赖的字符串标识（可选，如果为空则只通过类型查找）
+// dep: 依赖实例
+// 示例: registry.RegisterDependencyWithKey("ExampleService", exampleService)
+func (r *FunctionRegistry) RegisterDependencyWithKey(key string, dep interface{}) error {
 	if dep == nil {
 		return fmt.Errorf("依赖不能为 nil")
 	}
@@ -473,10 +483,17 @@ func (r *FunctionRegistry) RegisterDependency(dep interface{}) error {
 
 	// 检查是否已注册相同类型的依赖
 	if _, exists := r.dependencies[depType]; exists {
-		return fmt.Errorf("类型 %s 的依赖已注册", depType.String())
+		// 如果已存在，允许更新（用于支持重新注册）
+		log.Printf("警告: 类型 %s 的依赖已存在，将更新", depType.String())
 	}
 
 	r.dependencies[depType] = dep
+
+	// 如果提供了字符串key，也存储到字符串映射中
+	if key != "" {
+		r.dependencyKeys[key] = dep
+	}
+
 	return nil
 }
 
@@ -527,16 +544,45 @@ func (r *FunctionRegistry) WithDependencies(ctx context.Context) context.Context
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// 创建依赖映射的副本
+	// 创建依赖映射的副本（类型映射）
 	deps := make(map[reflect.Type]interface{})
 	for k, v := range r.dependencies {
 		deps[k] = v
 	}
 
-	return context.WithValue(ctx, dependenciesKey, deps)
+	// 创建依赖字符串key映射的副本
+	keyDeps := make(map[string]interface{})
+	for k, v := range r.dependencyKeys {
+		keyDeps[k] = v
+	}
+
+	// 将两个映射都存储到context中
+	ctx = context.WithValue(ctx, dependenciesKey, deps)
+	ctx = context.WithValue(ctx, dependencyKeysKey, keyDeps)
+
+	return ctx
+}
+
+// GetDependencyByKey 通过字符串key获取依赖（对外导出）
+// key: 依赖的字符串标识
+// 返回: 依赖实例和是否存在
+func GetDependencyByKey(ctx context.Context, key string) (interface{}, bool) {
+	// 从 context 中获取依赖字符串key映射
+	keyDeps, ok := ctx.Value(dependencyKeysKey).(map[string]interface{})
+	if !ok || keyDeps == nil {
+		return nil, false
+	}
+
+	dep, exists := keyDeps[key]
+	return dep, exists
 }
 
 // dependenciesKey context key 类型，用于存储依赖映射
 type dependenciesKeyType struct{}
 
 var dependenciesKey = dependenciesKeyType{}
+
+// dependencyKeysKey context key 类型，用于存储依赖字符串key映射
+type dependencyKeysKeyType struct{}
+
+var dependencyKeysKey = dependencyKeysKeyType{}

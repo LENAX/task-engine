@@ -34,9 +34,11 @@ func TestTaskBuilder_Basic(t *testing.T) {
 			"size":     len(content),
 		}, nil
 	}
-	_, err := registry.Register(ctx, "readFile", readFileFunc, "读取文件内容")
+	functionId, err := registry.Register(ctx, "readFile", readFileFunc, "读取文件内容")
 	if err != nil {
 		t.Fatalf("注册函数失败: %v", err)
+	} else {
+		fmt.Println("functionId: ", functionId)
 	}
 
 	task, err := builder.NewTaskBuilder("test-task", "测试任务", registry).

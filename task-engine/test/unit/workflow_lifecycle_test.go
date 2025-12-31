@@ -2,6 +2,7 @@ package unit
 
 import (
 	"context"
+	"log"
 	"os"
 	"testing"
 	"time"
@@ -16,7 +17,25 @@ import (
 
 const testLifecycleDBPath = "./test_lifecycle.db"
 
-func setupLifecycleTest(t *testing.T) (*engine.Engine, func()) {
+// mockJobFunc1 测试用的Job函数，打印执行信息
+func mockJobFunc1(ctx context.Context) (interface{}, error) {
+	log.Printf("✅ [执行函数] mockJobFunc1 开始执行")
+	return "mockJobFunc1执行成功", nil
+}
+
+// mockJobFunc2 测试用的Job函数，打印执行信息
+func mockJobFunc2(ctx context.Context) (interface{}, error) {
+	log.Printf("✅ [执行函数] mockJobFunc2 开始执行")
+	return "mockJobFunc2执行成功", nil
+}
+
+// mockJobFunc3 测试用的Job函数，打印执行信息
+func mockJobFunc3(ctx context.Context) (interface{}, error) {
+	log.Printf("✅ [执行函数] mockJobFunc3 开始执行")
+	return "mockJobFunc3执行成功", nil
+}
+
+func setupLifecycleTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, func()) {
 	// 删除旧的测试数据库
 	os.Remove(testLifecycleDBPath)
 
@@ -32,15 +51,33 @@ func setupLifecycleTest(t *testing.T) (*engine.Engine, func()) {
 		t.Fatalf("创建Engine失败: %v", err)
 	}
 
+	// 获取Engine的registry
+	registry := eng.GetRegistry()
+	if registry == nil {
+		t.Fatalf("获取registry失败")
+	}
+
 	// 启动Engine
 	ctx := context.Background()
 	if err := eng.Start(ctx); err != nil {
 		t.Fatalf("启动Engine失败: %v", err)
 	}
 
-	// 注册一个简单的mock job函数，避免任务因为找不到函数而失败
-	// 注意：这里需要访问Engine内部的registry，但Engine没有暴露这个方法
-	// 所以我们在测试中通过其他方式处理，或者让测试更健壮
+	// 注册测试用的Job函数到Engine的registry
+	_, err = registry.Register(ctx, "func1", mockJobFunc1, "测试函数1")
+	if err != nil {
+		t.Fatalf("注册func1失败: %v", err)
+	}
+
+	_, err = registry.Register(ctx, "func2", mockJobFunc2, "测试函数2")
+	if err != nil {
+		t.Fatalf("注册func2失败: %v", err)
+	}
+
+	_, err = registry.Register(ctx, "func3", mockJobFunc3, "测试函数3")
+	if err != nil {
+		t.Fatalf("注册func3失败: %v", err)
+	}
 
 	cleanup := func() {
 		eng.Stop()
@@ -48,7 +85,7 @@ func setupLifecycleTest(t *testing.T) (*engine.Engine, func()) {
 		os.Remove(testLifecycleDBPath)
 	}
 
-	return eng, cleanup
+	return eng, registry, cleanup
 }
 
 func TestWorkflowController_Basic(t *testing.T) {
@@ -71,16 +108,19 @@ func TestWorkflowController_Basic(t *testing.T) {
 }
 
 func TestWorkflowController_StateTransitions(t *testing.T) {
-	eng, cleanup := setupLifecycleTest(t)
+	eng, registry, cleanup := setupLifecycleTest(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	// 创建测试Workflow
-	registry := task.NewFunctionRegistry(nil, nil)
-	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
+	// 创建测试Workflow（使用Engine的registry）
+	task1, err := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
+
+	if err != nil {
+		t.Fatalf("构建Task失败: %v", err)
+	}
 
 	wf, err := builder.NewWorkflowBuilder("test-workflow", "测试工作流").
 		WithTask(task1).
@@ -180,13 +220,12 @@ func TestWorkflowController_StateTransitions(t *testing.T) {
 }
 
 func TestEngine_SubmitWorkflow(t *testing.T) {
-	eng, cleanup := setupLifecycleTest(t)
+	eng, registry, cleanup := setupLifecycleTest(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	// 创建测试Workflow
-	registry := task.NewFunctionRegistry(nil, nil)
+	// 创建测试Workflow（使用Engine的registry）
 	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
@@ -225,13 +264,12 @@ func TestEngine_SubmitWorkflow(t *testing.T) {
 }
 
 func TestEngine_PauseAndResumeWorkflowInstance(t *testing.T) {
-	eng, cleanup := setupLifecycleTest(t)
+	eng, registry, cleanup := setupLifecycleTest(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	// 创建并提交Workflow
-	registry := task.NewFunctionRegistry(nil, nil)
+	// 创建并提交Workflow（使用Engine的registry）
 	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()
@@ -284,13 +322,12 @@ func TestEngine_PauseAndResumeWorkflowInstance(t *testing.T) {
 }
 
 func TestEngine_TerminateWorkflowInstance(t *testing.T) {
-	eng, cleanup := setupLifecycleTest(t)
+	eng, registry, cleanup := setupLifecycleTest(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	// 创建并提交Workflow
-	registry := task.NewFunctionRegistry(nil, nil)
+	// 创建并提交Workflow（使用Engine的registry）
 	task1, _ := builder.NewTaskBuilder("task1", "任务1", registry).
 		WithJobFunction("func1", nil).
 		Build()

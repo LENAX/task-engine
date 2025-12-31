@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"reflect"
 )
 
 // TaskContext Task执行上下文，提供类型安全的API访问Task信息（对外导出）
@@ -160,4 +161,45 @@ func (tc *TaskContext) Err() error {
 // 示例: repo, ok := task.GetDependency[UserRepository](taskCtx.Context())
 func GetDependencyFromContext[T any](ctx context.Context) (T, bool) {
 	return GetDependency[T](ctx)
+}
+
+// GetDependency 通过字符串key获取依赖（对外导出）
+// key: 依赖的字符串标识（如 "ExampleService"）
+// 返回: 依赖实例和是否存在
+// 示例: service, ok := ctx.GetDependency("ExampleService")
+func (tc *TaskContext) GetDependency(key string) (interface{}, bool) {
+	return GetDependencyByKey(tc.ctx, key)
+}
+
+// GetDependencyTyped 通过字符串key获取依赖并转换为指定类型（对外导出）
+// key: 依赖的字符串标识
+// 返回: 依赖实例（转换为指定类型）和是否存在
+// 示例: service, ok := ctx.GetDependencyTyped[*ExampleService]("ExampleService")
+func GetDependencyTyped[T any](ctx context.Context, key string) (T, bool) {
+	var zero T
+	dep, ok := GetDependencyByKey(ctx, key)
+	if !ok {
+		return zero, false
+	}
+
+	// 类型断言
+	if typedDep, ok := dep.(T); ok {
+		return typedDep, true
+	}
+
+	// 如果直接类型断言失败，尝试通过反射转换
+	depValue := reflect.ValueOf(dep)
+	if depValue.Type().AssignableTo(reflect.TypeOf(zero)) {
+		return depValue.Interface().(T), true
+	}
+
+	return zero, false
+}
+
+// GetDependencyTypedFromContext 通过字符串key获取依赖并转换为指定类型（TaskContext辅助方法）
+// key: 依赖的字符串标识
+// 返回: 依赖实例（转换为指定类型）和是否存在
+// 示例: service, ok := task.GetDependencyTyped[*ExampleService](ctx.Context(), "ExampleService")
+func (tc *TaskContext) GetDependencyTypedFromContext(key string) (interface{}, bool) {
+	return GetDependencyByKey(tc.ctx, key)
 }
