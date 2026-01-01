@@ -31,6 +31,8 @@ type Task struct {
 	statusMu       sync.Mutex          // 保护status字段
 	isSubTask      bool                // 是否为动态生成的子任务（私有字段）
 	isSubTaskMu    sync.RWMutex        // 保护isSubTask字段
+	isTemplate     bool                // 是否为模板任务（私有字段，模板任务不执行，仅用于生成子任务）
+	isTemplateMu   sync.RWMutex        // 保护isTemplate字段
 	StatusHandlers map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
 	JobFuncID      string              // Job函数ID（通过Registry获取函数实例）
 	JobFuncName    string              // Job函数名称（用于快速查找和依赖构建）
@@ -238,6 +240,22 @@ func (t *Task) SetSubTask(isSubTask bool) {
 	t.isSubTaskMu.Lock()
 	defer t.isSubTaskMu.Unlock()
 	t.isSubTask = isSubTask
+}
+
+// IsTemplate 判断Task是否为模板任务（对外导出，线程安全）
+// 模板任务不会被执行，仅用于生成子任务
+func (t *Task) IsTemplate() bool {
+	t.isTemplateMu.RLock()
+	defer t.isTemplateMu.RUnlock()
+	return t.isTemplate
+}
+
+// SetTemplate 设置Task是否为模板任务（对外导出，线程安全）
+// 模板任务不会被执行，仅用于生成子任务
+func (t *Task) SetTemplate(isTemplate bool) {
+	t.isTemplateMu.Lock()
+	defer t.isTemplateMu.Unlock()
+	t.isTemplate = isTemplate
 }
 
 // GetJobFuncID 获取Task绑定的Job函数ID（对外导出）

@@ -20,6 +20,8 @@ type Task interface {
 	SetDependencies(dependencies []string)
 	IsSubTask() bool
 	SetSubTask(isSubTask bool)
+	IsTemplate() bool
+	SetTemplate(isTemplate bool)
 	GetJobFuncID() string
 	SetJobFuncID(jobFuncID string)
 	SetParam(key string, value interface{})

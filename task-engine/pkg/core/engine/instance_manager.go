@@ -233,6 +233,20 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 					continue
 				}
 
+				// 检查是否为模板任务（模板任务不执行，仅用于生成子任务）
+				if t.IsTemplate() {
+					log.Printf("📋 WorkflowInstance %s: Task %s (%s) 是模板任务，跳过执行，标记为已处理",
+						m.instance.ID, taskID, taskName)
+					// 模板任务标记为已处理，但不执行
+					// 设置状态为Success，表示模板任务已"完成"（虽然不执行，但依赖关系已满足）
+					t.SetStatus(task.TaskStatusSuccess)
+					m.processedNodes.Store(taskID, true)
+					m.readyTasksSet.Delete(taskID)
+					// 检查下游任务是否可以就绪（模板任务虽然不执行，但依赖关系仍然有效）
+					m.onTaskCompleted(taskID)
+					continue
+				}
+
 				// 先不标记为已处理，等成功提交后再标记
 				// 这样如果提交失败，任务还在 candidateNodes 中，可以重试
 

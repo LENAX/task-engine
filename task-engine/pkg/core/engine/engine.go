@@ -368,10 +368,11 @@ func (e *Engine) LoadWorkflow(workflowConfigPath string) (*WorkflowDefinition, e
 	}
 
 	// 2. 应用默认值（基于框架配置）
+	defaultTimeout := 30 * time.Second // 默认超时时间
 	if e.cfg != nil {
-		defaultTimeout := e.cfg.GetDefaultTaskTimeout()
-		wfConfig.ApplyDefaults(defaultTimeout)
+		defaultTimeout = e.cfg.GetDefaultTaskTimeout()
 	}
+	wfConfig.ApplyDefaults(defaultTimeout)
 
 	// 3. 校验配置合法性
 	// 构建jobRegistry map用于校验（从FunctionRegistry中获取）
@@ -388,7 +389,7 @@ func (e *Engine) LoadWorkflow(workflowConfigPath string) (*WorkflowDefinition, e
 		}
 	}
 
-	if err := config.ValidateWorkflowConfig(wfConfig, jobRegistryMap, e.cfg.GetDefaultTaskTimeout()); err != nil {
+	if err := config.ValidateWorkflowConfig(wfConfig, jobRegistryMap, defaultTimeout); err != nil {
 		return nil, fmt.Errorf("validate workflow config failed: %w", err)
 	}
 
@@ -438,6 +439,16 @@ func (e *Engine) convertWorkflowConfigToWorkflow(wfConfig *config.WorkflowConfig
 			taskBuilder = taskBuilder.WithDependencies(taskDef.Dependencies)
 		}
 
+		// 设置RequiredParams
+		if len(taskDef.RequiredParams) > 0 {
+			taskBuilder = taskBuilder.WithRequiredParams(taskDef.RequiredParams)
+		}
+
+		// 设置ResultMapping
+		if len(taskDef.ResultMapping) > 0 {
+			taskBuilder = taskBuilder.WithResultMapping(taskDef.ResultMapping)
+		}
+
 		// 设置Callbacks（转换为TaskHandler）
 		for _, callback := range taskDef.Callbacks {
 			// 将callback state映射到task status
@@ -451,6 +462,11 @@ func (e *Engine) convertWorkflowConfigToWorkflow(wfConfig *config.WorkflowConfig
 		t, err := taskBuilder.Build()
 		if err != nil {
 			return nil, fmt.Errorf("build task %s failed: %w", taskDef.TaskID, err)
+		}
+
+		// 设置模板任务标记
+		if taskDef.IsTemplate {
+			t.SetTemplate(true)
 		}
 
 		// 添加到WorkflowBuilder
