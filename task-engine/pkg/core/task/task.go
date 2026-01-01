@@ -3,6 +3,7 @@ package task
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,33 +25,58 @@ type Task struct {
 	ID             string
 	Name           string
 	Description    string
-	Params         map[string]any
+	Params         sync.Map // 参数映射（线程安全）
 	CreateTime     time.Time
-	Status         string
-	StatusHandlers map[string]string // 状态处理函数映射（status -> handlerID）
-	JobFuncID      string            // Job函数ID（通过Registry获取函数实例）
-	JobFuncName    string            // Job函数名称（用于快速查找和依赖构建）
-	TimeoutSeconds int               // 超时时间（秒，默认30秒）
-	RetryCount     int               // 重试次数（默认0次，即不重试）
-	Dependencies   []string          // 依赖的前置Task名称列表
+	status         string              // 状态（私有字段，通过setter修改）
+	statusMu       sync.Mutex          // 保护status字段
+	StatusHandlers map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
+	JobFuncID      string              // Job函数ID（通过Registry获取函数实例）
+	JobFuncName    string              // Job函数名称（用于快速查找和依赖构建）
+	TimeoutSeconds int                 // 超时时间（秒，默认30秒）
+	RetryCount     int                 // 重试次数（默认0次，即不重试）
+	Dependencies   []string            // 依赖的前置Task名称列表
+	RequiredParams []string            // 必需参数列表（用于参数校验）
+	ResultMapping  map[string]string   // 上游结果字段到下游参数的映射规则
 }
 
 // NewTask 创建Task实例（对外导出）
 // jobFuncName: 已注册的Job函数名称（用于从数据库加载的场景）
-func NewTask(name, desc, jobFuncID string, params map[string]any, statusHandlers map[string]string) *Task {
-	return &Task{
+// statusHandlers: 状态处理函数映射，支持单个handler（string）或多个handler（[]string）
+func NewTask(name, desc, jobFuncID string, params map[string]any, statusHandlers interface{}) *Task {
+	// 转换statusHandlers为map[string][]string格式
+	handlersMap := make(map[string][]string)
+	if statusHandlers != nil {
+		switch v := statusHandlers.(type) {
+		case map[string]string:
+			// 兼容旧格式：map[string]string -> map[string][]string
+			for status, handlerID := range v {
+				handlersMap[status] = []string{handlerID}
+			}
+		case map[string][]string:
+			// 新格式：直接使用
+			handlersMap = v
+		}
+	}
+
+	t := &Task{
 		ID:             uuid.NewString(),
 		Name:           name,
 		Description:    desc,
-		Status:         TaskStatusPending,
-		StatusHandlers: statusHandlers,
+		status:         TaskStatusPending,
+		StatusHandlers: handlersMap,
 		CreateTime:     time.Now(),
-		Params:         params,
 		JobFuncID:      jobFuncID,
 		TimeoutSeconds: 30, // 默认30秒
 		RetryCount:     0,  // 默认0次，即不重试
 		Dependencies:   make([]string, 0),
+		RequiredParams: make([]string, 0),
+		ResultMapping:  make(map[string]string),
 	}
+	// 初始化Params sync.Map
+	for k, v := range params {
+		t.Params.Store(k, v)
+	}
+	return t
 }
 
 // NewTaskWithFunction 创建Task实例并自动注册函数（对外导出）
@@ -124,14 +150,13 @@ func (t *Task) GetJobFuncName() string {
 // GetParams 获取Task的执行参数（对外导出）
 // 返回map[string]interface{}以兼容设计文档要求
 func (t *Task) GetParams() map[string]interface{} {
-	if t.Params == nil {
-		return make(map[string]interface{})
-	}
-	// 将map[string]any转换为map[string]interface{}
 	result := make(map[string]interface{})
-	for k, v := range t.Params {
-		result[k] = v
-	}
+	t.Params.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			result[keyStr] = value
+		}
+		return true
+	})
 	return result
 }
 
@@ -141,10 +166,7 @@ func (t *Task) UpdateParams(newParams map[string]any) error {
 	if newParams == nil {
 		return fmt.Errorf("参数不能为空")
 	}
-	if t.Params == nil {
-		t.Params = make(map[string]any)
-	}
-	// 将map[string]interface{}转换为map[string]any
+	// 将map[string]interface{}转换为map[string]any并存储到sync.Map
 	for k, v := range newParams {
 		// 将值转换为字符串
 		var strValue string
@@ -161,14 +183,23 @@ func (t *Task) UpdateParams(newParams map[string]any) error {
 			}
 			strValue = string(jsonBytes)
 		}
-		t.Params[k] = strValue
+		t.Params.Store(k, strValue)
 	}
 	return nil
 }
 
-// GetStatus 获取Task当前的执行状态（对外导出）
+// GetStatus 获取Task当前的执行状态（对外导出，线程安全）
 func (t *Task) GetStatus() string {
-	return t.Status
+	t.statusMu.Lock()
+	defer t.statusMu.Unlock()
+	return t.status
+}
+
+// SetStatus 设置Task的执行状态（对外导出，线程安全）
+func (t *Task) SetStatus(status string) {
+	t.statusMu.Lock()
+	defer t.statusMu.Unlock()
+	t.status = status
 }
 
 // GetDependencies 获取Task的依赖列表（对外导出）

@@ -33,8 +33,8 @@ type domainPool struct {
 }
 
 const (
-	maxGlobalWorkers = 1000 // 全局最大并发数上限
-	defaultQueueSize = 1000 // 默认任务队列大小
+	maxGlobalWorkers = 1000  // 全局最大并发数上限
+	defaultQueueSize = 10000 // 默认任务队列大小（支持大型workflow）
 )
 
 // NewExecutor 创建执行器实例（对外导出的工厂方法，engine包会调用）
@@ -227,6 +227,7 @@ func (e *Executor) SetRegistry(registry *task.FunctionRegistry) {
 }
 
 // SubmitTask 将待调度Task提交至Executor的任务队列（对外导出）
+// 如果队列已满，会阻塞等待直到有空间或Executor关闭
 func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 	if pendingTask == nil {
 		return fmt.Errorf("任务不能为空")
@@ -236,20 +237,19 @@ func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 	}
 
 	e.mu.RLock()
-	if !e.running {
-		e.mu.RUnlock()
-		return fmt.Errorf("Executor未运行")
-	}
+	running := e.running
 	e.mu.RUnlock()
 
-	// 提交到任务队列
+	if !running {
+		return fmt.Errorf("Executor未运行")
+	}
+
+	// 提交到任务队列（阻塞等待，直到有空间或Executor关闭）
 	select {
 	case e.taskQueue <- pendingTask:
 		return nil
 	case <-e.shutdown:
 		return fmt.Errorf("Executor已关闭")
-	default:
-		return fmt.Errorf("任务队列已满")
 	}
 }
 
@@ -326,7 +326,7 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	t := pendingTask.Task
 
 	// 更新Task状态为Running
-	t.Status = task.TaskStatusRunning
+	t.SetStatus(task.TaskStatusRunning)
 
 	// 如果没有注册中心，无法执行
 	if e.registry == nil {
@@ -370,9 +370,17 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		return
 	}
 
+	// 将 sync.Map 转换为 map 用于日志打印
+	paramsForLog := make(map[string]interface{})
+	t.Params.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			paramsForLog[keyStr] = value
+		}
+		return true
+	})
 	// 打印函数执行开始日志
 	log.Printf("🚀 [开始执行函数] TaskID=%s, TaskName=%s, JobFuncName=%s, JobFuncID=%s, 参数=%v",
-		t.ID, t.Name, t.JobFuncName, funcID, t.Params)
+		t.ID, t.Name, t.JobFuncName, funcID, paramsForLog)
 
 	// 创建执行上下文
 	ctx := context.Background()
@@ -388,6 +396,15 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		ctx = e.registry.WithDependencies(ctx)
 	}
 
+	// 将 sync.Map 转换为 map[string]interface{} 用于 TaskContext
+	paramsMap := make(map[string]interface{})
+	t.Params.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			paramsMap[keyStr] = value
+		}
+		return true
+	})
+
 	// 创建TaskContext
 	taskCtx := task.NewTaskContext(
 		ctx,
@@ -395,7 +412,7 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		t.Name,
 		pendingTask.WorkflowID,
 		pendingTask.InstanceID,
-		t.Params,
+		paramsMap,
 	)
 
 	// 执行Job函数
@@ -415,14 +432,14 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		}
 
 		if state.Status == "Success" {
-			t.Status = task.TaskStatusSuccess
+			t.SetStatus(task.TaskStatusSuccess)
 			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%v",
 				t.ID, t.Name, t.JobFuncName, duration, state.Data)
 			if pendingTask.OnComplete != nil {
 				pendingTask.OnComplete(result)
 			}
 		} else {
-			t.Status = task.TaskStatusFailed
+			t.SetStatus(task.TaskStatusFailed)
 			log.Printf("❌ [函数执行失败] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 错误=%v",
 				t.ID, t.Name, t.JobFuncName, duration, state.Error)
 			// 检查是否需要重试
@@ -444,7 +461,7 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	case <-ctx.Done():
 		// 超时
 		duration := time.Since(startTime).Milliseconds()
-		t.Status = task.TaskStatusTimeout
+		t.SetStatus(task.TaskStatusTimeout)
 		log.Printf("⏱️  [函数执行超时] TaskID=%s, TaskName=%s, JobFuncName=%s, 超时时间=%ds, 耗时=%dms",
 			t.ID, t.Name, t.JobFuncName, timeoutSeconds, duration)
 		result := &TaskResult{

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stevelan1995/task-engine/pkg/core/cache"
 	"github.com/stevelan1995/task-engine/pkg/core/dag"
 	"github.com/stevelan1995/task-engine/pkg/core/executor"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
@@ -19,9 +20,9 @@ type WorkflowInstanceManager struct {
 	instance             *workflow.WorkflowInstance
 	workflow             *workflow.Workflow
 	dag                  *dag.DAG
-	processedNodes       sync.Map               // 已处理的Task ID -> bool
-	candidateNodes       sync.Map               // 候选Task ID -> workflow.Task
-	contextData          map[string]interface{} // Task间传递的数据
+	processedNodes       sync.Map // 已处理的Task ID -> bool
+	candidateNodes       sync.Map // 候选Task ID -> workflow.Task
+	contextData          sync.Map // Task间传递的数据
 	controlSignalChan    chan workflow.ControlSignal
 	statusUpdateChan     chan string
 	mu                   sync.RWMutex
@@ -31,7 +32,8 @@ type WorkflowInstanceManager struct {
 	taskRepo             storage.TaskRepository
 	workflowInstanceRepo storage.WorkflowInstanceRepository
 	registry             *task.FunctionRegistry
-	wg                   sync.WaitGroup // 用于等待所有协程完成
+	resultCache          cache.ResultCache // 结果缓存
+	wg                   sync.WaitGroup    // 用于等待所有协程完成
 }
 
 // NewWorkflowInstanceManager 创建WorkflowInstanceManager（内部方法）
@@ -43,6 +45,8 @@ func NewWorkflowInstanceManager(
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
 	registry *task.FunctionRegistry,
 ) (*WorkflowInstanceManager, error) {
+	// 创建默认的内存缓存（如果未提供）
+	resultCache := cache.NewMemoryResultCache()
 	// 构建DAG
 	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())
 	if err != nil {
@@ -60,7 +64,7 @@ func NewWorkflowInstanceManager(
 		instance:             instance,
 		workflow:             wf,
 		dag:                  dagInstance,
-		contextData:          make(map[string]interface{}),
+		contextData:          sync.Map{},
 		controlSignalChan:    make(chan workflow.ControlSignal, 10),
 		statusUpdateChan:     make(chan string, 10),
 		ctx:                  ctx,
@@ -69,6 +73,7 @@ func NewWorkflowInstanceManager(
 		taskRepo:             taskRepo,
 		workflowInstanceRepo: workflowInstanceRepo,
 		registry:             registry,
+		resultCache:          resultCache,
 	}
 
 	// 初始化candidateNodes（根节点，入度为0的Task）
@@ -201,6 +206,23 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 					paramsAny[k] = v
 				}
 
+				// 从缓存获取上游任务结果并注入参数
+				if m.resultCache != nil {
+					deps := t.GetDependencies()
+					for _, depName := range deps {
+						depTaskID := m.findTaskIDByName(depName)
+						if depTaskID == "" {
+							continue
+						}
+						// 尝试从缓存获取
+						if cachedResult, found := m.resultCache.Get(depTaskID); found {
+							// 将缓存结果注入到参数中（使用特殊前缀）
+							paramsAny[fmt.Sprintf("_cached_%s", depTaskID)] = cachedResult
+							log.Printf("📦 [缓存命中] TaskID=%s, 从缓存获取上游任务 %s 的结果", taskID, depTaskID)
+						}
+					}
+				}
+
 				// 转换为map[string]string用于NewTask
 				paramsStr := make(map[string]string)
 				for k, v := range t.GetParams() {
@@ -219,7 +241,7 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 				taskObj.JobFuncName = t.GetJobFuncName()
 				taskObj.TimeoutSeconds = 30 // 默认值
 				taskObj.RetryCount = 0
-				taskObj.Status = task.TaskStatusPending
+				taskObj.SetStatus(task.TaskStatusPending)
 
 				// 创建storage.TaskInstance并保存到数据库
 				taskInstance := &storage.TaskInstance{
@@ -384,6 +406,12 @@ func (m *WorkflowInstanceManager) getAvailableTasks() []workflow.Task {
 		}
 
 		if allDepsProcessed {
+			// 执行参数校验和resultMapping
+			if err := m.validateAndMapParams(t, taskID); err != nil {
+				log.Printf("参数校验失败: TaskID=%s, Error=%v", taskID, err)
+				// 参数校验失败，跳过该任务
+				return true
+			}
 			available = append(available, t)
 		}
 
@@ -391,6 +419,90 @@ func (m *WorkflowInstanceManager) getAvailableTasks() []workflow.Task {
 	})
 
 	return available
+}
+
+// validateAndMapParams 校验参数并执行resultMapping（内部方法）
+func (m *WorkflowInstanceManager) validateAndMapParams(t workflow.Task, taskID string) error {
+	// 尝试获取Task对象以访问RequiredParams和ResultMapping
+	taskObj, ok := t.(*task.Task)
+	if !ok {
+		// 如果不是task.Task类型，跳过校验
+		return nil
+	}
+
+	// 1. 检查必需参数
+	if len(taskObj.RequiredParams) > 0 {
+		// 获取上游任务的结果
+		deps := t.GetDependencies()
+		allParamsFound := true
+		missingParams := make([]string, 0)
+
+		for _, requiredParam := range taskObj.RequiredParams {
+			found := false
+			// 首先检查当前任务的参数中是否已有
+			if t.GetParams()[requiredParam] != nil {
+				found = true
+			} else {
+				// 从上游任务结果中查找
+				for _, depName := range deps {
+					depTaskID := m.findTaskIDByName(depName)
+					if depTaskID == "" {
+						continue
+					}
+					// 从contextData获取上游任务结果
+					if upstreamResultValue, exists := m.contextData.Load(depTaskID); exists {
+						if upstreamResult, ok := upstreamResultValue.(map[string]interface{}); ok {
+							if _, hasKey := upstreamResult[requiredParam]; hasKey {
+								found = true
+								break
+							}
+						}
+					}
+				}
+			}
+
+			if !found {
+				allParamsFound = false
+				missingParams = append(missingParams, requiredParam)
+			}
+		}
+
+		if !allParamsFound {
+			return fmt.Errorf("缺少必需参数: %v", missingParams)
+		}
+	}
+
+	// 2. 执行resultMapping（从上游结果映射到当前任务参数）
+	if len(taskObj.ResultMapping) > 0 {
+		deps := t.GetDependencies()
+		for targetParam, sourceField := range taskObj.ResultMapping {
+			// 从上游任务结果中查找sourceField
+			for _, depName := range deps {
+				depTaskID := m.findTaskIDByName(depName)
+				if depTaskID == "" {
+					continue
+				}
+				// 从contextData获取上游任务结果
+				if upstreamResultValue, exists := m.contextData.Load(depTaskID); exists {
+					if upstreamResult, ok := upstreamResultValue.(map[string]interface{}); ok {
+						if sourceValue, hasKey := upstreamResult[sourceField]; hasKey {
+							// 动态注入参数到任务
+							// 注意：这里需要更新任务的Params，但workflow.Task是接口，无法直接修改
+							// 实际参数注入应该在任务执行时通过contextData传递
+							log.Printf("📝 [参数映射] TaskID=%s, 从上游任务 %s 映射字段 %s -> %s, 值=%v", taskID, depTaskID, sourceField, targetParam, sourceValue)
+							// 将映射的参数保存到contextData，供任务执行时使用
+							// 使用特殊的key格式：taskID:paramName
+							paramKey := fmt.Sprintf("%s:%s", taskID, targetParam)
+							m.contextData.Store(paramKey, sourceValue)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // isAllTasksCompleted 检查是否所有任务都已完成
@@ -455,11 +567,20 @@ func (m *WorkflowInstanceManager) createBreakpoint() *workflow.BreakpointData {
 	dagSnapshot := make(map[string]interface{})
 	dagSnapshot["nodes"] = m.dag.GetOrder() // 使用 go-dag 的 GetOrder 方法获取节点数
 
+	// 将 sync.Map 转换为 map[string]interface{} 用于序列化
+	contextDataMap := make(map[string]interface{})
+	m.contextData.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			contextDataMap[keyStr] = value
+		}
+		return true
+	})
+
 	return &workflow.BreakpointData{
 		CompletedTaskNames: completedTaskNames,
 		RunningTaskNames:   runningTaskNames,
 		DAGSnapshot:        dagSnapshot,
-		ContextData:        m.contextData,
+		ContextData:        contextDataMap,
 		LastUpdateTime:     time.Now(),
 	}
 }
@@ -480,10 +601,11 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 	}
 
 	// 2. 恢复上下文数据
+	m.contextData = sync.Map{}
 	if breakpoint.ContextData != nil {
-		m.contextData = breakpoint.ContextData
-	} else {
-		m.contextData = make(map[string]interface{})
+		for k, v := range breakpoint.ContextData {
+			m.contextData.Store(k, v)
+		}
 	}
 
 	// 3. 重新计算候选节点（基于已完成的Task）
@@ -603,25 +725,26 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 			// 注意：workflow.Task是接口，需要类型断言或通过其他方式获取
 			// 这里简化处理，假设StatusHandlers在创建Task时已配置
 			// 实际应该从Task定义中获取StatusHandlers配置
-			var statusHandlers map[string]string
+			var statusHandlers map[string][]string
 			if taskObj, ok := workflowTask.(*task.Task); ok {
 				statusHandlers = taskObj.StatusHandlers
 			}
 
 			// 创建task.Task实例用于handler调用
-			taskObj := &task.Task{
-				ID:             taskInstance.ID,
-				Name:           taskInstance.Name,
-				Description:    workflowTask.GetName(), // 使用workflow中的描述
-				Params:         taskInstance.Params,
-				Status:         taskInstance.Status,
-				StatusHandlers: statusHandlers,
-				JobFuncID:      taskInstance.JobFuncID,
-				JobFuncName:    taskInstance.JobFuncName,
-				TimeoutSeconds: taskInstance.TimeoutSeconds,
-				RetryCount:     taskInstance.RetryCount,
-				Dependencies:   []string{}, // 从workflowTask获取
+			taskObj := task.NewTask(taskInstance.Name, workflowTask.GetName(), taskInstance.JobFuncID, taskInstance.Params, statusHandlers)
+			taskObj.ID = taskInstance.ID
+			taskObj.JobFuncName = taskInstance.JobFuncName
+			taskObj.TimeoutSeconds = taskInstance.TimeoutSeconds
+			taskObj.RetryCount = taskInstance.RetryCount
+			taskObj.Dependencies = []string{} // 从workflowTask获取
+			taskObj.SetStatus(taskInstance.Status)
+
+			// 在调用Handler之前，将Manager接口注入到registry的依赖中
+			// 这样Handler可以直接通过ctx.GetDependency("InstanceManager")获取Manager，而不需要Engine
+			managerInterface := &InstanceManagerInterface{
+				manager: m,
 			}
+			_ = m.registry.RegisterDependencyWithKey("InstanceManager", managerInterface)
 
 			if err := task.ExecuteTaskHandlerWithContext(
 				m.registry,
@@ -666,7 +789,16 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 
 		// 保存结果数据到上下文
 		if result.Data != nil {
-			m.contextData[taskID] = result.Data
+			m.contextData.Store(taskID, result.Data)
+			// 缓存结果（TTL默认1小时）
+			if m.resultCache != nil {
+				ttl := 1 * time.Hour
+				if err := m.resultCache.Set(taskID, result.Data, ttl); err != nil {
+					log.Printf("缓存任务结果失败: TaskID=%s, Error=%v", taskID, err)
+				} else {
+					log.Printf("✅ [缓存保存] TaskID=%s, 结果已缓存", taskID)
+				}
+			}
 		}
 	}
 }
@@ -694,25 +826,19 @@ func (m *WorkflowInstanceManager) createTaskErrorHandler(taskID string) func(err
 			}
 
 			// 尝试从workflow.Task获取StatusHandlers
-			var statusHandlers map[string]string
+			var statusHandlers map[string][]string
 			if taskObj, ok := workflowTask.(*task.Task); ok {
 				statusHandlers = taskObj.StatusHandlers
 			}
 
 			// 创建task.Task实例用于handler调用
-			taskObj := &task.Task{
-				ID:             taskInstance.ID,
-				Name:           taskInstance.Name,
-				Description:    workflowTask.GetName(),
-				Params:         taskInstance.Params,
-				Status:         taskInstance.Status,
-				StatusHandlers: statusHandlers,
-				JobFuncID:      taskInstance.JobFuncID,
-				JobFuncName:    taskInstance.JobFuncName,
-				TimeoutSeconds: taskInstance.TimeoutSeconds,
-				RetryCount:     taskInstance.RetryCount,
-				Dependencies:   []string{},
-			}
+			taskObj := task.NewTask(taskInstance.Name, workflowTask.GetName(), taskInstance.JobFuncID, taskInstance.Params, statusHandlers)
+			taskObj.ID = taskInstance.ID
+			taskObj.JobFuncName = taskInstance.JobFuncName
+			taskObj.TimeoutSeconds = taskInstance.TimeoutSeconds
+			taskObj.RetryCount = taskInstance.RetryCount
+			taskObj.Dependencies = []string{}
+			taskObj.SetStatus(taskInstance.Status)
 
 			if handlerErr := task.ExecuteTaskHandlerWithContext(
 				m.registry,
@@ -764,49 +890,101 @@ func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID
 		return fmt.Errorf("子Task名称不能为空")
 	}
 
-	// 检查父Task是否存在
-	if _, exists := m.workflow.GetTasks()[parentTaskID]; !exists {
-		return fmt.Errorf("父Task %s 不存在", parentTaskID)
+	// 使用Workflow的AddSubTask方法（线程安全）
+	if err := m.workflow.AddSubTask(subTask, parentTaskID); err != nil {
+		return err
 	}
 
-	// 检查子Task ID是否重复
-	if _, exists := m.workflow.GetTasks()[subTask.GetID()]; exists {
-		return fmt.Errorf("子Task ID %s 已存在", subTask.GetID())
-	}
-
-	// 检查子Task名称是否唯一
-	for taskID, t := range m.workflow.GetTasks() {
-		if t.GetName() == subTask.GetName() && taskID != subTask.GetID() {
-			return fmt.Errorf("Task名称 %s 已存在", subTask.GetName())
+	// 3. 更新DAG依赖关系（重构：父任务-子任务-下游任务）
+	// 获取父任务的所有下游任务
+	parentNode, exists := m.dag.GetNode(parentTaskID)
+	if exists {
+		downstreamTaskIDs := parentNode.OutEdges
+		if len(downstreamTaskIDs) > 0 {
+			// 需要重构依赖关系：
+			// 1. 删除父任务到下游任务的直接依赖（在Workflow.Dependencies中）
+			// 2. 添加子任务到下游任务的依赖
+			for _, downstreamID := range downstreamTaskIDs {
+				// 从Workflow.Dependencies中删除父任务到下游任务的依赖
+				depsValue, exists := m.workflow.Dependencies.Load(downstreamID)
+				if exists {
+					deps := depsValue.([]string)
+					newDeps := make([]string, 0, len(deps))
+					for _, depID := range deps {
+						if depID != parentTaskID {
+							newDeps = append(newDeps, depID)
+						}
+					}
+					m.workflow.Dependencies.Store(downstreamID, newDeps)
+				}
+				// 添加子任务到下游任务的依赖（在Workflow.Dependencies中）
+				depsValue2, _ := m.workflow.Dependencies.LoadOrStore(downstreamID, make([]string, 0))
+				deps := depsValue2.([]string)
+				// 检查是否已存在
+				found := false
+				for _, depID := range deps {
+					if depID == subTask.GetID() {
+						found = true
+						break
+					}
+				}
+				if !found {
+					// 创建新的依赖列表（避免并发修改）
+					newDeps := make([]string, len(deps), len(deps)+1)
+					copy(newDeps, deps)
+					newDeps = append(newDeps, subTask.GetID())
+					m.workflow.Dependencies.Store(downstreamID, newDeps)
+				}
+			}
 		}
 	}
 
-	// 1. 将子Task添加到Workflow的Tasks映射中
-	m.workflow.Tasks[subTask.GetID()] = subTask
-
-	// 2. 更新Workflow的Dependencies映射（子任务依赖父任务）
-	if m.workflow.Dependencies == nil {
-		m.workflow.Dependencies = make(map[string][]string)
-	}
-	// 检查是否已存在该依赖
-	found := false
-	for _, depID := range m.workflow.Dependencies[subTask.GetID()] {
-		if depID == parentTaskID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		m.workflow.Dependencies[subTask.GetID()] = append(m.workflow.Dependencies[subTask.GetID()], parentTaskID)
-	}
-
-	// 3. 更新DAG，添加子任务节点和依赖关系
+	// 4. 更新DAG，添加子任务节点和依赖关系
+	// 注意：由于go-dag是只读的，我们需要重新构建DAG
+	// 但为了性能，我们只添加新节点，依赖关系通过Workflow.Dependencies管理
 	if err := m.dag.AddNode(subTask.GetID(), subTask.GetName(), subTask, []string{parentTaskID}); err != nil {
 		// 如果DAG添加失败，回滚Workflow的更改
-		delete(m.workflow.Tasks, subTask.GetID())
-		delete(m.workflow.Dependencies, subTask.GetID())
+		m.workflow.Tasks.Delete(subTask.GetID())
+		m.workflow.Dependencies.Delete(subTask.GetID())
+		// 回滚下游任务的依赖关系
+		if exists {
+			for _, downstreamID := range parentNode.OutEdges {
+				// 恢复父任务到下游任务的依赖
+				depsValue, _ := m.workflow.Dependencies.LoadOrStore(downstreamID, make([]string, 0))
+				deps := depsValue.([]string)
+				// 检查是否已存在
+				found := false
+				for _, depID := range deps {
+					if depID == parentTaskID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					// 创建新的依赖列表（避免并发修改）
+					newDeps := make([]string, len(deps), len(deps)+1)
+					copy(newDeps, deps)
+					newDeps = append(newDeps, parentTaskID)
+					m.workflow.Dependencies.Store(downstreamID, newDeps)
+				}
+				// 删除子任务到下游任务的依赖
+				depsValue, _ = m.workflow.Dependencies.Load(downstreamID)
+				deps = depsValue.([]string)
+				newDeps := make([]string, 0, len(deps))
+				for _, depID := range deps {
+					if depID != subTask.GetID() {
+						newDeps = append(newDeps, depID)
+					}
+				}
+				m.workflow.Dependencies.Store(downstreamID, newDeps)
+			}
+		}
 		return fmt.Errorf("添加子任务到DAG失败: %w", err)
 	}
+
+	// 5. 由于go-dag是只读的，我们需要重新构建DAG以反映新的依赖关系
+	// 但为了性能，我们只在必要时重新构建
+	// 这里我们通过更新Workflow.Dependencies来管理依赖关系，DAG会在下次需要时重新构建
 
 	// 4. 检查子任务的依赖是否已满足，如果满足则加入候选队列
 	allDepsProcessed := true

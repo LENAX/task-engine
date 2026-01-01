@@ -30,10 +30,10 @@ type Engine struct {
 	workflowInstanceRepo storage.WorkflowInstanceRepository
 	taskRepo             storage.TaskRepository
 	registry             *task.FunctionRegistry
-	cfg                  *config.EngineConfig   // 框架配置
-	jobRegistry          map[string]interface{} // Job函数注册表（funcKey -> function）
-	callbackRegistry     map[string]interface{} // Callback函数注册表（funcKey -> function）
-	serviceRegistry      map[string]interface{} // 服务依赖注册表（serviceKey -> service）
+	cfg                  *config.EngineConfig // 框架配置
+	jobRegistry          sync.Map             // Job函数注册表（funcKey -> function）
+	callbackRegistry     sync.Map             // Callback函数注册表（funcKey -> function）
+	serviceRegistry      sync.Map             // 服务依赖注册表（serviceKey -> service）
 	running              bool
 	MaxConcurrency       int
 	Timeout              int
@@ -49,14 +49,32 @@ func NewEngine(
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
 	taskRepo storage.TaskRepository,
 ) (*Engine, error) {
+	return NewEngineWithRepos(
+		maxConcurrency, timeout,
+		workflowRepo,
+		workflowInstanceRepo,
+		taskRepo,
+		nil, // JobFunctionRepository (可选)
+		nil, // TaskHandlerRepository (可选)
+	)
+}
+
+// NewEngineWithRepos 创建Engine实例（带完整Repository支持，对外导出）
+func NewEngineWithRepos(
+	maxConcurrency, timeout int,
+	workflowRepo storage.WorkflowRepository,
+	workflowInstanceRepo storage.WorkflowInstanceRepository,
+	taskRepo storage.TaskRepository,
+	jobFunctionRepo storage.JobFunctionRepository,
+	taskHandlerRepo storage.TaskHandlerRepository,
+) (*Engine, error) {
 	exec, err := executor.NewExecutor(maxConcurrency)
 	if err != nil {
 		return nil, err
 	}
 
-	// 创建FunctionRegistry
-	// 暂时不传入repo，后续可以完善
-	registry := task.NewFunctionRegistry(nil, nil)
+	// 创建FunctionRegistry，传入JobFunction和TaskHandler的Repository以启用默认存储
+	registry := task.NewFunctionRegistry(jobFunctionRepo, taskHandlerRepo)
 
 	return &Engine{
 		executor:             exec,
@@ -120,6 +138,37 @@ func (e *Engine) AddSubTaskToInstance(ctx context.Context, instanceID string, su
 	}
 
 	return manager.AddSubTask(subTask, parentTaskID)
+}
+
+// GetInstanceManager 获取指定WorkflowInstance的Manager（对外导出）
+// 用于Handler中需要访问Manager的场景
+func (e *Engine) GetInstanceManager(instanceID string) (interface{}, error) {
+	if !e.running {
+		return nil, fmt.Errorf("引擎未启动")
+	}
+
+	e.mu.RLock()
+	manager, exists := e.managers[instanceID]
+	e.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("WorkflowInstance %s 不存在", instanceID)
+	}
+
+	// 返回一个接口，只暴露AddSubTask方法，避免暴露内部结构
+	return &InstanceManagerInterface{
+		manager: manager,
+	}, nil
+}
+
+// InstanceManagerInterface 暴露给Handler的Manager接口，避免循环引用
+type InstanceManagerInterface struct {
+	manager *WorkflowInstanceManager
+}
+
+// AddSubTask 添加子任务（对外导出）
+func (i *InstanceManagerInterface) AddSubTask(subTask workflow.Task, parentTaskID string) error {
+	return i.manager.AddSubTask(subTask, parentTaskID)
 }
 
 // restoreUnfinishedInstances 恢复未完成的WorkflowInstance（内部方法）
