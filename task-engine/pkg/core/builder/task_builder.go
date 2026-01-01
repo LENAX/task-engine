@@ -18,7 +18,9 @@ type TaskBuilder struct {
 	timeoutSeconds int
 	retryCount     int
 	dependencies   []string
-	statusHandlers map[string]string // 状态处理函数映射（status -> handlerID）
+	statusHandlers map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
+	requiredParams []string            // 必需参数列表
+	resultMapping  map[string]string   // 上游结果字段到下游参数的映射规则
 	registry       *task.FunctionRegistry
 }
 
@@ -35,7 +37,9 @@ func NewTaskBuilder(name, description string, registry *task.FunctionRegistry) *
 		retryCount:     0,  // 默认0次，即不重试
 		dependencies:   make([]string, 0),
 		params:         make(map[string]interface{}),
-		statusHandlers: make(map[string]string),
+		statusHandlers: make(map[string][]string),
+		requiredParams: make([]string, 0),
+		resultMapping:  make(map[string]string),
 		registry:       registry,
 	}
 }
@@ -117,6 +121,7 @@ func (b *TaskBuilder) WithDependencies(depTaskNames []string) *TaskBuilder {
 // WithTaskHandler 为Task添加状态处理函数（链式构建，对外导出）
 // status: Task状态（如 task.TaskStatusSuccess, task.TaskStatusFailed 等）
 // handlerName: 已注册的Task Handler名称或ID
+// 支持多次调用为同一状态添加多个Handler，按添加顺序执行
 // 如果TaskBuilder包含registry，会检查Handler是否存在
 func (b *TaskBuilder) WithTaskHandler(status, handlerName string) *TaskBuilder {
 	if status == "" || handlerName == "" {
@@ -125,7 +130,7 @@ func (b *TaskBuilder) WithTaskHandler(status, handlerName string) *TaskBuilder {
 
 	// 初始化statusHandlers map
 	if b.statusHandlers == nil {
-		b.statusHandlers = make(map[string]string)
+		b.statusHandlers = make(map[string][]string)
 	}
 
 	// 检查Handler是否存在
@@ -135,7 +140,10 @@ func (b *TaskBuilder) WithTaskHandler(status, handlerName string) *TaskBuilder {
 		// 如果通过名称找不到，尝试直接使用handlerName作为ID检查
 		if !b.registry.TaskHandlerExists(handlerName) {
 			// Handler不存在，但先保存名称，在Build()时统一报错
-			b.statusHandlers[status] = handlerName
+			if b.statusHandlers[status] == nil {
+				b.statusHandlers[status] = make([]string, 0)
+			}
+			b.statusHandlers[status] = append(b.statusHandlers[status], handlerName)
 			return b
 		}
 		// 如果handlerName是ID，直接使用
@@ -145,13 +153,49 @@ func (b *TaskBuilder) WithTaskHandler(status, handlerName string) *TaskBuilder {
 	// 验证Handler确实存在
 	if !b.registry.TaskHandlerExists(handlerID) {
 		// Handler不存在，但先保存名称，在Build()时统一报错
-		b.statusHandlers[status] = handlerName
+		if b.statusHandlers[status] == nil {
+			b.statusHandlers[status] = make([]string, 0)
+		}
+		b.statusHandlers[status] = append(b.statusHandlers[status], handlerName)
 		return b
 	}
 
-	// Handler存在，保存ID
-	b.statusHandlers[status] = handlerID
+	// Handler存在，添加到列表（如果列表不存在则创建）
+	if b.statusHandlers[status] == nil {
+		b.statusHandlers[status] = make([]string, 0)
+	}
+	// 检查是否已存在，避免重复添加
+	for _, existingID := range b.statusHandlers[status] {
+		if existingID == handlerID {
+			return b // 已存在，不重复添加
+		}
+	}
+	b.statusHandlers[status] = append(b.statusHandlers[status], handlerID)
 
+	return b
+}
+
+// WithRequiredParams 设置必需参数列表（链式构建，对外导出）
+// params: 必需参数名称列表
+func (b *TaskBuilder) WithRequiredParams(params []string) *TaskBuilder {
+	if len(params) == 0 {
+		return b
+	}
+	b.requiredParams = make([]string, len(params))
+	copy(b.requiredParams, params)
+	return b
+}
+
+// WithResultMapping 设置结果映射规则（链式构建，对外导出）
+// mapping: 上游结果字段到下游参数的映射（sourceField -> targetParam）
+func (b *TaskBuilder) WithResultMapping(mapping map[string]string) *TaskBuilder {
+	if len(mapping) == 0 {
+		return b
+	}
+	b.resultMapping = make(map[string]string)
+	for k, v := range mapping {
+		b.resultMapping[k] = v
+	}
 	return b
 }
 
@@ -195,51 +239,68 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 
 		// 验证所有TaskHandler是否存在
 		if len(b.statusHandlers) > 0 {
-			for status, handlerRef := range b.statusHandlers {
-				// 先通过名称查找Handler ID
-				handlerID := b.registry.GetTaskHandlerIDByName(handlerRef)
-				if handlerID == "" {
-					// 如果通过名称找不到，尝试直接使用handlerRef作为ID检查
-					if !b.registry.TaskHandlerExists(handlerRef) {
-						return nil, fmt.Errorf("Task Handler %s (状态: %s) 未在registry中注册", handlerRef, status)
+			for status, handlerRefs := range b.statusHandlers {
+				validatedIDs := make([]string, 0, len(handlerRefs))
+				for _, handlerRef := range handlerRefs {
+					// 先通过名称查找Handler ID
+					handlerID := b.registry.GetTaskHandlerIDByName(handlerRef)
+					if handlerID == "" {
+						// 如果通过名称找不到，尝试直接使用handlerRef作为ID检查
+						if !b.registry.TaskHandlerExists(handlerRef) {
+							return nil, fmt.Errorf("Task Handler %s (状态: %s) 未在registry中注册", handlerRef, status)
+						}
+						handlerID = handlerRef
+					} else {
+						// 验证Handler确实存在
+						if !b.registry.TaskHandlerExists(handlerID) {
+							return nil, fmt.Errorf("Task Handler %s (ID: %s, 状态: %s) 未在registry中注册", handlerRef, handlerID, status)
+						}
 					}
-					handlerID = handlerRef
-				} else {
-					// 验证Handler确实存在
-					if !b.registry.TaskHandlerExists(handlerID) {
-						return nil, fmt.Errorf("Task Handler %s (ID: %s, 状态: %s) 未在registry中注册", handlerRef, handlerID, status)
-					}
+					// 添加到已验证的ID列表
+					validatedIDs = append(validatedIDs, handlerID)
 				}
-				// 更新为正确的Handler ID
-				b.statusHandlers[status] = handlerID
+				// 更新为已验证的Handler ID列表
+				b.statusHandlers[status] = validatedIDs
 			}
 		}
 	}
 
-	// 创建Task实例
-	t := &task.Task{
-		ID:             uuid.NewString(),
-		Name:           b.name,
-		Description:    b.description,
-		Status:         task.TaskStatusPending,
-		JobFuncName:    b.jobFuncName,
-		JobFuncID:      b.jobFuncID,
-		TimeoutSeconds: b.timeoutSeconds,
-		RetryCount:     b.retryCount,
-		Dependencies:   make([]string, len(b.dependencies)),
-		Params:         make(map[string]any),
+	// 使用 NewTask 创建 Task 实例
+	t := task.NewTask(b.name, b.description, b.jobFuncID, make(map[string]any), nil)
+	t.ID = uuid.NewString()
+	t.JobFuncName = b.jobFuncName
+	t.TimeoutSeconds = b.timeoutSeconds
+	t.RetryCount = b.retryCount
+	t.Dependencies = make([]string, len(b.dependencies))
+	copy(t.Dependencies, b.dependencies)
+	t.RequiredParams = make([]string, len(b.requiredParams))
+	copy(t.RequiredParams, b.requiredParams)
+	t.ResultMapping = make(map[string]string)
+	for k, v := range b.resultMapping {
+		t.ResultMapping[k] = v
 	}
 
 	// 设置StatusHandlers
 	if len(b.statusHandlers) > 0 {
-		t.StatusHandlers = make(map[string]string)
-		for status, handlerID := range b.statusHandlers {
-			t.StatusHandlers[status] = handlerID
+		t.StatusHandlers = make(map[string][]string)
+		for status, handlerIDs := range b.statusHandlers {
+			// 复制切片，避免外部修改
+			handlerIDsCopy := make([]string, len(handlerIDs))
+			copy(handlerIDsCopy, handlerIDs)
+			t.StatusHandlers[status] = handlerIDsCopy
 		}
 	}
 
 	// 复制依赖列表
 	copy(t.Dependencies, b.dependencies)
+
+	// 复制必需参数列表
+	copy(t.RequiredParams, b.requiredParams)
+
+	// 复制结果映射
+	for k, v := range b.resultMapping {
+		t.ResultMapping[k] = v
+	}
 
 	// 转换参数：map[string]interface{} -> map[string]string
 	for k, v := range b.params {
@@ -253,7 +314,7 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 			// 对于其他类型，使用fmt.Sprintf转换
 			strValue = fmt.Sprintf("%v", val)
 		}
-		t.Params[k] = strValue
+		t.Params.Store(k, strValue)
 	}
 
 	return t, nil
