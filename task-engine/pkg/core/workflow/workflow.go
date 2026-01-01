@@ -6,23 +6,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stevelan1995/task-engine/pkg/core/types"
 )
 
-// Task 定义Task接口，避免循环依赖（对外导出）
-type Task interface {
-	GetID() string
-	GetName() string
-	GetJobFuncName() string
-	GetParams() map[string]interface{}
-	GetStatus() string
-	GetDependencies() []string
-}
+// Task 使用公共包中的Task接口（类型别名，保持向后兼容）
+// 注意：为了保持向后兼容，保留这个类型别名
+// 新代码可以直接使用 types.Task
+type Task = types.Task
 
-// TaskInfo 定义Task信息接口（用于DAG构建，避免循环依赖）
-type TaskInfo interface {
-	GetID() string
-	GetName() string
-}
+// TaskInfo 使用公共包中的TaskInfo接口（类型别名，保持向后兼容）
+type TaskInfo = types.TaskInfo
 
 // Workflow Workflow核心结构体（对外导出）
 type Workflow struct {
@@ -268,6 +261,21 @@ func (w *Workflow) GetTaskByName(taskName string) (Task, bool) {
 	taskID := taskIDValue.(string)
 	// 根据Task ID获取Task
 	return w.GetTask(taskID)
+}
+
+// GetTaskIDByName 根据Task名称获取Task ID（对外导出，线程安全）
+// taskName: Task名称
+// 返回Task ID和是否存在
+func (w *Workflow) GetTaskIDByName(taskName string) (string, bool) {
+	if taskName == "" {
+		return "", false
+	}
+	// 使用TaskNameIndex快速查找Task ID
+	taskIDValue, exists := w.TaskNameIndex.Load(taskName)
+	if !exists {
+		return "", false
+	}
+	return taskIDValue.(string), true
 }
 
 // UpdateTask 更新Workflow中的Task（对外导出，线程安全）

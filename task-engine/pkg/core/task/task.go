@@ -29,6 +29,8 @@ type Task struct {
 	CreateTime     time.Time
 	status         string              // 状态（私有字段，通过setter修改）
 	statusMu       sync.Mutex          // 保护status字段
+	isSubTask      bool                // 是否为动态生成的子任务（私有字段）
+	isSubTaskMu    sync.RWMutex        // 保护isSubTask字段
 	StatusHandlers map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
 	JobFuncID      string              // Job函数ID（通过Registry获取函数实例）
 	JobFuncName    string              // Job函数名称（用于快速查找和依赖构建）
@@ -37,6 +39,7 @@ type Task struct {
 	Dependencies   []string            // 依赖的前置Task名称列表
 	RequiredParams []string            // 必需参数列表（用于参数校验）
 	ResultMapping  map[string]string   // 上游结果字段到下游参数的映射规则
+	mu             sync.RWMutex        // 保护所有字段
 }
 
 // NewTask 创建Task实例（对外导出）
@@ -132,9 +135,18 @@ func NewTask(name, desc, jobFuncID string, params map[string]any, statusHandlers
 // 	return registry.Get(t.JobFuncID)
 // }
 
-// GetID 获取Task的唯一标识（对外导出）
+// GetID 获取Task的唯一标识（对外导出，线程安全）
 func (t *Task) GetID() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return t.ID
+}
+
+// SetID 设置Task的唯一标识（对外导出，线程安全）
+func (t *Task) SetID(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ID = id
 }
 
 // GetName 获取Task的名称（对外导出）
@@ -212,4 +224,204 @@ func (t *Task) GetDependencies() []string {
 	result := make([]string, len(t.Dependencies))
 	copy(result, t.Dependencies)
 	return result
+}
+
+// IsSubTask 判断Task是否为动态生成的子任务（对外导出，线程安全）
+func (t *Task) IsSubTask() bool {
+	t.isSubTaskMu.RLock()
+	defer t.isSubTaskMu.RUnlock()
+	return t.isSubTask
+}
+
+// SetSubTask 设置Task是否为动态生成的子任务（对外导出，线程安全）
+func (t *Task) SetSubTask(isSubTask bool) {
+	t.isSubTaskMu.Lock()
+	defer t.isSubTaskMu.Unlock()
+	t.isSubTask = isSubTask
+}
+
+// GetJobFuncID 获取Task绑定的Job函数ID（对外导出）
+func (t *Task) GetJobFuncID() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.JobFuncID
+}
+
+// SetJobFuncID 设置Task绑定的Job函数ID（对外导出）
+func (t *Task) SetJobFuncID(jobFuncID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.JobFuncID = jobFuncID
+}
+
+// SetParam 设置单个参数（对外导出，线程安全）
+func (t *Task) SetParam(key string, value interface{}) {
+	t.Params.Store(key, value)
+}
+
+// GetParam 获取单个参数（对外导出，线程安全）
+func (t *Task) GetParam(key string) (interface{}, bool) {
+	return t.Params.Load(key)
+}
+
+func (t *Task) GetTimeoutSeconds() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.TimeoutSeconds
+}
+
+func (t *Task) SetTimeoutSeconds(timeoutSeconds int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.TimeoutSeconds = timeoutSeconds
+}
+
+// GetDescription 获取Task的描述（对外导出，线程安全）
+func (t *Task) GetDescription() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Description
+}
+
+// SetDescription 设置Task的描述（对外导出，线程安全）
+func (t *Task) SetDescription(description string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Description = description
+}
+
+// GetCreateTime 获取Task的创建时间（对外导出，线程安全）
+func (t *Task) GetCreateTime() time.Time {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.CreateTime
+}
+
+// SetCreateTime 设置Task的创建时间（对外导出，线程安全）
+func (t *Task) SetCreateTime(createTime time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.CreateTime = createTime
+}
+
+// GetStatusHandlers 获取Task的状态处理器映射（对外导出，线程安全）
+func (t *Task) GetStatusHandlers() map[string][]string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.StatusHandlers == nil {
+		return make(map[string][]string)
+	}
+	// 返回副本，避免外部修改
+	result := make(map[string][]string, len(t.StatusHandlers))
+	for k, v := range t.StatusHandlers {
+		result[k] = make([]string, len(v))
+		copy(result[k], v)
+	}
+	return result
+}
+
+// SetStatusHandlers 设置Task的状态处理器映射（对外导出，线程安全）
+func (t *Task) SetStatusHandlers(statusHandlers map[string][]string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if statusHandlers == nil {
+		t.StatusHandlers = make(map[string][]string)
+	} else {
+		// 创建副本，避免外部修改
+		t.StatusHandlers = make(map[string][]string, len(statusHandlers))
+		for k, v := range statusHandlers {
+			t.StatusHandlers[k] = make([]string, len(v))
+			copy(t.StatusHandlers[k], v)
+		}
+	}
+}
+
+// SetJobFuncName 设置Task绑定的Job函数名称（对外导出，线程安全）
+func (t *Task) SetJobFuncName(jobFuncName string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.JobFuncName = jobFuncName
+}
+
+// GetRetryCount 获取Task的重试次数（对外导出，线程安全）
+func (t *Task) GetRetryCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.RetryCount
+}
+
+// SetRetryCount 设置Task的重试次数（对外导出，线程安全）
+func (t *Task) SetRetryCount(retryCount int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.RetryCount = retryCount
+}
+
+// SetDependencies 设置Task的依赖列表（对外导出，线程安全）
+func (t *Task) SetDependencies(dependencies []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if dependencies == nil {
+		t.Dependencies = make([]string, 0)
+	} else {
+		// 创建副本，避免外部修改
+		t.Dependencies = make([]string, len(dependencies))
+		copy(t.Dependencies, dependencies)
+	}
+}
+
+// GetRequiredParams 获取Task的必需参数列表（对外导出，线程安全）
+func (t *Task) GetRequiredParams() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.RequiredParams == nil {
+		return make([]string, 0)
+	}
+	// 返回副本，避免外部修改
+	result := make([]string, len(t.RequiredParams))
+	copy(result, t.RequiredParams)
+	return result
+}
+
+// SetRequiredParams 设置Task的必需参数列表（对外导出，线程安全）
+func (t *Task) SetRequiredParams(requiredParams []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if requiredParams == nil {
+		t.RequiredParams = make([]string, 0)
+	} else {
+		// 创建副本，避免外部修改
+		t.RequiredParams = make([]string, len(requiredParams))
+		copy(t.RequiredParams, requiredParams)
+	}
+}
+
+// GetResultMapping 获取Task的结果映射规则（对外导出，线程安全）
+func (t *Task) GetResultMapping() map[string]string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.ResultMapping == nil {
+		return make(map[string]string)
+	}
+	// 返回副本，避免外部修改
+	result := make(map[string]string, len(t.ResultMapping))
+	for k, v := range t.ResultMapping {
+		result[k] = v
+	}
+	return result
+}
+
+// SetResultMapping 设置Task的结果映射规则（对外导出，线程安全）
+func (t *Task) SetResultMapping(resultMapping map[string]string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if resultMapping == nil {
+		t.ResultMapping = make(map[string]string)
+	} else {
+		// 创建副本，避免外部修改
+		t.ResultMapping = make(map[string]string, len(resultMapping))
+		for k, v := range resultMapping {
+			t.ResultMapping[k] = v
+		}
+	}
 }

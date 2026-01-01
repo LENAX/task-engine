@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+
+	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
 
 // TaskHandlerType Task Handler函数签名（对外导出）
@@ -12,11 +14,11 @@ type TaskHandlerType func(ctx *TaskContext)
 
 // ExecuteTaskHandler 执行Task的状态Handler（对外导出）
 // registry: 函数注册中心
-// task: Task实例
+// task: Task实例（使用接口，支持任何实现了workflow.Task的类型）
 // status: 当前状态
 // resultData: 任务执行结果数据（可选，用于Success状态）
 // errorMsg: 错误信息（可选，用于Failed/Timeout状态）
-func ExecuteTaskHandler(registry *FunctionRegistry, task *Task, status string, resultData interface{}, errorMsg string) error {
+func ExecuteTaskHandler(registry *FunctionRegistry, task workflow.Task, status string, resultData interface{}, errorMsg string) error {
 	if registry == nil {
 		return fmt.Errorf("函数注册中心未配置")
 	}
@@ -25,13 +27,14 @@ func ExecuteTaskHandler(registry *FunctionRegistry, task *Task, status string, r
 		return fmt.Errorf("Task实例为空")
 	}
 
-	// 检查是否有配置该状态的Handler
-	if len(task.StatusHandlers) == 0 {
+	// 检查是否有配置该状态的Handler（使用接口方法）
+	statusHandlers := task.GetStatusHandlers()
+	if len(statusHandlers) == 0 {
 		return nil // 没有配置Handler，直接返回
 	}
 
 	// 获取该状态对应的Handler ID列表
-	handlerIDs, exists := task.StatusHandlers[status]
+	handlerIDs, exists := statusHandlers[status]
 	if !exists || len(handlerIDs) == 0 {
 		return nil // 该状态没有配置Handler，直接返回
 	}
@@ -56,13 +59,10 @@ func ExecuteTaskHandler(registry *FunctionRegistry, task *Task, status string, r
 
 		// 准备参数，包含结果数据或错误信息
 		params := make(map[string]interface{})
-		// 复制原有参数
-		task.Params.Range(func(key, value interface{}) bool {
-			if keyStr, ok := key.(string); ok {
-				params[keyStr] = value
-			}
-			return true
-		})
+		// 复制原有参数（使用接口方法）
+		for k, v := range task.GetParams() {
+			params[k] = v
+		}
 
 		// 根据状态添加特定数据
 		switch status {
@@ -84,24 +84,24 @@ func ExecuteTaskHandler(registry *FunctionRegistry, task *Task, status string, r
 
 		taskCtx := NewTaskContext(
 			ctx,
-			task.ID,
-			task.Name,
+			task.GetID(),
+			task.GetName(),
 			"", // WorkflowID，如果需要在handler中使用，应该从外部传入
 			"", // WorkflowInstanceID，如果需要在handler中使用，应该从外部传入
 			params,
 		)
 
 		// 执行Handler（在goroutine中执行，避免阻塞）
-		go func(hID string, h TaskHandlerType) {
+		go func(hID string, h TaskHandlerType, taskID string) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("Task Handler执行panic: Task=%s, Status=%s, HandlerID=%s, Error=%v",
-						task.ID, status, hID, r)
+						taskID, status, hID, r)
 				}
 			}()
 
 			h(taskCtx)
-		}(handlerID, handler)
+		}(handlerID, handler, task.GetID())
 	}
 
 	return nil
@@ -110,7 +110,7 @@ func ExecuteTaskHandler(registry *FunctionRegistry, task *Task, status string, r
 // ExecuteTaskHandlerSync 同步执行Task的状态Handler（对外导出）
 // 与ExecuteTaskHandler的区别是：同步执行，会等待handler完成
 // 适用于需要确保handler执行完成后再继续的场景
-func ExecuteTaskHandlerSync(registry *FunctionRegistry, task *Task, status string, resultData interface{}, errorMsg string) error {
+func ExecuteTaskHandlerSync(registry *FunctionRegistry, task workflow.Task, status string, resultData interface{}, errorMsg string) error {
 	if registry == nil {
 		return fmt.Errorf("函数注册中心未配置")
 	}
@@ -119,13 +119,14 @@ func ExecuteTaskHandlerSync(registry *FunctionRegistry, task *Task, status strin
 		return fmt.Errorf("Task实例为空")
 	}
 
-	// 检查是否有配置该状态的Handler
-	if len(task.StatusHandlers) == 0 {
+	// 检查是否有配置该状态的Handler（使用接口方法）
+	statusHandlers := task.GetStatusHandlers()
+	if len(statusHandlers) == 0 {
 		return nil
 	}
 
 	// 获取该状态对应的Handler ID列表
-	handlerIDs, exists := task.StatusHandlers[status]
+	handlerIDs, exists := statusHandlers[status]
 	if !exists || len(handlerIDs) == 0 {
 		return nil
 	}
@@ -134,12 +135,10 @@ func ExecuteTaskHandlerSync(registry *FunctionRegistry, task *Task, status strin
 	ctx := context.Background()
 
 	params := make(map[string]interface{})
-	task.Params.Range(func(key, value interface{}) bool {
-		if keyStr, ok := key.(string); ok {
-			params[keyStr] = value
-		}
-		return true
-	})
+	// 复制原有参数（使用接口方法）
+	for k, v := range task.GetParams() {
+		params[k] = v
+	}
 
 	// 根据状态添加特定数据
 	switch status {
@@ -160,8 +159,8 @@ func ExecuteTaskHandlerSync(registry *FunctionRegistry, task *Task, status strin
 
 	taskCtx := NewTaskContext(
 		ctx,
-		task.ID,
-		task.Name,
+		task.GetID(),
+		task.GetName(),
 		"",
 		"",
 		params,
@@ -181,16 +180,16 @@ func ExecuteTaskHandlerSync(registry *FunctionRegistry, task *Task, status strin
 		}
 
 		// 同步执行Handler
-		func(hID string, h TaskHandlerType) {
+		func(hID string, h TaskHandlerType, taskID string) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("Task Handler执行panic: Task=%s, Status=%s, HandlerID=%s, Error=%v",
-						task.ID, status, hID, r)
+						taskID, status, hID, r)
 				}
 			}()
 
 			h(taskCtx)
-		}(handlerID, handler)
+		}(handlerID, handler, task.GetID())
 	}
 
 	return nil
@@ -233,12 +232,10 @@ func ExecuteTaskHandlerWithContext(
 	ctx = registry.WithDependencies(ctx)
 
 	params := make(map[string]interface{})
-	task.Params.Range(func(key, value interface{}) bool {
-		if keyStr, ok := key.(string); ok {
-			params[keyStr] = value
-		}
-		return true
-	})
+	// 复制原有参数（使用接口方法）
+	for k, v := range task.GetParams() {
+		params[k] = v
+	}
 
 	// 根据状态添加特定数据
 	switch status {
@@ -259,8 +256,8 @@ func ExecuteTaskHandlerWithContext(
 
 	taskCtx := NewTaskContext(
 		ctx,
-		task.ID,
-		task.Name,
+		task.GetID(),
+		task.GetName(),
 		workflowID,
 		workflowInstanceID,
 		params,
@@ -280,16 +277,16 @@ func ExecuteTaskHandlerWithContext(
 		}
 
 		// 执行Handler（异步执行）
-		go func(hID string, h TaskHandlerType) {
+		go func(hID string, h TaskHandlerType, taskID string) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("Task Handler执行panic: Task=%s, Status=%s, HandlerID=%s, Error=%v",
-						task.ID, status, hID, r)
+						taskID, status, hID, r)
 				}
 			}()
 
 			h(taskCtx)
-		}(handlerID, handler)
+		}(handlerID, handler, task.GetID())
 	}
 
 	return nil

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"sync"
 	"time"
 
@@ -104,31 +103,6 @@ func NewWorkflowInstanceManager(
 		}
 	}
 
-	if len(missingTasks) > 0 {
-		log.Printf("⚠️ WorkflowInstance %s: 初始化验证失败，发现 %d 个根节点任务未被添加到 candidateNodes: %v",
-			instance.ID, len(missingTasks), missingTasks)
-		// 尝试恢复这些任务
-		for _, taskID := range readyTasks {
-			if t, exists := wf.GetTasks()[taskID]; exists {
-				// 检查是否真的不在 candidateNodes 中
-				if _, exists := manager.candidateNodes.Load(taskID); !exists {
-					manager.candidateNodes.Store(taskID, t)
-					log.Printf("✅ WorkflowInstance %s: 恢复任务 %s (%s) 到 candidateNodes", instance.ID, taskID, t.GetName())
-				}
-			}
-		}
-		// 再次检查所有没有依赖的任务
-		for taskID, t := range wf.GetTasks() {
-			deps := t.GetDependencies()
-			if len(deps) == 0 {
-				if _, exists := manager.candidateNodes.Load(taskID); !exists {
-					manager.candidateNodes.Store(taskID, t)
-					log.Printf("✅ WorkflowInstance %s: 补充添加任务 %s (%s) 到 candidateNodes", instance.ID, taskID, t.GetName())
-				}
-			}
-		}
-	}
-
 	log.Printf("✅ WorkflowInstance %s: 初始化完成，总任务数: %d, 就绪任务数: %d, 已添加到 candidateNodes: %d",
 		instance.ID, totalTasks, len(readyTasks), addedCount)
 
@@ -195,7 +169,8 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 			availableTasks := m.getAvailableTasks()
 			if len(availableTasks) == 0 {
 				// 检查是否有任务在数据库中但不在candidateNodes中
-				// 这可能是由于初始化时的问题或任务被提前创建到数据库
+				// 主要用于系统恢复场景：系统崩溃重启后，需要恢复未完成的任务
+				// 或者任务提交失败后需要重试的场景
 				m.recoverPendingTasks()
 
 				// 检查是否所有任务都已完成
@@ -219,6 +194,8 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 					m.mu.Unlock()
 
 					ctx := context.Background()
+					// 批量保存所有任务状态
+					m.saveAllTaskStatuses(ctx)
 					m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Success")
 
 					// 发送状态更新通知（重要：让Controller知道workflow已完成）
@@ -247,99 +224,38 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 				if _, processed := m.processedNodes.Load(taskID); processed {
 					// 任务已被处理，从candidateNodes中删除并跳过
 					m.candidateNodes.Delete(taskID)
-					// 减少日志写入频率，只在必要时记录
-					// #region agent log
-					// logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					// if logFile != nil {
-					// 	fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:245","message":"任务提交前发现已处理，跳过","data":{"instanceID":"%s","taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"F"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, taskName)
-					// 	logFile.Close()
-					// }
-					// #endregion
 					continue
 				}
 
 				// 先不标记为已处理，等成功提交后再标记
 				// 这样如果提交失败，任务还在 candidateNodes 中，可以重试
 
-				// 通过JobFuncName从registry获取JobFuncID
-				jobFuncID := ""
-				if m.registry != nil {
-					jobFuncID = m.registry.GetIDByName(t.GetJobFuncName())
-				}
-
-				// 创建task.Task实例（用于Executor）
-				// 获取参数并转换为map[string]any
-				paramsAny := make(map[string]any)
-				for k, v := range t.GetParams() {
-					paramsAny[k] = v
-				}
+				// 使用IsSubTask()判断是否是动态生成的子任务（不保存到数据库，跳过执行）
+				// if t.IsSubTask() {
+				// 	log.Printf("⚠️ WorkflowInstance %s: Task %s (%s) 是动态生成的子任务，跳过执行",
+				// 		m.instance.ID, taskID, taskName)
+				// 	// 从candidateNodes中删除，避免重复检查
+				// 	m.candidateNodes.Delete(taskID)
+				// 	continue
+				// }
 
 				// 从缓存获取上游任务结果并注入参数
 				if m.resultCache != nil {
-					deps := t.GetDependencies()
-					for _, depName := range deps {
-						depTaskID := m.findTaskIDByName(depName)
-						if depTaskID == "" {
-							continue
-						}
-						// 尝试从缓存获取
-						if cachedResult, found := m.resultCache.Get(depTaskID); found {
-							// 将缓存结果注入到参数中（使用特殊前缀）
-							paramsAny[fmt.Sprintf("_cached_%s", depTaskID)] = cachedResult
-							log.Printf("📦 [缓存命中] TaskID=%s, 从缓存获取上游任务 %s 的结果", taskID, depTaskID)
-						}
-					}
+					m.injectCachedResults(t, taskID)
 				}
 
-				// 转换为map[string]string用于NewTask
-				paramsStr := make(map[string]string)
-				for k, v := range t.GetParams() {
-					switch val := v.(type) {
-					case string:
-						paramsStr[k] = val
-					case nil:
-						paramsStr[k] = ""
-					default:
-						paramsStr[k] = fmt.Sprintf("%v", val)
-					}
+				// 通过JobFuncName从registry获取JobFuncID（如果还没有设置）
+				if t.GetJobFuncID() == "" && m.registry != nil {
+					t.SetJobFuncID(m.registry.GetIDByName(t.GetJobFuncName()))
 				}
 
-				taskObj := task.NewTask(t.GetName(), "", jobFuncID, paramsAny, paramsStr)
-				taskObj.ID = taskID // 使用已有的ID
-				taskObj.JobFuncName = t.GetJobFuncName()
-				taskObj.TimeoutSeconds = 30 // 默认值
-				taskObj.RetryCount = 0
-				taskObj.SetStatus(task.TaskStatusPending)
-
-				// 检查Task是否已存在于数据库（预定义的Task已在SubmitWorkflow时保存）
-				ctx := context.Background()
-				existingTask, err := m.taskRepo.GetByID(ctx, taskID)
-				if err != nil {
-					log.Printf("⚠️ WorkflowInstance %s: 查询Task %s 失败: %v", m.instance.ID, taskID, err)
-					// 查询失败，跳过该任务
-					continue
-				}
-
-				// 如果Task不存在，说明是动态生成的子任务，不保存（根据业务需求）
-				if existingTask == nil {
-					log.Printf("⚠️ WorkflowInstance %s: Task %s (%s) 不存在于数据库，可能是动态生成的子任务，跳过执行",
-						m.instance.ID, taskID, taskName)
-					// 从candidateNodes中删除，避免重复检查
-					m.candidateNodes.Delete(taskID)
-					continue
-				}
-
-				// Task已存在（预定义的Task），使用数据库中的信息更新taskObj
-				if existingTask.TimeoutSeconds > 0 {
-					taskObj.TimeoutSeconds = existingTask.TimeoutSeconds
-				}
-				if existingTask.JobFuncID != "" {
-					taskObj.JobFuncID = existingTask.JobFuncID
-				}
+				// 确保状态为Pending
+				t.SetStatus(task.TaskStatusPending)
 
 				// 创建executor.PendingTask
+				// 现在可以直接使用 workflow.Task 接口，不需要类型断言
 				pendingTask := &executor.PendingTask{
-					Task:       taskObj,
+					Task:       t,
 					WorkflowID: m.instance.WorkflowID,
 					InstanceID: m.instance.ID,
 					Domain:     "",
@@ -349,46 +265,21 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 				}
 
 				// 提交到Executor
-				// #region agent log
-				logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:331","message":"提交任务到Executor前","data":{"instanceID":"%s","taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, taskName)
-					logFile.Close()
-				}
-				// #endregion
 				if err := m.executor.SubmitTask(pendingTask); err != nil {
-					// #region agent log
-					logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					if logFile != nil {
-						fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:332","message":"提交任务到Executor失败","data":{"instanceID":"%s","taskID":"%s","taskName":"%s","error":"%v"},"sessionId":"debug-session","runId":"run1","hypothesisId":"E"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, taskName, err)
-						logFile.Close()
-					}
-					// #endregion
 					log.Printf("❌ WorkflowInstance %s: 提交Task到Executor失败: TaskID=%s, TaskName=%s, Error=%v",
 						m.instance.ID, taskID, taskName, err)
 					// 提交失败，需要回滚：将任务重新添加到 candidateNodes，以便重试
 					// 注意：任务已经保存到数据库，但还没有被标记为已处理
+					// 不更新数据库状态，只在instance完成/保存breakpoint/被取消时批量保存
 					m.candidateNodes.Store(taskID, t)
-					// 更新数据库中的任务状态为失败
-					errorMsg := fmt.Sprintf("提交到Executor失败: %v", err)
-					_ = m.taskRepo.UpdateStatusWithError(ctx, taskID, "Failed", errorMsg)
 					continue
 				}
 
-				// #region agent log
-				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:344","message":"提交任务到Executor成功","data":{"instanceID":"%s","taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, taskName)
-					logFile.Close()
-				}
-				// #endregion
 				// 提交成功，从 candidateNodes 中删除（但不标记为已处理，等任务真正完成后再标记）
 				// 注意：任务被提交到Executor后，会在异步执行完成后通过OnComplete/OnError回调更新状态
 				// 我们不应该在这里标记为已处理，因为任务可能还在Executor队列中等待执行
+				// 不更新数据库状态，只在instance完成/保存breakpoint/被取消时批量保存
 				m.candidateNodes.Delete(taskID)
-
-				// 更新Task状态为Pending（已在Save中设置，这里确保一致性）
-				m.taskRepo.UpdateStatus(ctx, taskID, "Pending")
 			}
 		}
 	}
@@ -420,9 +311,12 @@ func (m *WorkflowInstanceManager) handlePause() {
 	m.instance.Status = "Paused"
 	m.mu.Unlock()
 
+	ctx := context.Background()
+	// 批量保存所有任务状态
+	m.saveAllTaskStatuses(ctx)
+
 	// 记录断点数据
 	breakpoint := m.createBreakpoint()
-	ctx := context.Background()
 	m.workflowInstanceRepo.UpdateBreakpoint(ctx, m.instance.ID, breakpoint)
 	m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Paused")
 
@@ -468,6 +362,8 @@ func (m *WorkflowInstanceManager) handleTerminate() {
 	m.mu.Unlock()
 
 	ctx := context.Background()
+	// 批量保存所有任务状态
+	m.saveAllTaskStatuses(ctx)
 	m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Terminated")
 
 	// 发送状态更新通知（非阻塞）
@@ -483,78 +379,52 @@ func (m *WorkflowInstanceManager) handleTerminate() {
 	log.Printf("WorkflowInstance %s: 已终止", m.instance.ID)
 }
 
-// getAvailableTasks 获取可执行的任务列表
+// getAvailableTasks 获取可执行的任务列表（优化版：使用 DAG 获取就绪任务）
 func (m *WorkflowInstanceManager) getAvailableTasks() []workflow.Task {
 	var available []workflow.Task
 
-	m.candidateNodes.Range(func(key, value interface{}) bool {
-		taskID := key.(string)
-		t := value.(workflow.Task)
+	// 使用 DAG 获取当前就绪的任务（入度为0的节点）
+	readyTaskIDs := m.dag.GetReadyTasks()
 
+	for _, taskID := range readyTaskIDs {
 		// 检查是否已处理
 		if _, processed := m.processedNodes.Load(taskID); processed {
-			// 如果任务已处理，从candidateNodes中删除（防止重复提交）
-			m.candidateNodes.Delete(taskID)
-			// 减少日志写入频率，只在必要时记录
-			// #region agent log
-			// logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			// if logFile != nil {
-			// 	fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:476","message":"从candidateNodes删除已处理的任务","data":{"instanceID":"%s","taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"F"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, t.GetName())
-			// 	logFile.Close()
-			// }
-			// #endregion
-			return true // 继续下一个
+			continue
 		}
 
-		// 检查所有父节点是否都已处理
-		deps := t.GetDependencies()
-		allDepsProcessed := true
-		for _, depName := range deps {
-			// 通过名称找到Task ID
-			depTaskID := m.findTaskIDByName(depName)
-			if depTaskID == "" {
-				allDepsProcessed = false
-				break
-			}
-			if _, processed := m.processedNodes.Load(depTaskID); !processed {
-				allDepsProcessed = false
-				break
-			}
+		// 获取任务实例
+		task, exists := m.workflow.GetTasks()[taskID]
+		if !exists {
+			// 任务不在 workflow 中，可能是动态任务或已删除
+			continue
 		}
 
-		if allDepsProcessed {
-			// 执行参数校验和resultMapping
-			if err := m.validateAndMapParams(t, taskID); err != nil {
-				log.Printf("参数校验失败: TaskID=%s, Error=%v", taskID, err)
-				// 参数校验失败，跳过该任务
-				return true
-			}
-			available = append(available, t)
+		// 执行参数校验和resultMapping（业务逻辑）
+		if err := m.validateAndMapParams(task, taskID); err != nil {
+			log.Printf("参数校验失败: TaskID=%s, Error=%v", taskID, err)
+			continue
 		}
 
-		return true
-	})
+		available = append(available, task)
+	}
 
 	return available
 }
 
 // validateAndMapParams 校验参数并执行resultMapping（内部方法）
 func (m *WorkflowInstanceManager) validateAndMapParams(t workflow.Task, taskID string) error {
-	// 尝试获取Task对象以访问RequiredParams和ResultMapping
-	taskObj, ok := t.(*task.Task)
-	if !ok {
-		// 如果不是task.Task类型，跳过校验
-		return nil
-	}
+	// 使用接口方法获取RequiredParams和ResultMapping，无需类型断言
+	requiredParams := t.GetRequiredParams()
+	resultMapping := t.GetResultMapping()
 
 	// 1. 检查必需参数
-	if len(taskObj.RequiredParams) > 0 {
+	if len(requiredParams) > 0 {
 		// 获取上游任务的结果
 		deps := t.GetDependencies()
 		allParamsFound := true
 		missingParams := make([]string, 0)
 
-		for _, requiredParam := range taskObj.RequiredParams {
+		for _, requiredParam := range requiredParams {
 			found := false
 			// 首先检查当前任务的参数中是否已有
 			if t.GetParams()[requiredParam] != nil {
@@ -562,8 +432,8 @@ func (m *WorkflowInstanceManager) validateAndMapParams(t workflow.Task, taskID s
 			} else {
 				// 从上游任务结果中查找
 				for _, depName := range deps {
-					depTaskID := m.findTaskIDByName(depName)
-					if depTaskID == "" {
+					depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+					if !exists {
 						continue
 					}
 					// 从contextData获取上游任务结果
@@ -590,13 +460,13 @@ func (m *WorkflowInstanceManager) validateAndMapParams(t workflow.Task, taskID s
 	}
 
 	// 2. 执行resultMapping（从上游结果映射到当前任务参数）
-	if len(taskObj.ResultMapping) > 0 {
+	if len(resultMapping) > 0 {
 		deps := t.GetDependencies()
-		for targetParam, sourceField := range taskObj.ResultMapping {
+		for targetParam, sourceField := range resultMapping {
 			// 从上游任务结果中查找sourceField
 			for _, depName := range deps {
-				depTaskID := m.findTaskIDByName(depName)
-				if depTaskID == "" {
+				depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+				if !exists {
 					continue
 				}
 				// 从contextData获取上游任务结果
@@ -620,6 +490,103 @@ func (m *WorkflowInstanceManager) validateAndMapParams(t workflow.Task, taskID s
 	}
 
 	return nil
+}
+
+// injectCachedResults 从缓存获取上游任务结果并注入参数（内部方法）
+// 处理ResultMapping规则：如果存在映射关系，按照映射规则注入；否则检查字段一致性并警告
+func (m *WorkflowInstanceManager) injectCachedResults(t workflow.Task, taskID string) {
+	if m.resultCache == nil {
+		return
+	}
+
+	// 使用接口方法获取ResultMapping和RequiredParams，无需类型断言
+	resultMapping := t.GetResultMapping()
+	requiredParams := t.GetRequiredParams()
+	hasResultMapping := len(resultMapping) > 0
+
+	deps := t.GetDependencies()
+	for _, depName := range deps {
+		depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+		if !exists {
+			log.Printf("⚠️ WorkflowInstance %s: Task %s 依赖的任务名称 %s 不存在", m.instance.ID, taskID, depName)
+			continue
+		}
+
+		// 尝试从缓存获取
+		cachedResult, found := m.resultCache.Get(depTaskID)
+		if !found {
+			continue
+		}
+
+		// 将缓存结果转换为map[string]interface{}格式
+		upstreamResult, ok := cachedResult.(map[string]interface{})
+		if !ok {
+			// 如果结果不是map类型，直接注入整个结果（向后兼容）
+			cacheKey := fmt.Sprintf("_cached_%s", depTaskID)
+			if _, exists := t.GetParam(cacheKey); !exists {
+				t.SetParam(cacheKey, cachedResult)
+				log.Printf("📦 [缓存命中] TaskID=%s, 从缓存获取上游任务 %s 的结果（非map类型）", taskID, depTaskID)
+			}
+			continue
+		}
+
+		// 如果有ResultMapping配置，按照映射规则注入
+		if hasResultMapping {
+			mappedCount := 0
+			missingFields := make([]string, 0)
+
+			for targetParam, sourceField := range resultMapping {
+				// 检查上游结果中是否存在sourceField
+				if sourceValue, hasKey := upstreamResult[sourceField]; hasKey {
+					// 按照映射规则注入参数
+					if _, exists := t.GetParam(targetParam); !exists {
+						t.SetParam(targetParam, sourceValue)
+						mappedCount++
+						log.Printf("📦 [缓存映射] TaskID=%s, 从上游任务 %s 映射字段 %s -> %s, 值=%v", taskID, depTaskID, sourceField, targetParam, sourceValue)
+					}
+				} else {
+					// 找不到映射的字段，记录警告
+					missingFields = append(missingFields, fmt.Sprintf("%s(映射到%s)", sourceField, targetParam))
+				}
+			}
+
+			// 如果有找不到的映射字段，发出警告
+			if len(missingFields) > 0 {
+				log.Printf("⚠️ WorkflowInstance %s: Task %s 的ResultMapping中指定的上游字段在上游任务 %s 的结果中不存在: %v", m.instance.ID, taskID, depTaskID, missingFields)
+			}
+
+			// 如果所有映射都成功，记录日志
+			if mappedCount > 0 && len(missingFields) == 0 {
+				log.Printf("✅ [缓存映射完成] TaskID=%s, 从上游任务 %s 成功映射 %d 个字段", taskID, depTaskID, mappedCount)
+			}
+		} else {
+			// 没有ResultMapping配置，检查是否有依赖但找不到对应字段的情况
+			// 这里可以检查RequiredParams，如果存在必需参数但上游结果中没有对应字段，发出警告
+			if len(requiredParams) > 0 {
+				missingRequiredFields := make([]string, 0)
+				for _, requiredParam := range requiredParams {
+					// 检查当前任务参数中是否已有
+					if t.GetParams()[requiredParam] != nil {
+						continue
+					}
+					// 检查上游结果中是否有该字段
+					if _, hasKey := upstreamResult[requiredParam]; !hasKey {
+						missingRequiredFields = append(missingRequiredFields, requiredParam)
+					}
+				}
+				if len(missingRequiredFields) > 0 {
+					log.Printf("⚠️ WorkflowInstance %s: Task %s 的必需参数在上游任务 %s 的结果中不存在: %v (建议配置ResultMapping)", m.instance.ID, taskID, depTaskID, missingRequiredFields)
+				}
+			}
+
+			// 向后兼容：如果没有ResultMapping，注入整个结果（使用特殊前缀）
+			cacheKey := fmt.Sprintf("_cached_%s", depTaskID)
+			if _, exists := t.GetParam(cacheKey); !exists {
+				t.SetParam(cacheKey, cachedResult)
+				log.Printf("📦 [缓存命中] TaskID=%s, 从缓存获取上游任务 %s 的结果", taskID, depTaskID)
+			}
+		}
+	}
 }
 
 // isAllTasksCompleted 检查是否所有任务都已完成
@@ -675,8 +642,12 @@ func (m *WorkflowInstanceManager) isAllTasksCompleted() bool {
 	return true
 }
 
-// recoverPendingTasks 恢复那些在数据库中但不在candidateNodes中的Pending任务
-// 这可能是由于初始化时的问题或任务被提前创建到数据库
+// recoverPendingTasks 恢复那些在数据库中但不在candidateNodes中的Pending/Failed任务
+// 主要用于以下场景：
+// 1. 系统崩溃恢复：重启后恢复WorkflowInstance时，需要恢复未完成的任务
+// 2. 任务提交失败恢复：任务已保存到数据库但提交到Executor失败，需要重试
+// 3. 状态不一致恢复：processedNodes和数据库状态不一致时的恢复
+// 注意：只恢复预定义的任务（在workflow中存在的任务），动态生成的子任务不在数据库中，不需要恢复
 func (m *WorkflowInstanceManager) recoverPendingTasks() {
 	ctx := context.Background()
 	taskInstances, err := m.taskRepo.GetByWorkflowInstanceID(ctx, m.instance.ID)
@@ -756,11 +727,13 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 		}
 
 		// 从workflow中获取任务定义
+		// 注意：只恢复预定义的任务，动态生成的子任务不在数据库中，所以这里应该总是能找到
 		t, exists := m.workflow.GetTasks()[taskID]
 		if !exists {
-			// 任务不在workflow中，记录详细信息
+			// 任务不在workflow中，这不应该发生（因为所有预定义任务都在workflow中）
+			// 可能是数据不一致或动态任务（动态任务不应该在数据库中）
 			skippedNotInWorkflow++
-			log.Printf("⚠️ WorkflowInstance %s: Pending任务 %s (%s) 不在Workflow中，无法恢复",
+			log.Printf("⚠️ WorkflowInstance %s: Pending任务 %s (%s) 不在Workflow中，跳过恢复（可能是数据不一致）",
 				m.instance.ID, taskID, ti.Name)
 			continue
 		}
@@ -770,8 +743,8 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 		allDepsProcessed := true
 		missingDeps := make([]string, 0)
 		for _, depName := range deps {
-			depTaskID := m.findTaskIDByName(depName)
-			if depTaskID == "" {
+			depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+			if !exists {
 				allDepsProcessed = false
 				missingDeps = append(missingDeps, fmt.Sprintf("%s(未找到)", depName))
 				break
@@ -818,14 +791,94 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 	}
 }
 
-// findTaskIDByName 通过Task名称查找Task ID
-func (m *WorkflowInstanceManager) findTaskIDByName(name string) string {
-	for taskID, t := range m.workflow.GetTasks() {
-		if t.GetName() == name {
-			return taskID
+// saveAllTaskStatuses 批量保存所有任务状态到数据库（只保存预定义任务，跳过动态任务）
+func (m *WorkflowInstanceManager) saveAllTaskStatuses(ctx context.Context) {
+	// 获取所有任务（包括动态任务）
+	allTasks := m.workflow.GetTasks()
+	savedCount := 0
+	skippedCount := 0
+
+	// 从数据库获取所有任务实例，建立映射
+	taskInstances, err := m.taskRepo.GetByWorkflowInstanceID(ctx, m.instance.ID)
+	if err != nil {
+		log.Printf("⚠️ WorkflowInstance %s: 查询任务实例失败: %v", m.instance.ID, err)
+		return
+	}
+	taskInstanceMap := make(map[string]*storage.TaskInstance)
+	for _, ti := range taskInstances {
+		taskInstanceMap[ti.ID] = ti
+	}
+
+	for taskID, workflowTask := range allTasks {
+		// 使用IsSubTask()判断是否是动态生成的子任务（不保存到数据库）
+		if workflowTask.IsSubTask() {
+			// 动态生成的子任务，跳过保存
+			skippedCount++
+			continue
+		}
+
+		// 检查任务是否在数据库中（预定义任务）
+		existingTask, exists := taskInstanceMap[taskID]
+		if !exists {
+			// 如果任务不存在于数据库，可能是数据不一致，记录日志但跳过
+			log.Printf("⚠️ WorkflowInstance %s: Task %s 不在数据库中，跳过保存", m.instance.ID, taskID)
+			skippedCount++
+			continue
+		}
+
+		// 获取任务当前状态（从workflow.Task获取）
+		currentStatus := workflowTask.GetStatus()
+		if currentStatus == "" {
+			// 如果workflow.Task没有状态，检查是否已处理
+			if _, processed := m.processedNodes.Load(taskID); processed {
+				// 已处理，检查是否有错误信息（从contextData获取，使用特殊key）
+				errorKey := fmt.Sprintf("%s:error", taskID)
+				if _, hasError := m.contextData.Load(errorKey); hasError {
+					// 有错误信息，状态为Failed
+					currentStatus = "Failed"
+				} else {
+					// 没有错误信息，状态为Success
+					currentStatus = "Success"
+				}
+			} else {
+				// 未处理，保持数据库中的状态
+				continue
+			}
+		}
+
+		// 如果状态没有变化，跳过
+		if existingTask.Status == currentStatus {
+			continue
+		}
+
+		// 更新任务状态
+		var updateErr error
+		if currentStatus == "Failed" {
+			// 如果是失败状态，尝试获取错误信息
+			errorKey := fmt.Sprintf("%s:error", taskID)
+			errorMsg := ""
+			if errorValue, hasError := m.contextData.Load(errorKey); hasError {
+				if errStr, ok := errorValue.(string); ok {
+					errorMsg = errStr
+				}
+			}
+			updateErr = m.taskRepo.UpdateStatusWithError(ctx, taskID, currentStatus, errorMsg)
+		} else {
+			updateErr = m.taskRepo.UpdateStatus(ctx, taskID, currentStatus)
+		}
+
+		if updateErr != nil {
+			log.Printf("⚠️ WorkflowInstance %s: 更新任务状态失败: TaskID=%s, Status=%s, Error=%v",
+				m.instance.ID, taskID, currentStatus, updateErr)
+		} else {
+			savedCount++
 		}
 	}
-	return ""
+
+	if savedCount > 0 || skippedCount > 0 {
+		log.Printf("📊 WorkflowInstance %s: 批量保存任务状态完成 - 已保存: %d, 跳过动态任务: %d",
+			m.instance.ID, savedCount, skippedCount)
+	}
 }
 
 // createBreakpoint 创建断点数据
@@ -873,8 +926,7 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 	// 1. 恢复已完成的Task列表
 	m.processedNodes = sync.Map{}
 	for _, taskName := range breakpoint.CompletedTaskNames {
-		taskID := m.findTaskIDByName(taskName)
-		if taskID != "" {
+		if taskID, exists := m.workflow.GetTaskIDByName(taskName); exists {
 			m.processedNodes.Store(taskID, true)
 		}
 	}
@@ -888,12 +940,17 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 	}
 
 	// 3. 重新计算候选节点（基于已完成的Task）
+	// 注意：由于现在使用 DAG.GetReadyTasks() 来获取就绪任务，这里只需要初始化 candidateNodes
+	// 实际的就绪任务会在下次调用 getAvailableTasks() 时通过 DAG 自动获取
+	// 但为了向后兼容和恢复场景，我们仍然可以预先填充一些就绪任务
 	m.candidateNodes = sync.Map{}
+
+	// 使用 DAG 获取当前就绪的任务（基于已完成的节点，DAG 会自动计算入度）
 	readyTasks := m.dag.GetReadyTasks()
 	for _, taskID := range readyTasks {
 		// 检查是否已处理
 		if _, processed := m.processedNodes.Load(taskID); !processed {
-			// 检查所有父节点是否都已处理
+			// 检查所有父节点是否都已处理（双重验证，确保恢复的正确性）
 			parents, err := m.dag.GetParents(taskID)
 			if err == nil {
 				allParentsProcessed := true
@@ -912,156 +969,21 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 		}
 	}
 
-	// 对于所有未完成的Task，检查其依赖关系，如果依赖已完成，加入候选队列
-	for taskID, t := range m.workflow.GetTasks() {
-		// 如果已处理，跳过
-		if _, processed := m.processedNodes.Load(taskID); processed {
-			continue
-		}
-
-		// 检查是否已在候选队列
-		if _, exists := m.candidateNodes.Load(taskID); exists {
-			continue
-		}
-
-		// 检查所有依赖是否都已处理
-		deps := t.GetDependencies()
-		allDepsProcessed := true
-		for _, depName := range deps {
-			depTaskID := m.findTaskIDByName(depName)
-			if depTaskID == "" {
-				allDepsProcessed = false
-				break
-			}
-			if _, processed := m.processedNodes.Load(depTaskID); !processed {
-				allDepsProcessed = false
-				break
-			}
-		}
-
-		if allDepsProcessed {
-			m.candidateNodes.Store(taskID, t)
-		}
-	}
-
-	// 4. 对于所有未完成的Task，检查其依赖关系，如果依赖已完成，加入候选队列
-	for taskID, t := range m.workflow.GetTasks() {
-		// 如果已处理，跳过
-		if _, processed := m.processedNodes.Load(taskID); processed {
-			continue
-		}
-
-		// 检查是否已在候选队列
-		if _, exists := m.candidateNodes.Load(taskID); exists {
-			continue
-		}
-
-		// 检查所有依赖是否都已处理
-		deps := t.GetDependencies()
-		allDepsProcessed := true
-		for _, depName := range deps {
-			depTaskID := m.findTaskIDByName(depName)
-			if depTaskID == "" {
-				allDepsProcessed = false
-				break
-			}
-			if _, processed := m.processedNodes.Load(depTaskID); !processed {
-				allDepsProcessed = false
-				break
-			}
-		}
-
-		if allDepsProcessed {
-			m.candidateNodes.Store(taskID, t)
-		}
-	}
-
 	return nil
 }
 
 // createTaskCompleteHandler 创建任务完成处理器
 func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(*executor.TaskResult) {
 	return func(result *executor.TaskResult) {
-		// #region agent log
-		logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if logFile != nil {
-			fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:890","message":"OnComplete回调被调用","data":{"instanceID":"%s","taskID":"%s","status":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, result.Status)
-			logFile.Close()
-		}
-		// #endregion
-		ctx := context.Background()
-		// #region agent log
-		logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if logFile != nil {
-			fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:892","message":"更新数据库状态为Success前","data":{"instanceID":"%s","taskID":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"D"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID)
-			logFile.Close()
-		}
-		// #endregion
-		// 重试更新数据库状态（处理SQLite并发锁定问题）
-		updateSuccess := false
-		maxRetries := 5
-		retryDelay := 10 * time.Millisecond
-		for i := 0; i < maxRetries; i++ {
-			if err := m.taskRepo.UpdateStatus(ctx, taskID, "Success"); err != nil {
-				// 检查是否是数据库锁定错误
-				if i < maxRetries-1 && (err.Error() == "更新Task状态失败: database is locked" ||
-					err.Error() == "database is locked") {
-					// 数据库锁定，等待后重试
-					time.Sleep(retryDelay)
-					retryDelay *= 2 // 指数退避
-					continue
-				}
-				// 其他错误或重试次数用完，记录日志
-				// #region agent log
-				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:996","message":"更新数据库状态失败","data":{"instanceID":"%s","taskID":"%s","error":"%v","retryCount":%d},"sessionId":"debug-session","runId":"run1","hypothesisId":"D"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, err, i+1)
-					logFile.Close()
-				}
-				// #endregion
-				log.Printf("❌ WorkflowInstance %s: 更新任务状态失败: TaskID=%s, Error=%v, 重试次数=%d", m.instance.ID, taskID, err, i+1)
-				break
-			} else {
-				updateSuccess = true
-				break
-			}
+		ctx := m.ctx
+
+		// 更新workflow.Task的状态为Success
+		if workflowTask, exists := m.workflow.GetTasks()[taskID]; exists {
+			workflowTask.SetStatus(task.TaskStatusSuccess)
 		}
 
-		if updateSuccess {
-			// #region agent log
-			logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:892","message":"更新数据库状态为Success成功","data":{"instanceID":"%s","taskID":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"D"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID)
-				logFile.Close()
-			}
-			// #endregion
-		}
-
-		// 任务真正完成时，才标记为已处理
-		// 注意：只有在数据库更新成功时才标记为已处理
-		// 如果数据库更新失败，不标记为已处理，让recoverPendingTasks可以恢复这个任务
-		if updateSuccess {
-			// #region agent log
-			logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:1045","message":"标记任务为已处理","data":{"instanceID":"%s","taskID":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID)
-				logFile.Close()
-			}
-			// #endregion
-			m.processedNodes.Store(taskID, true)
-		} else {
-			// 数据库更新失败，不标记为已处理，让recoverPendingTasks可以恢复
-			// #region agent log
-			logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:1055","message":"数据库更新失败，不标记为已处理","data":{"instanceID":"%s","taskID":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"D"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID)
-				logFile.Close()
-			}
-			// #endregion
-			log.Printf("⚠️ WorkflowInstance %s: 任务 %s 数据库更新失败，不标记为已处理，等待recoverPendingTasks恢复", m.instance.ID, taskID)
-			// 不标记为已处理，让recoverPendingTasks可以恢复这个任务
-			return
-		}
+		// 标记任务为已处理（不更新数据库，只在instance完成/保存breakpoint/被取消时批量保存）
+		m.processedNodes.Store(taskID, true)
 
 		// 执行Task的状态Handler（Success状态）
 		if m.registry != nil {
@@ -1078,22 +1000,16 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 				return
 			}
 
-			// 尝试从workflow.Task获取StatusHandlers
-			// 注意：workflow.Task是接口，需要类型断言或通过其他方式获取
-			// 这里简化处理，假设StatusHandlers在创建Task时已配置
-			// 实际应该从Task定义中获取StatusHandlers配置
-			var statusHandlers map[string][]string
-			if taskObj, ok := workflowTask.(*task.Task); ok {
-				statusHandlers = taskObj.StatusHandlers
-			}
+			// 从workflow.Task获取StatusHandlers（使用接口方法，无需类型断言）
+			statusHandlers := workflowTask.GetStatusHandlers()
 
 			// 创建task.Task实例用于handler调用
 			taskObj := task.NewTask(taskInstance.Name, workflowTask.GetName(), taskInstance.JobFuncID, taskInstance.Params, statusHandlers)
-			taskObj.ID = taskInstance.ID
-			taskObj.JobFuncName = taskInstance.JobFuncName
-			taskObj.TimeoutSeconds = taskInstance.TimeoutSeconds
-			taskObj.RetryCount = taskInstance.RetryCount
-			taskObj.Dependencies = []string{} // 从workflowTask获取
+			taskObj.SetID(taskInstance.ID)
+			taskObj.SetJobFuncName(taskInstance.JobFuncName)
+			taskObj.SetTimeoutSeconds(taskInstance.TimeoutSeconds)
+			taskObj.SetRetryCount(taskInstance.RetryCount)
+			taskObj.SetDependencies(workflowTask.GetDependencies()) // 从workflowTask获取
 			taskObj.SetStatus(taskInstance.Status)
 
 			// 在调用Handler之前，将Manager接口注入到registry的依赖中
@@ -1117,77 +1033,12 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 		}
 
 		// 更新DAG入度（go-dag 自动管理，这里保留用于兼容性）
+		// 注意：DAG 的入度是自动管理的，当任务完成时，下游节点的入度会自动更新
+		// 下次调用 getAvailableTasks() 时会通过 dag.GetReadyTasks() 自动包含新的就绪节点
 		m.dag.UpdateInDegree(taskID)
 
-		// 将下游节点加入候选队列
-		node, exists := m.dag.GetNode(taskID)
-		if exists {
-			for _, nextID := range node.OutEdges {
-				// 如果下游节点是当前任务自己，说明DAG存在环，这是不应该发生的
-				// 因为DAG在构建和动态添加节点时都会检测循环依赖
-				if nextID == taskID {
-					// 重新检测DAG是否有环，如果确实有环，应该报错
-					if err := m.dag.DetectCycle(); err != nil {
-						log.Printf("❌ WorkflowInstance %s: 检测到DAG存在循环依赖！任务 %s 的下游节点是自己。错误: %v", m.instance.ID, taskID, err)
-						// 记录详细的DAG状态用于调试
-						// #region agent log
-						logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-						if logFile != nil {
-							fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:1025","message":"检测到DAG循环依赖","data":{"instanceID":"%s","taskID":"%s","error":"%v"},"sessionId":"debug-session","runId":"run1","hypothesisId":"F"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, err)
-							logFile.Close()
-						}
-						// #endregion
-						// 不继续处理，避免无限循环
-						continue
-					} else {
-						// 如果DAG检测没有环，但OutEdges包含自己，说明是DAG状态异常
-						log.Printf("⚠️ WorkflowInstance %s: 任务 %s 的OutEdges包含自己，但DAG检测无环，可能是DAG状态异常", m.instance.ID, taskID)
-						// #region agent log
-						logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-						if logFile != nil {
-							fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:1033","message":"DAG状态异常：OutEdges包含自己但无环","data":{"instanceID":"%s","taskID":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"F"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID)
-							logFile.Close()
-						}
-						// #endregion
-						continue
-					}
-				}
-				// 防止将已完成的任务重新添加到候选队列
-				if _, processed := m.processedNodes.Load(nextID); processed {
-					continue
-				}
-				if t, exists := m.workflow.GetTasks()[nextID]; exists {
-					// 检查是否所有父节点都已处理
-					allDepsProcessed := true
-					for _, depName := range t.GetDependencies() {
-						depTaskID := m.findTaskIDByName(depName)
-						if depTaskID == "" {
-							allDepsProcessed = false
-							break
-						}
-						if _, processed := m.processedNodes.Load(depTaskID); !processed {
-							allDepsProcessed = false
-							break
-						}
-					}
-					if allDepsProcessed {
-						// 再次检查任务是否已被处理（防止并发问题）
-						if _, processed := m.processedNodes.Load(nextID); !processed {
-							m.candidateNodes.Store(nextID, t)
-							// #region agent log
-							logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-							if logFile != nil {
-								fmt.Fprintf(logFile, `{"timestamp":%d,"location":"instance_manager.go:1032","message":"将下游任务添加到candidateNodes","data":{"instanceID":"%s","parentTaskID":"%s","nextTaskID":"%s","nextTaskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"F"}`+"\n", time.Now().UnixMilli(), m.instance.ID, taskID, nextID, t.GetName())
-								logFile.Close()
-							}
-							// #endregion
-						}
-					}
-				}
-			}
-		}
-
-		// 确保已完成的任务从candidateNodes中删除（防止重复提交）
+		// 注意：由于现在使用 DAG.GetReadyTasks() 来获取就绪任务，不再需要手动维护 candidateNodes
+		// 但为了支持动态任务和向后兼容，保留 candidateNodes 的清理逻辑
 		m.candidateNodes.Delete(taskID)
 
 		// 保存结果数据到上下文
@@ -1210,39 +1061,18 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 func (m *WorkflowInstanceManager) createTaskErrorHandler(taskID string) func(error) {
 	return func(err error) {
 		ctx := context.Background()
-		status := "Failed"
-		// 重试更新数据库状态（处理SQLite并发锁定问题）
-		updateSuccess := false
-		maxRetries := 5
-		retryDelay := 10 * time.Millisecond
-		for i := 0; i < maxRetries; i++ {
-			if updateErr := m.taskRepo.UpdateStatusWithError(ctx, taskID, status, err.Error()); updateErr != nil {
-				// 检查是否是数据库锁定错误
-				if i < maxRetries-1 && (updateErr.Error() == "更新Task状态和错误信息失败: database is locked" ||
-					updateErr.Error() == "database is locked") {
-					// 数据库锁定，等待后重试
-					time.Sleep(retryDelay)
-					retryDelay *= 2 // 指数退避
-					continue
-				}
-				// 其他错误或重试次数用完，记录日志
-				log.Printf("❌ WorkflowInstance %s: 更新任务失败状态失败: TaskID=%s, Error=%v, 重试次数=%d", m.instance.ID, taskID, updateErr, i+1)
-				break
-			} else {
-				updateSuccess = true
-				break
-			}
+
+		// 保存错误信息到contextData（用于批量保存时获取错误信息）
+		errorKey := fmt.Sprintf("%s:error", taskID)
+		m.contextData.Store(errorKey, err.Error())
+
+		// 更新workflow.Task的状态为Failed
+		if workflowTask, exists := m.workflow.GetTasks()[taskID]; exists {
+			workflowTask.SetStatus(task.TaskStatusFailed)
 		}
 
-		// 任务真正完成（失败）时，才标记为已处理
-		// 注意：只有在数据库更新成功时才标记为已处理
-		if updateSuccess {
-			m.processedNodes.Store(taskID, true)
-		} else {
-			// 数据库更新失败，不标记为已处理，让recoverPendingTasks可以恢复这个任务
-			log.Printf("⚠️ WorkflowInstance %s: 任务 %s 失败状态更新失败，不标记为已处理，等待recoverPendingTasks恢复", m.instance.ID, taskID)
-			return
-		}
+		// 标记任务为已处理（不更新数据库，只在instance完成/保存breakpoint/被取消时批量保存）
+		m.processedNodes.Store(taskID, true)
 
 		// 执行Task的状态Handler（Failed状态）
 		if m.registry != nil {
@@ -1259,19 +1089,16 @@ func (m *WorkflowInstanceManager) createTaskErrorHandler(taskID string) func(err
 				return
 			}
 
-			// 尝试从workflow.Task获取StatusHandlers
-			var statusHandlers map[string][]string
-			if taskObj, ok := workflowTask.(*task.Task); ok {
-				statusHandlers = taskObj.StatusHandlers
-			}
+			// 从workflow.Task获取StatusHandlers（使用接口方法，无需类型断言）
+			statusHandlers := workflowTask.GetStatusHandlers()
 
 			// 创建task.Task实例用于handler调用
 			taskObj := task.NewTask(taskInstance.Name, workflowTask.GetName(), taskInstance.JobFuncID, taskInstance.Params, statusHandlers)
-			taskObj.ID = taskInstance.ID
-			taskObj.JobFuncName = taskInstance.JobFuncName
-			taskObj.TimeoutSeconds = taskInstance.TimeoutSeconds
-			taskObj.RetryCount = taskInstance.RetryCount
-			taskObj.Dependencies = []string{}
+			taskObj.SetID(taskInstance.ID)
+			taskObj.SetJobFuncName(taskInstance.JobFuncName)
+			taskObj.SetTimeoutSeconds(taskInstance.TimeoutSeconds)
+			taskObj.SetRetryCount(taskInstance.RetryCount)
+			taskObj.SetDependencies(workflowTask.GetDependencies()) // 从workflowTask获取
 			taskObj.SetStatus(taskInstance.Status)
 
 			if handlerErr := task.ExecuteTaskHandlerWithContext(
@@ -1295,6 +1122,8 @@ func (m *WorkflowInstanceManager) createTaskErrorHandler(taskID string) func(err
 		m.instance.EndTime = &now
 		m.mu.Unlock()
 
+		// 批量保存所有任务状态（包括失败的任务）
+		m.saveAllTaskStatuses(ctx)
 		m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Failed")
 	}
 }
@@ -1323,6 +1152,9 @@ func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID
 	if subTask.GetName() == "" {
 		return fmt.Errorf("子Task名称不能为空")
 	}
+
+	// 如果子任务是*task.Task类型，设置isSubTask标志
+	subTask.SetSubTask(true)
 
 	// 使用Workflow的AddSubTask方法（线程安全）
 	if err := m.workflow.AddSubTask(subTask, parentTaskID); err != nil {
@@ -1434,8 +1266,8 @@ func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID
 	if allDepsProcessed {
 		subTaskDeps := subTask.GetDependencies()
 		for _, depName := range subTaskDeps {
-			depTaskID := m.findTaskIDByName(depName)
-			if depTaskID == "" {
+			depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+			if !exists {
 				allDepsProcessed = false
 				break
 			}
