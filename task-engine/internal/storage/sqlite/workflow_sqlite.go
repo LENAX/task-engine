@@ -60,11 +60,31 @@ func (r *workflowRepo) initSchema() error {
 		params TEXT,
 		dependencies TEXT,
 		create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		status TEXT NOT NULL DEFAULT 'ENABLED'
+		status TEXT NOT NULL DEFAULT 'ENABLED',
+		sub_task_error_tolerance REAL NOT NULL DEFAULT 0.0,
+		transactional INTEGER NOT NULL DEFAULT 0,
+		transaction_mode TEXT DEFAULT ''
 	);
 	`
 	_, err := r.db.Exec(createTableSQL)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// 如果表已存在，添加新字段（ALTER TABLE 在 SQLite 中需要特殊处理）
+	// 检查字段是否存在，如果不存在则添加
+	alterSQLs := []string{
+		`ALTER TABLE workflow_definition ADD COLUMN sub_task_error_tolerance REAL NOT NULL DEFAULT 0.0`,
+		`ALTER TABLE workflow_definition ADD COLUMN transactional INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE workflow_definition ADD COLUMN transaction_mode TEXT DEFAULT ''`,
+	}
+
+	for _, alterSQL := range alterSQLs {
+		// SQLite 的 ALTER TABLE ADD COLUMN 如果列已存在会报错，忽略错误
+		_, _ = r.db.Exec(alterSQL)
+	}
+
+	return nil
 }
 
 // Save 实现存储接口（内部实现）
@@ -92,18 +112,21 @@ func (r *workflowRepo) Save(ctx context.Context, wf *workflow.Workflow) error {
 
 	// 构建DAO对象
 	dao := &dao.WorkflowDAO{
-		ID:           wf.GetID(),
-		Name:         wf.GetName(),
-		Description:  wf.Description,
-		Params:       string(paramsJSON),
-		Dependencies: string(depsJSON),
-		CreateTime:   wf.CreateTime,
-		Status:       wf.GetStatus(),
+		ID:                    wf.GetID(),
+		Name:                  wf.GetName(),
+		Description:           wf.Description,
+		Params:                string(paramsJSON),
+		Dependencies:          string(depsJSON),
+		CreateTime:            wf.CreateTime,
+		Status:                wf.GetStatus(),
+		SubTaskErrorTolerance: wf.GetSubTaskErrorTolerance(),
+		Transactional:         wf.GetTransactional(),
+		TransactionMode:       wf.GetTransactionMode(),
 	}
 
 	query := `
-	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status)
-	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status)
+	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode)
+	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status, :sub_task_error_tolerance, :transactional, :transaction_mode)
 	`
 	_, err = r.db.NamedExecContext(ctx, query, dao)
 	if err != nil {
@@ -143,18 +166,21 @@ func (r *workflowRepo) SaveWithTasks(ctx context.Context, wf *workflow.Workflow,
 	}
 
 	workflowDAO := &dao.WorkflowDAO{
-		ID:           wf.GetID(),
-		Name:         wf.GetName(),
-		Description:  wf.Description,
-		Params:       string(paramsJSON),
-		Dependencies: string(depsJSON),
-		CreateTime:   wf.CreateTime,
-		Status:       wf.GetStatus(),
+		ID:                    wf.GetID(),
+		Name:                  wf.GetName(),
+		Description:           wf.Description,
+		Params:                string(paramsJSON),
+		Dependencies:          string(depsJSON),
+		CreateTime:            wf.CreateTime,
+		Status:                wf.GetStatus(),
+		SubTaskErrorTolerance: wf.GetSubTaskErrorTolerance(),
+		Transactional:         wf.GetTransactional(),
+		TransactionMode:       wf.GetTransactionMode(),
 	}
 
 	query := `
-	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status)
-	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status)
+	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode)
+	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status, :sub_task_error_tolerance, :transactional, :transaction_mode)
 	`
 	_, err = tx.NamedExecContext(ctx, query, workflowDAO)
 	if err != nil {
@@ -239,7 +265,7 @@ func (r *workflowRepo) SaveWithTasks(ctx context.Context, wf *workflow.Workflow,
 // GetByID 实现存储接口（内部实现）
 func (r *workflowRepo) GetByID(ctx context.Context, id string) (*workflow.Workflow, error) {
 	var dao dao.WorkflowDAO
-	query := `SELECT id, name, description, params, dependencies, create_time, status FROM workflow_definition WHERE id = ?`
+	query := `SELECT id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode FROM workflow_definition WHERE id = ?`
 	err := r.db.GetContext(ctx, &dao, query, id)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
@@ -280,6 +306,14 @@ func (r *workflowRepo) GetByID(ctx context.Context, id string) (*workflow.Workfl
 	}
 	wf.CreateTime = dao.CreateTime
 	wf.SetStatus(dao.Status)
+	// 设置新字段
+	if err := wf.SetSubTaskErrorTolerance(dao.SubTaskErrorTolerance); err != nil {
+		return nil, fmt.Errorf("设置子任务错误容忍度失败: %w", err)
+	}
+	if err := wf.SetTransactional(dao.Transactional); err != nil {
+		return nil, fmt.Errorf("设置事务模式失败: %w", err)
+	}
+	wf.SetTransactionMode(dao.TransactionMode)
 	// 注意：Tasks需要从其他地方加载，这里只加载定义
 
 	return wf, nil

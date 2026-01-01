@@ -19,16 +19,20 @@ type TaskInfo = types.TaskInfo
 
 // Workflow Workflow核心结构体（对外导出）
 type Workflow struct {
-	ID            string     `json:"id"`
-	Name          string     `json:"name"`
-	Description   string     `json:"description"`
-	Params        sync.Map   `json:"-"` // 参数映射（线程安全）
-	CreateTime    time.Time  `json:"create_time"`
-	status        string     // ENABLED/DISABLED（私有字段，通过setter修改）
-	statusMu      sync.Mutex // 保护status字段
-	Tasks         sync.Map   `json:"-"` // Task ID -> Task映射（线程安全）
-	TaskNameIndex sync.Map   `json:"-"` // Task Name -> Task ID映射（线程安全）
-	Dependencies  sync.Map   `json:"-"` // 后置Task ID -> 前置Task ID列表（线程安全）
+	ID                    string       `json:"id"`
+	Name                  string       `json:"name"`
+	Description           string       `json:"description"`
+	Params                sync.Map     `json:"-"` // 参数映射（线程安全）
+	CreateTime            time.Time    `json:"create_time"`
+	status                string       // ENABLED/DISABLED（私有字段，通过setter修改）
+	statusMu              sync.Mutex   // 保护status字段
+	Tasks                 sync.Map     `json:"-"`                        // Task ID -> Task映射（线程安全）
+	TaskNameIndex         sync.Map     `json:"-"`                        // Task Name -> Task ID映射（线程安全）
+	Dependencies          sync.Map     `json:"-"`                        // 后置Task ID -> 前置Task ID列表（线程安全）
+	SubTaskErrorTolerance float64      `json:"sub_task_error_tolerance"` // 子任务错误容忍度（0-1），默认0
+	Transactional         bool         `json:"transactional"`            // 是否启用事务（预留字段）
+	TransactionMode       string       `json:"transaction_mode"`         // 事务模式（预留字段）
+	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode 字段
 }
 
 // BreakpointData 断点数据（对外导出）
@@ -55,14 +59,17 @@ type WorkflowInstance struct {
 // NewWorkflow 创建Workflow实例（对外导出）
 func NewWorkflow(name, desc string) *Workflow {
 	wf := &Workflow{
-		ID:            uuid.NewString(),
-		Name:          name,
-		Description:   desc,
-		status:        "ENABLED",
-		CreateTime:    time.Now(),
-		Tasks:         sync.Map{},
-		TaskNameIndex: sync.Map{},
-		Dependencies:  sync.Map{},
+		ID:                    uuid.NewString(),
+		Name:                  name,
+		Description:           desc,
+		status:                "ENABLED",
+		CreateTime:            time.Now(),
+		Tasks:                 sync.Map{},
+		TaskNameIndex:         sync.Map{},
+		Dependencies:          sync.Map{},
+		SubTaskErrorTolerance: 0.0,   // 默认值0，不允许子任务失败
+		Transactional:         false, // 默认不启用事务
+		TransactionMode:       "",    // 默认空字符串
 	}
 	return wf
 }
@@ -601,4 +608,60 @@ func (w *Workflow) Validate() error {
 	}
 
 	return nil
+}
+
+// GetSubTaskErrorTolerance 获取子任务错误容忍度（对外导出，线程安全）
+func (w *Workflow) GetSubTaskErrorTolerance() float64 {
+	w.fieldsMu.RLock()
+	defer w.fieldsMu.RUnlock()
+	return w.SubTaskErrorTolerance
+}
+
+// SetSubTaskErrorTolerance 设置子任务错误容忍度（对外导出，线程安全）
+// tolerance: 容忍度值，范围0-1，0表示不允许子任务失败，1表示允许所有子任务失败
+func (w *Workflow) SetSubTaskErrorTolerance(tolerance float64) error {
+	if tolerance < 0 || tolerance > 1 {
+		return fmt.Errorf("子任务错误容忍度必须在0-1之间，当前值: %f", tolerance)
+	}
+	w.fieldsMu.Lock()
+	defer w.fieldsMu.Unlock()
+	// 如果transactional已开启，SubTaskErrorTolerance必须为0
+	if w.Transactional && tolerance > 0 {
+		return fmt.Errorf("当transactional开启时，SubTaskErrorTolerance必须为0，当前值: %f", tolerance)
+	}
+	w.SubTaskErrorTolerance = tolerance
+	return nil
+}
+
+// GetTransactional 获取是否启用事务（对外导出，线程安全）
+func (w *Workflow) GetTransactional() bool {
+	w.fieldsMu.RLock()
+	defer w.fieldsMu.RUnlock()
+	return w.Transactional
+}
+
+// SetTransactional 设置是否启用事务（对外导出，线程安全）
+func (w *Workflow) SetTransactional(transactional bool) error {
+	w.fieldsMu.Lock()
+	defer w.fieldsMu.Unlock()
+	// 如果开启transactional，SubTaskErrorTolerance必须为0
+	if transactional && w.SubTaskErrorTolerance > 0 {
+		return fmt.Errorf("开启transactional时，SubTaskErrorTolerance必须为0，当前值: %f", w.SubTaskErrorTolerance)
+	}
+	w.Transactional = transactional
+	return nil
+}
+
+// GetTransactionMode 获取事务模式（对外导出，线程安全）
+func (w *Workflow) GetTransactionMode() string {
+	w.fieldsMu.RLock()
+	defer w.fieldsMu.RUnlock()
+	return w.TransactionMode
+}
+
+// SetTransactionMode 设置事务模式（对外导出，线程安全）
+func (w *Workflow) SetTransactionMode(mode string) {
+	w.fieldsMu.Lock()
+	defer w.fieldsMu.Unlock()
+	w.TransactionMode = mode
 }

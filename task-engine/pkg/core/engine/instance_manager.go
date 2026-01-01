@@ -410,12 +410,119 @@ func (m *WorkflowInstanceManager) checkAndAddToReady(childID string) {
 	}
 }
 
+// getSubTasks 获取任务的所有子任务（只返回IsSubTask()为true的任务）（内部方法）
+func (m *WorkflowInstanceManager) getSubTasks(parentTaskID string) []string {
+	children, err := m.dag.GetChildren(parentTaskID)
+	if err != nil {
+		return nil
+	}
+
+	subTasks := make([]string, 0)
+	for _, childID := range children {
+		if task, exists := m.workflow.GetTasks()[childID]; exists {
+			if task.IsSubTask() {
+				subTasks = append(subTasks, childID)
+			}
+		}
+	}
+	return subTasks
+}
+
+// checkParentTaskStatus 检查父任务是否应该成功（根据SubTaskErrorTolerance）（内部方法）
+func (m *WorkflowInstanceManager) checkParentTaskStatus(parentTaskID string) {
+	// 获取父任务的所有子任务
+	subTasks := m.getSubTasks(parentTaskID)
+	if len(subTasks) == 0 {
+		// 没有子任务，不需要检查
+		return
+	}
+
+	// 检查所有子任务是否都已完成（已处理）
+	allSubTasksCompleted := true
+	successCount := 0
+	failedCount := 0
+	totalCount := len(subTasks)
+
+	for _, subTaskID := range subTasks {
+		// 检查子任务是否已处理
+		if _, processed := m.processedNodes.Load(subTaskID); !processed {
+			allSubTasksCompleted = false
+			break
+		}
+
+		// 检查子任务状态
+		if subTask, exists := m.workflow.GetTasks()[subTaskID]; exists {
+			status := subTask.GetStatus()
+			if status == task.TaskStatusSuccess {
+				successCount++
+			} else if status == task.TaskStatusFailed {
+				failedCount++
+			}
+		}
+	}
+
+	// 如果还有子任务未完成，不处理
+	if !allSubTasksCompleted {
+		return
+	}
+
+	// 计算失败率
+	failureRate := float64(failedCount) / float64(totalCount)
+	tolerance := m.workflow.GetSubTaskErrorTolerance()
+
+	// 判断父任务是否应该成功
+	parentTask, exists := m.workflow.GetTasks()[parentTaskID]
+	if !exists {
+		return
+	}
+
+	currentStatus := parentTask.GetStatus()
+	// 如果父任务已经成功或失败，不再更新
+	if currentStatus == task.TaskStatusSuccess || currentStatus == task.TaskStatusFailed {
+		return
+	}
+
+	// 根据失败率和容忍度判断
+	if failureRate <= tolerance {
+		// 失败率小于等于容忍度，父任务成功
+		parentTask.SetStatus(task.TaskStatusSuccess)
+		// 标记父任务为已处理
+		m.processedNodes.Store(parentTaskID, true)
+		log.Printf("✅ WorkflowInstance %s: 父任务 %s 成功（子任务失败率: %.2f, 容忍度: %.2f）",
+			m.instance.ID, parentTask.GetName(), failureRate, tolerance)
+
+		// 更新就绪任务集合：检查父任务的下游任务是否可以就绪
+		m.onTaskCompleted(parentTaskID)
+	} else {
+		// 失败率超过容忍度，父任务失败
+		parentTask.SetStatus(task.TaskStatusFailed)
+		// 标记父任务为已处理
+		m.processedNodes.Store(parentTaskID, true)
+		log.Printf("❌ WorkflowInstance %s: 父任务 %s 失败（子任务失败率: %.2f, 容忍度: %.2f）",
+			m.instance.ID, parentTask.GetName(), failureRate, tolerance)
+
+		// 更新就绪任务集合：检查父任务的下游任务是否可以就绪（即使父任务失败，下游任务也可能需要处理）
+		m.onTaskCompleted(parentTaskID)
+	}
+}
+
 // onTaskCompleted 任务完成时更新就绪集合（内部方法）
 func (m *WorkflowInstanceManager) onTaskCompleted(taskID string) {
 	// 从就绪集合中删除已完成的任务
 	m.readyTasksSet.Delete(taskID)
 
-	// 检查下游任务是否可以就绪
+	// 如果当前任务是子任务，检查父任务状态
+	if task, exists := m.workflow.GetTasks()[taskID]; exists && task.IsSubTask() {
+		// 获取父任务ID（通过DAG的GetParents）
+		parents, err := m.dag.GetParents(taskID)
+		if err == nil && len(parents) > 0 {
+			// 子任务通常只有一个父任务
+			parentTaskID := parents[0]
+			m.checkParentTaskStatus(parentTaskID)
+		}
+	}
+
+	// 检查下游任务是否可以就绪（包括普通下游任务和子任务）
 	children, err := m.dag.GetChildren(taskID)
 	if err != nil {
 		return
