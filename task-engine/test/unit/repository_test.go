@@ -89,7 +89,7 @@ func TestWorkflowInstanceRepository_CRUD(t *testing.T) {
 	ctx := context.Background()
 
 	// 创建测试实例
-	instance := &storage.WorkflowInstance{
+	instance := &workflow.WorkflowInstance{
 		ID:         uuid.NewString(),
 		WorkflowID: uuid.NewString(),
 		Status:     "Ready",
@@ -134,7 +134,7 @@ func TestWorkflowInstanceRepository_CRUD(t *testing.T) {
 	}
 
 	// 更新断点数据
-	breakpoint := &storage.BreakpointData{
+	breakpoint := &workflow.BreakpointData{
 		CompletedTaskNames: []string{"task1", "task2"},
 		RunningTaskNames:   []string{"task3"},
 		DAGSnapshot:        make(map[string]interface{}),

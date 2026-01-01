@@ -47,3 +47,4 @@ go.sum
 !.gitignore
 doc/.DS_Store
 task-engine/server
+task-engine/test/unit/test_repository.db-shm

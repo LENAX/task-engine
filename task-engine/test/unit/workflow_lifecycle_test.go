@@ -206,7 +206,7 @@ func TestWorkflowController_StateTransitions(t *testing.T) {
 		if currentStatus != "Terminated" && currentStatus != "Success" && currentStatus != "Failed" {
 			t.Errorf("终止后状态错误，期望: Terminated/Success/Failed, 实际: %s", currentStatus)
 		}
-		return
+		// return
 
 		// 等待暂停处理完成
 		time.Sleep(100 * time.Millisecond)

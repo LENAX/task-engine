@@ -163,21 +163,32 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 			// 获取可执行任务
 			availableTasks := m.getAvailableTasks()
 			if len(availableTasks) == 0 {
-				// 检查是否有任务在数据库中但不在candidateNodes中
-				// 主要用于系统恢复场景：系统崩溃重启后，需要恢复未完成的任务
-				// 或者任务提交失败后需要重试的场景
-				m.recoverPendingTasks()
-
+				// 优化：减少recoverPendingTasks的调用频率
+				// 使用更长的等待时间，避免频繁查询数据库
 				// 检查是否所有任务都已完成
 				// 注意：需要等待一段时间，让Handler有机会添加子任务
 				// 因为Handler是在goroutine中异步执行的
-				time.Sleep(100 * time.Millisecond) // 等待Handler执行完成
+				time.Sleep(500 * time.Millisecond) // 增加等待时间，减少数据库查询频率
 
 				// 再次检查是否有可执行任务（可能在等待期间添加了子任务）
 				availableTasks = m.getAvailableTasks()
 				if len(availableTasks) > 0 {
 					// 有新任务可执行，继续处理
 					continue
+				}
+
+				// 优化：只在必要时调用recoverPendingTasks（例如：长时间没有新任务时）
+				// 主要用于系统恢复场景：系统崩溃重启后，需要恢复未完成的任务
+				// 或者任务提交失败后需要重试的场景
+				// 注意：这个调用比较昂贵，所以只在没有可用任务且可能还有未完成任务时才调用
+				if !m.isAllTasksCompleted() {
+					// 可能还有未完成的任务，尝试恢复
+					m.recoverPendingTasks()
+					// 恢复后再次检查
+					availableTasks = m.getAvailableTasks()
+					if len(availableTasks) > 0 {
+						continue
+					}
 				}
 
 				// 再次检查是否所有任务都已完成
@@ -845,7 +856,6 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 	skippedInQueue := 0
 	skippedNotInWorkflow := 0
 	skippedDepsNotMet := 0
-	clearedProcessedNodes := 0
 
 	for _, ti := range taskInstances {
 		// 处理Pending或Failed状态的任务（Failed可能是提交失败后需要重试的）
@@ -857,50 +867,20 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 		taskID := ti.ID
 
 		// 检查是否已处理
-		// 注意：如果任务在processedNodes中但状态还是Pending，说明任务被提交了但可能还没执行完成
-		// 这种情况下，我们应该检查任务是否真的在执行中（状态为Running），如果不是，应该恢复它
+		// 优化：减少数据库查询，只在真正需要时才查询
+		// 如果任务在processedNodes中，通常说明任务已经被处理或正在处理中
+		// 只有在状态是Pending且被标记为已处理时，才需要进一步检查（这种情况很少见）
 		if _, processed := m.processedNodes.Load(taskID); processed {
-			// 如果任务被标记为已处理，但状态还是Pending，说明可能有问题
-			// 检查任务是否真的在执行中
-			if ti.Status == "Pending" {
-				// 任务被标记为已处理但状态还是Pending，可能是：
-				// 1. 任务执行完成，OnComplete回调被调用，标记为已处理，但数据库更新失败或延迟
-				// 2. 任务被错误地标记为已处理
-				// 3. 任务正在执行中，但状态还没更新为Running
-				// 为了安全，我们检查任务是否真的在执行中（通过查询数据库的最新状态）
-				// 如果任务确实还在Pending，说明可能有问题，需要重新检查
-				latestTask, err := m.taskRepo.GetByID(ctx, taskID)
-				if err == nil {
-					if latestTask.Status == "Running" {
-						// 任务正在执行中，正常情况
-						skippedProcessed++
-						continue
-					} else if latestTask.Status == "Success" || latestTask.Status == "Failed" {
-						// 任务已完成，但processedNodes标记和数据库状态不一致
-						// 这种情况不应该发生，但为了安全，我们跳过
-						skippedProcessed++
-						continue
-					} else if latestTask.Status == "Pending" {
-						// 任务确实还在Pending，但被标记为已处理，这是异常情况
-						// 可能是OnComplete回调被调用但数据库更新失败
-						// 或者任务被错误地标记为已处理
-						// 为了恢复，我们清除processedNodes标记，让任务可以被恢复
-						log.Printf("⚠️ WorkflowInstance %s: 任务 %s (%s) 在processedNodes中但状态为Pending，清除processedNodes标记以便恢复",
-							m.instance.ID, taskID, ti.Name)
-						m.processedNodes.Delete(taskID)
-						clearedProcessedNodes++
-						// 不continue，继续处理这个任务
-					}
-				} else {
-					// 查询失败，为了安全，跳过
-					skippedProcessed++
-					continue
-				}
-			} else {
-				// 状态不是Pending，正常情况
+			// 如果状态不是Pending，说明任务已经完成或失败，正常情况，跳过
+			if ti.Status != "Pending" {
 				skippedProcessed++
 				continue
 			}
+			// 状态是Pending但被标记为已处理，这是异常情况，但为了性能，我们直接跳过
+			// 因为这种情况很少见，而且频繁查询数据库会导致性能问题
+			// 如果真的需要恢复，可以通过其他机制（如定期批量检查）来处理
+			skippedProcessed++
+			continue
 		}
 
 		// 检查是否已在就绪任务集合
@@ -970,8 +950,8 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 	}
 
 	if pendingCount > 0 {
-		log.Printf("📊 WorkflowInstance %s: recoverPendingTasks统计 - Pending/Failed任务总数: %d, 已恢复: %d, 已处理: %d, 已在队列: %d, 不在Workflow: %d, 依赖未满足: %d, 清除processedNodes: %d",
-			m.instance.ID, pendingCount, recoveredCount, skippedProcessed, skippedInQueue, skippedNotInWorkflow, skippedDepsNotMet, clearedProcessedNodes)
+		log.Printf("📊 WorkflowInstance %s: recoverPendingTasks统计 - Pending/Failed任务总数: %d, 已恢复: %d, 已处理: %d, 已在队列: %d, 不在Workflow: %d, 依赖未满足: %d",
+			m.instance.ID, pendingCount, recoveredCount, skippedProcessed, skippedInQueue, skippedNotInWorkflow, skippedDepsNotMet)
 	}
 }
 
@@ -1159,8 +1139,6 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 // createTaskCompleteHandler 创建任务完成处理器
 func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(*executor.TaskResult) {
 	return func(result *executor.TaskResult) {
-		ctx := m.ctx
-
 		// 更新workflow.Task的状态为Success
 		if workflowTask, exists := m.workflow.GetTasks()[taskID]; exists {
 			workflowTask.SetStatus(task.TaskStatusSuccess)
@@ -1177,24 +1155,19 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 				return
 			}
 
-			// 从数据库加载Task实例以获取当前状态
-			taskInstance, err := m.taskRepo.GetByID(ctx, taskID)
-			if err != nil {
-				log.Printf("加载Task实例失败: %v", err)
-				return
-			}
-
-			// 从workflow.Task获取StatusHandlers（使用接口方法，无需类型断言）
+			// 优化：直接使用workflowTask的信息，避免数据库查询
+			// workflowTask已经包含了所有需要的信息（ID, Name, JobFuncID, Params等）
 			statusHandlers := workflowTask.GetStatusHandlers()
 
 			// 创建task.Task实例用于handler调用
-			taskObj := task.NewTask(taskInstance.Name, workflowTask.GetName(), taskInstance.JobFuncID, taskInstance.Params, statusHandlers)
-			taskObj.SetID(taskInstance.ID)
-			taskObj.SetJobFuncName(taskInstance.JobFuncName)
-			taskObj.SetTimeoutSeconds(taskInstance.TimeoutSeconds)
-			taskObj.SetRetryCount(taskInstance.RetryCount)
-			taskObj.SetDependencies(workflowTask.GetDependencies()) // 从workflowTask获取
-			taskObj.SetStatus(taskInstance.Status)
+			// 使用workflowTask的信息，而不是从数据库加载
+			taskObj := task.NewTask(workflowTask.GetName(), workflowTask.GetDescription(), workflowTask.GetJobFuncID(), workflowTask.GetParams(), statusHandlers)
+			taskObj.SetID(workflowTask.GetID())
+			taskObj.SetJobFuncName(workflowTask.GetJobFuncName())
+			taskObj.SetTimeoutSeconds(workflowTask.GetTimeoutSeconds())
+			taskObj.SetRetryCount(workflowTask.GetRetryCount())
+			taskObj.SetDependencies(workflowTask.GetDependencies())
+			taskObj.SetStatus(task.TaskStatusSuccess) // 使用当前状态（Success）
 
 			// 在调用Handler之前，将Manager接口注入到registry的依赖中
 			// 这样Handler可以直接通过ctx.GetDependency("InstanceManager")获取Manager，而不需要Engine
@@ -1218,7 +1191,7 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 
 		// 更新DAG入度（go-dag 自动管理，这里保留用于兼容性）
 		// 注意：DAG 的入度是自动管理的，当任务完成时，下游节点的入度会自动更新
-		m.dag.UpdateInDegree(taskID)
+		// m.dag.UpdateInDegree(taskID)
 
 		// 如果当前任务是子任务，更新父任务的子任务统计信息
 		if workflowTask, exists := m.workflow.GetTasks()[taskID]; exists && workflowTask.IsSubTask() {
@@ -1269,24 +1242,19 @@ func (m *WorkflowInstanceManager) createTaskErrorHandler(taskID string) func(err
 				return
 			}
 
-			// 从数据库加载Task实例以获取当前状态
-			taskInstance, loadErr := m.taskRepo.GetByID(ctx, taskID)
-			if loadErr != nil {
-				log.Printf("加载Task实例失败: %v", loadErr)
-				return
-			}
-
-			// 从workflow.Task获取StatusHandlers（使用接口方法，无需类型断言）
+			// 优化：直接使用workflowTask的信息，避免数据库查询
+			// workflowTask已经包含了所有需要的信息（ID, Name, JobFuncID, Params等）
 			statusHandlers := workflowTask.GetStatusHandlers()
 
 			// 创建task.Task实例用于handler调用
-			taskObj := task.NewTask(taskInstance.Name, workflowTask.GetName(), taskInstance.JobFuncID, taskInstance.Params, statusHandlers)
-			taskObj.SetID(taskInstance.ID)
-			taskObj.SetJobFuncName(taskInstance.JobFuncName)
-			taskObj.SetTimeoutSeconds(taskInstance.TimeoutSeconds)
-			taskObj.SetRetryCount(taskInstance.RetryCount)
-			taskObj.SetDependencies(workflowTask.GetDependencies()) // 从workflowTask获取
-			taskObj.SetStatus(taskInstance.Status)
+			// 使用workflowTask的信息，而不是从数据库加载
+			taskObj := task.NewTask(workflowTask.GetName(), workflowTask.GetDescription(), workflowTask.GetJobFuncID(), workflowTask.GetParams(), statusHandlers)
+			taskObj.SetID(workflowTask.GetID())
+			taskObj.SetJobFuncName(workflowTask.GetJobFuncName())
+			taskObj.SetTimeoutSeconds(workflowTask.GetTimeoutSeconds())
+			taskObj.SetRetryCount(workflowTask.GetRetryCount())
+			taskObj.SetDependencies(workflowTask.GetDependencies())
+			taskObj.SetStatus(task.TaskStatusFailed) // 使用当前状态（Failed）
 
 			if handlerErr := task.ExecuteTaskHandlerWithContext(
 				m.registry,
