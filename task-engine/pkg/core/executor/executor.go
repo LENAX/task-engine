@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -238,7 +239,16 @@ func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 
 	e.mu.RLock()
 	running := e.running
+	queueLen := len(e.taskQueue)
 	e.mu.RUnlock()
+
+	// #region agent log
+	logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if logFile != nil {
+		fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:231","message":"SubmitTask调用","data":{"taskID":"%s","taskName":"%s","running":%t,"queueLen":%d},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName(), running, queueLen)
+		logFile.Close()
+	}
+	// #endregion
 
 	if !running {
 		return fmt.Errorf("Executor未运行")
@@ -247,6 +257,13 @@ func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 	// 提交到任务队列（阻塞等待，直到有空间或Executor关闭）
 	select {
 	case e.taskQueue <- pendingTask:
+		// #region agent log
+		logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if logFile != nil {
+			fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:249","message":"任务已加入taskQueue","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
+			logFile.Close()
+		}
+		// #endregion
 		return nil
 	case <-e.shutdown:
 		return fmt.Errorf("Executor已关闭")
@@ -262,6 +279,13 @@ func (e *Executor) scheduler() {
 				// 任务队列已关闭
 				return
 			}
+			// #region agent log
+			logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if logFile != nil {
+				fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:260","message":"scheduler从taskQueue取出任务","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
+				logFile.Close()
+			}
+			// #endregion
 			// 分配任务到Worker
 			e.dispatchTask(pendingTask)
 		case <-e.shutdown:
@@ -272,6 +296,16 @@ func (e *Executor) scheduler() {
 
 // dispatchTask 分配任务到Worker（内部方法）
 func (e *Executor) dispatchTask(pendingTask *PendingTask) {
+	// #region agent log
+	logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if logFile != nil {
+		e.mu.RLock()
+		workerPoolLen := len(e.workerPool)
+		e.mu.RUnlock()
+		fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:274","message":"dispatchTask被调用","data":{"taskID":"%s","taskName":"%s","workerPoolAvailable":%d},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName(), e.maxWorkers-workerPoolLen)
+		logFile.Close()
+	}
+	// #endregion
 	// 如果有业务域，使用业务域子池
 	if pendingTask.Domain != "" {
 		e.mu.RLock()
@@ -285,18 +319,41 @@ func (e *Executor) dispatchTask(pendingTask *PendingTask) {
 				pool.mu.Lock()
 				pool.current++
 				pool.mu.Unlock()
+				// #region agent log
+				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if logFile != nil {
+					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:289","message":"任务分配到domainPool worker","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
+					logFile.Close()
+				}
+				// #endregion
 				e.wg.Add(1)
 				go e.executeTask(pendingTask, pool)
 				return
 			default:
 				// 业务域子池已满，回退到全局池
+				// #region agent log
+				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if logFile != nil {
+					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:292","message":"domainPool已满，回退到全局池","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
+					logFile.Close()
+				}
+				// #endregion
 			}
 		}
 	}
 
 	// 使用全局Worker池
+	// 注意：这里使用阻塞方式，如果workerPool满了，会一直等待
+	// 这可能导致任务无法及时执行，但可以确保任务最终会被执行
 	select {
 	case e.workerPool <- struct{}{}:
+		// #region agent log
+		logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if logFile != nil {
+			fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:301","message":"任务分配到全局workerPool","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
+			logFile.Close()
+		}
+		// #endregion
 		e.wg.Add(1)
 		go e.executeTask(pendingTask, nil)
 	case <-e.shutdown:
@@ -326,12 +383,12 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	t := pendingTask.Task
 
 	// 更新Task状态为Running
-	t.SetStatus(task.TaskStatusRunning)
+	t.SetStatus("RUNNING")
 
 	// 如果没有注册中心，无法执行
 	if e.registry == nil {
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   "Failed",
 			Error:    fmt.Errorf("Job函数注册中心未配置"),
 			Duration: time.Since(startTime).Milliseconds(),
@@ -343,25 +400,25 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	}
 
 	// 获取Job函数
-	jobFunc := e.registry.GetByName(t.JobFuncName)
+	jobFunc := e.registry.GetByName(t.GetJobFuncName())
 	var funcID string
 	if jobFunc == nil {
 		// 尝试通过JobFuncID获取
-		jobFunc = e.registry.Get(t.JobFuncID)
-		funcID = t.JobFuncID
+		jobFunc = e.registry.Get(t.GetJobFuncID())
+		funcID = t.GetJobFuncID()
 	} else {
 		// 通过名称获取到函数，查找对应的ID
-		funcID = e.registry.GetIDByName(t.JobFuncName)
+		funcID = e.registry.GetIDByName(t.GetJobFuncName())
 		if funcID == "" {
-			funcID = t.JobFuncName
+			funcID = t.GetJobFuncName()
 		}
 	}
 	if jobFunc == nil {
-		log.Printf("❌ [Task执行失败] TaskID=%s, TaskName=%s, 原因: Job函数 %s 未找到", t.ID, t.Name, t.JobFuncName)
+		log.Printf("❌ [Task执行失败] TaskID=%s, TaskName=%s, 原因: Job函数 %s 未找到", t.GetID(), t.GetName(), t.GetJobFuncName())
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   "Failed",
-			Error:    fmt.Errorf("Job函数 %s 未找到", t.JobFuncName),
+			Error:    fmt.Errorf("Job函数 %s 未找到", t.GetJobFuncName()),
 			Duration: time.Since(startTime).Milliseconds(),
 		}
 		if pendingTask.OnError != nil {
@@ -370,21 +427,15 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		return
 	}
 
-	// 将 sync.Map 转换为 map 用于日志打印
-	paramsForLog := make(map[string]interface{})
-	t.Params.Range(func(key, value interface{}) bool {
-		if keyStr, ok := key.(string); ok {
-			paramsForLog[keyStr] = value
-		}
-		return true
-	})
+	// 获取参数用于日志打印
+	paramsForLog := t.GetParams()
 	// 打印函数执行开始日志
 	log.Printf("🚀 [开始执行函数] TaskID=%s, TaskName=%s, JobFuncName=%s, JobFuncID=%s, 参数=%v",
-		t.ID, t.Name, t.JobFuncName, funcID, paramsForLog)
+		t.GetID(), t.GetName(), t.GetJobFuncName(), funcID, paramsForLog)
 
 	// 创建执行上下文
 	ctx := context.Background()
-	timeoutSeconds := t.TimeoutSeconds
+	timeoutSeconds := t.GetTimeoutSeconds()
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 30 // 默认30秒
 	}
@@ -396,27 +447,21 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		ctx = e.registry.WithDependencies(ctx)
 	}
 
-	// 将 sync.Map 转换为 map[string]interface{} 用于 TaskContext
-	paramsMap := make(map[string]interface{})
-	t.Params.Range(func(key, value interface{}) bool {
-		if keyStr, ok := key.(string); ok {
-			paramsMap[keyStr] = value
-		}
-		return true
-	})
+	// 获取参数用于 TaskContext
+	paramsMap := t.GetParams()
 
 	// 创建TaskContext
 	taskCtx := task.NewTaskContext(
 		ctx,
-		t.ID,
-		t.Name,
+		t.GetID(),
+		t.GetName(),
 		pendingTask.WorkflowID,
 		pendingTask.InstanceID,
 		paramsMap,
 	)
 
 	// 执行Job函数
-	log.Printf("📞 [调用函数] TaskID=%s, TaskName=%s, JobFuncName=%s, 开始执行...", t.ID, t.Name, t.JobFuncName)
+	log.Printf("📞 [调用函数] TaskID=%s, TaskName=%s, JobFuncName=%s, 开始执行...", t.GetID(), t.GetName(), t.GetJobFuncName())
 	stateCh := jobFunc(taskCtx)
 
 	// 监听执行结果
@@ -424,7 +469,7 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	case state := <-stateCh:
 		duration := time.Since(startTime).Milliseconds()
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   state.Status,
 			Data:     state.Data,
 			Error:    state.Error,
@@ -432,22 +477,43 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		}
 
 		if state.Status == "Success" {
-			t.SetStatus(task.TaskStatusSuccess)
+			t.SetStatus("SUCCESS")
 			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%v",
-				t.ID, t.Name, t.JobFuncName, duration, state.Data)
+				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, state.Data)
+			// #region agent log
+			logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if logFile != nil {
+				fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:438","message":"任务执行成功，准备调用OnComplete","data":{"taskID":"%s","taskName":"%s","hasOnComplete":%t},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), t.GetID(), t.GetName(), pendingTask.OnComplete != nil)
+				logFile.Close()
+			}
+			// #endregion
 			if pendingTask.OnComplete != nil {
+				// #region agent log
+				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if logFile != nil {
+					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:439","message":"调用OnComplete回调前","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), t.GetID(), t.GetName())
+					logFile.Close()
+				}
+				// #endregion
 				pendingTask.OnComplete(result)
+				// #region agent log
+				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if logFile != nil {
+					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:439","message":"调用OnComplete回调后","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), t.GetID(), t.GetName())
+					logFile.Close()
+				}
+				// #endregion
 			}
 		} else {
-			t.SetStatus(task.TaskStatusFailed)
+			t.SetStatus("FAILED")
 			log.Printf("❌ [函数执行失败] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 错误=%v",
-				t.ID, t.Name, t.JobFuncName, duration, state.Error)
+				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, state.Error)
 			// 检查是否需要重试
 			if pendingTask.RetryCount < pendingTask.MaxRetries {
 				// 重试：计算重试间隔（1s、2s、4s...）
 				retryDelay := time.Duration(1<<uint(pendingTask.RetryCount)) * time.Second
 				log.Printf("🔄 [准备重试] TaskID=%s, TaskName=%s, 当前重试次数=%d, 延迟=%v",
-					t.ID, t.Name, pendingTask.RetryCount, retryDelay)
+					t.GetID(), t.GetName(), pendingTask.RetryCount, retryDelay)
 				time.Sleep(retryDelay)
 				// 重新提交任务
 				pendingTask.RetryCount++
@@ -461,11 +527,11 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	case <-ctx.Done():
 		// 超时
 		duration := time.Since(startTime).Milliseconds()
-		t.SetStatus(task.TaskStatusTimeout)
+		t.SetStatus("TIMEOUT")
 		log.Printf("⏱️  [函数执行超时] TaskID=%s, TaskName=%s, JobFuncName=%s, 超时时间=%ds, 耗时=%dms",
-			t.ID, t.Name, t.JobFuncName, timeoutSeconds, duration)
+			t.GetID(), t.GetName(), t.GetJobFuncName(), timeoutSeconds, duration)
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   "TimeoutFailed",
 			Error:    fmt.Errorf("任务执行超时（%d秒）", timeoutSeconds),
 			Duration: duration,

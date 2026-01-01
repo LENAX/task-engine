@@ -81,9 +81,12 @@ func TestDAGOptimization_AddSubTask(t *testing.T) {
 	}
 
 	// 添加到Workflow
-	wf.Tasks[parentTask.GetID()] = parentTask
-	wf.Tasks[downstreamTask.GetID()] = downstreamTask
-	wf.Dependencies[downstreamTask.GetID()] = []string{parentTask.GetID()}
+	if err := wf.AddTask(parentTask); err != nil {
+		t.Fatalf("添加父任务失败: %v", err)
+	}
+	if err := wf.AddTask(downstreamTask); err != nil {
+		t.Fatalf("添加下游任务失败: %v", err)
+	}
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -167,11 +170,15 @@ func TestDAGOptimization_TopologicalOrder(t *testing.T) {
 		Build()
 
 	// 添加到Workflow
-	wf.Tasks[task1.GetID()] = task1
-	wf.Tasks[task2.GetID()] = task2
-	wf.Tasks[task3.GetID()] = task3
-	wf.Dependencies[task2.GetID()] = []string{task1.GetID()}
-	wf.Dependencies[task3.GetID()] = []string{task2.GetID()}
+	if err := wf.AddTask(task1); err != nil {
+		t.Fatalf("添加任务1失败: %v", err)
+	}
+	if err := wf.AddTask(task2); err != nil {
+		t.Fatalf("添加任务2失败: %v", err)
+	}
+	if err := wf.AddTask(task3); err != nil {
+		t.Fatalf("添加任务3失败: %v", err)
+	}
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)

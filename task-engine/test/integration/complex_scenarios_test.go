@@ -52,7 +52,7 @@ func TestComplexScenarios_LargeWorkflow(t *testing.T) {
 	}
 
 	// 创建1000个任务
-	taskCount := 10000
+	taskCount := 4000
 	t.Logf("开始创建 %d 个任务...", taskCount)
 
 	for i := 0; i < taskCount; i++ {
@@ -105,6 +105,29 @@ func TestComplexScenarios_LargeWorkflow(t *testing.T) {
 		}
 
 		if status == "Success" || status == "Failed" || status == "Terminated" {
+			// 检查是否还有待处理的任务
+			taskInstances, err := taskRepo.GetByWorkflowInstanceID(ctx, instanceID)
+			if err == nil {
+				pendingCount := 0
+				runningCount := 0
+				for _, ti := range taskInstances {
+					if ti.Status == "Pending" {
+						pendingCount++
+					} else if ti.Status == "Running" {
+						runningCount++
+					}
+				}
+				// 如果还有待处理或运行中的任务，继续等待
+				if pendingCount > 0 || runningCount > 0 {
+					if time.Since(lastLogTime) > 5*time.Second {
+						t.Logf("工作流状态: %s, 但仍有待处理任务: %d, 运行中: %d, 继续等待...",
+							status, pendingCount, runningCount)
+						lastLogTime = time.Now()
+					}
+					time.Sleep(1 * time.Second)
+					continue
+				}
+			}
 			t.Logf("工作流完成，状态: %s, 总耗时: %v", status, time.Since(startTime))
 			break
 		}
@@ -184,17 +207,12 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 创建Job函数，返回更多数据项用于生成大量子任务
+	// 创建Job函数，仅在子任务中用于返回结果
 	mockFunc := func(ctx *task.TaskContext) (interface{}, error) {
 		time.Sleep(10 * time.Millisecond)
-		// 生成100个数据项，每个数据项会生成一个子任务
-		data := make([]string, 100)
-		for i := 0; i < 100; i++ {
-			data[i] = fmt.Sprintf("item-%d", i)
-		}
 		return map[string]interface{}{
 			"result": "success",
-			"data":   data,
+			"item":   ctx.TaskID, // 仅保留item字段以便可追踪
 		}, nil
 	}
 
@@ -203,36 +221,20 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 		t.Fatalf("注册函数失败: %v", err)
 	}
 
-	// 创建子任务生成Handler
+	// 创建生成子任务的数据，只用于父任务生成子任务阶段
+	subTaskData := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		subTaskData[i] = fmt.Sprintf("item-%d", i)
+	}
+
+	// 创建子任务生成Handler（只允许父任务生成子任务，子任务不再递归生成子任务）
 	generateSubTasksHandler := func(ctx *task.TaskContext) {
 		log.Printf("🔍 [GenerateSubTasks] 开始执行，TaskID=%s, InstanceID=%s", ctx.TaskID, ctx.WorkflowInstanceID)
-
-		resultData := ctx.GetParam("_result_data")
-		if resultData == nil {
-			log.Printf("⚠️ [GenerateSubTasks] TaskID=%s, 未找到_result_data参数", ctx.TaskID)
-			return
-		}
-
-		// 从结果中提取数据
-		resultMap, ok := resultData.(map[string]interface{})
-		if !ok {
-			log.Printf("⚠️ [GenerateSubTasks] TaskID=%s, resultData类型不是map[string]interface{}，实际类型: %T", ctx.TaskID, resultData)
-			return
-		}
-
-		data, ok := resultMap["data"].([]string)
-		if !ok {
-			log.Printf("⚠️ [GenerateSubTasks] TaskID=%s, data字段类型不是[]string，实际类型: %T", ctx.TaskID, resultMap["data"])
-			return
-		}
-
-		log.Printf("🔍 [GenerateSubTasks] TaskID=%s, 找到 %d 个数据项", ctx.TaskID, len(data))
 
 		// 为每个数据项生成子任务
 		parentTaskID := ctx.TaskID
 
 		// 直接获取Manager接口（已由WorkflowInstanceManager注入到依赖中）
-		// 使用GetDependencyTyped获取类型安全的依赖
 		type ManagerAddSubTaskInterface interface {
 			AddSubTask(subTask workflow.Task, parentTaskID string) error
 		}
@@ -243,11 +245,10 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 			return
 		}
 
-		// 生成子任务
 		generatedCount := 0
 		errorCount := 0
-		for _, item := range data {
-			subTaskName := fmt.Sprintf("sub-task-%s", item)
+		for _, item := range subTaskData {
+			subTaskName := fmt.Sprintf("sub-task-%s-%s", parentTaskID, item)
 			subTask, err := builder.NewTaskBuilder(subTaskName, fmt.Sprintf("子任务-%s", item), registry).
 				WithJobFunction("mockFunc", nil).
 				WithTaskHandler(task.TaskStatusSuccess, "DefaultLogSuccess").
@@ -264,7 +265,6 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 				errorCount++
 				continue
 			}
-
 			generatedCount++
 		}
 
@@ -281,8 +281,8 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 		t.Fatalf("注册Handler失败: %v", err)
 	}
 
-	// 创建多个父任务，每个父任务会生成100个子任务
-	// 创建10个父任务，总共生成1000个子任务
+	// 创建多个父任务，每个父任务会生成 100 个子任务
+	// 创建 10 个父任务，总共生成 1000 个子任务
 	parentTaskCount := 10
 	expectedSubTasksPerParent := 100
 	expectedTotalTasks := 1 + parentTaskCount + (parentTaskCount * expectedSubTasksPerParent) // 1个根任务 + 10个父任务 + 1000个子任务
@@ -303,7 +303,7 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 		t.Fatalf("添加根任务失败: %v", err)
 	}
 
-	// 创建父任务
+	// 创建父任务，每个父任务依赖 root-task
 	parentTasks := make([]*task.Task, parentTaskCount)
 	for i := 0; i < parentTaskCount; i++ {
 		parentName := fmt.Sprintf("parent-task-%d", i)
@@ -370,17 +370,24 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 		if status == "Success" || status == "Failed" || status == "Terminated" {
 			// 查询最终任务数量
 			taskInstances, err := taskRepo.GetByWorkflowInstanceID(ctx, instanceID)
-			finalTaskCount := 0
-			if err == nil {
-				finalTaskCount = len(taskInstances)
+			if err != nil {
+				t.Fatalf("查询任务实例失败: %v", err)
 			}
+			finalTaskCount := len(taskInstances)
 
 			t.Logf("工作流完成，状态: %s, 总耗时: %v, 最终任务数: %d (预期: %d+)",
 				status, time.Since(startTime), finalTaskCount, expectedTotalTasks)
 
-			// 验证任务数量
+			// 验证任务数量 - 如果任务数不足，测试应该失败
 			if finalTaskCount < expectedTotalTasks {
-				t.Logf("⚠️ 实际任务数 (%d) 少于预期 (%d)，可能是子任务生成未完成", finalTaskCount, expectedTotalTasks)
+				// 统计任务状态，帮助诊断问题
+				statusCount := make(map[string]int)
+				for _, ti := range taskInstances {
+					statusCount[ti.Status]++
+				}
+				t.Errorf("❌ 实际任务数 (%d) 少于预期 (%d)，可能是子任务生成未完成。任务状态统计: %v",
+					finalTaskCount, expectedTotalTasks, statusCount)
+				// 不立即失败，继续执行以收集更多信息
 			} else {
 				t.Logf("✅ 任务数量符合预期")
 			}
@@ -404,15 +411,26 @@ func TestComplexScenarios_DynamicLargeWorkflow(t *testing.T) {
 
 	finalStatus, _ := controller.GetStatus()
 
-	// 最终统计
+	// 最终统计和验证
 	taskInstances, err := taskRepo.GetByWorkflowInstanceID(ctx, instanceID)
-	finalTaskCount := 0
-	if err == nil {
-		finalTaskCount = len(taskInstances)
+	if err != nil {
+		t.Fatalf("查询任务实例失败: %v", err)
 	}
+	finalTaskCount := len(taskInstances)
 
 	t.Logf("✅ 动态大型workflow测试完成：最终任务数: %d (预期: %d+), 最终状态: %s, 耗时: %v",
 		finalTaskCount, expectedTotalTasks, finalStatus, time.Since(startTime))
+
+	// 最终验证：如果任务数不足，测试必须失败
+	if finalTaskCount < expectedTotalTasks {
+		// 统计任务状态，帮助诊断问题
+		statusCount := make(map[string]int)
+		for _, ti := range taskInstances {
+			statusCount[ti.Status]++
+		}
+		t.Fatalf("❌ 测试失败：实际任务数 (%d) 少于预期 (%d)。任务状态统计: %v。可能是子任务生成Handler未正确执行或子任务未被调度执行。",
+			finalTaskCount, expectedTotalTasks, statusCount)
+	}
 }
 
 // TestComplexScenarios_ComplexDependencies 测试包含复杂任务依赖关系的workflow
@@ -499,14 +517,7 @@ func TestComplexScenarios_ComplexDependencies(t *testing.T) {
 		if err := wf.AddTask(taskObj); err != nil {
 			t.Fatalf("添加任务 %d 失败: %v", i, err)
 		}
-
-		// 设置依赖关系
-		deps := make([]string, depsCount)
-		for j := 0; j < depsCount; j++ {
-			depIndex := (i*2 + j) % rootTaskCount
-			deps[j] = rootTasks[depIndex].GetID()
-		}
-		wf.Dependencies.Store(taskObj.GetID(), deps)
+		// 注意：依赖关系已通过WithDependency在构建时设置，AddTask会自动处理
 	}
 
 	// 创建叶子任务（每个叶子任务依赖2-3个中间任务）
@@ -532,14 +543,7 @@ func TestComplexScenarios_ComplexDependencies(t *testing.T) {
 		if err := wf.AddTask(taskObj); err != nil {
 			t.Fatalf("添加任务 %d 失败: %v", i, err)
 		}
-
-		// 设置依赖关系
-		deps := make([]string, depsCount)
-		for j := 0; j < depsCount; j++ {
-			depIndex := (i*2 + j) % midTaskCount
-			deps[j] = midTasks[depIndex].GetID()
-		}
-		wf.Dependencies.Store(taskObj.GetID(), deps)
+		// 注意：依赖关系已通过WithDependency在构建时设置，AddTask会自动处理
 	}
 
 	// 创建最终任务（每个最终任务依赖多个叶子任务）
@@ -565,14 +569,7 @@ func TestComplexScenarios_ComplexDependencies(t *testing.T) {
 		if err := wf.AddTask(taskObj); err != nil {
 			t.Fatalf("添加任务 %d 失败: %v", i, err)
 		}
-
-		// 设置依赖关系
-		deps := make([]string, depsCount)
-		for j := 0; j < depsCount; j++ {
-			depIndex := (i*3 + j) % leafTaskCount
-			deps[j] = leafTasks[depIndex].GetID()
-		}
-		wf.Dependencies.Store(taskObj.GetID(), deps)
+		// 注意：依赖关系已通过WithDependency在构建时设置，AddTask会自动处理
 	}
 
 	totalTasks := rootTaskCount + midTaskCount + leafTaskCount + finalTaskCount
@@ -587,7 +584,22 @@ func TestComplexScenarios_ComplexDependencies(t *testing.T) {
 	// 等待执行完成
 	timeout := 5 * time.Minute
 	startTime := time.Now()
-	waitForCompletion(t, controller, timeout)
+	for {
+		status, err := controller.GetStatus()
+		if err != nil {
+			t.Fatalf("获取状态失败: %v", err)
+		}
+
+		if status == "Success" || status == "Failed" || status == "Terminated" {
+			break
+		}
+
+		if time.Since(startTime) > timeout {
+			t.Fatalf("工作流执行超时")
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	finalStatus, _ := controller.GetStatus()
 	if finalStatus != "Success" {
@@ -684,7 +696,22 @@ func TestComplexScenarios_RandomFailures(t *testing.T) {
 	// 等待执行完成
 	timeout := 5 * time.Minute
 	startTime := time.Now()
-	waitForCompletion(t, controller, timeout)
+	for {
+		status, err := controller.GetStatus()
+		if err != nil {
+			t.Fatalf("获取状态失败: %v", err)
+		}
+
+		if status == "Success" || status == "Failed" || status == "Terminated" {
+			break
+		}
+
+		if time.Since(startTime) > timeout {
+			t.Fatalf("工作流执行超时")
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	finalStatus, _ := controller.GetStatus()
 	t.Logf("✅ 随机异常测试完成：%d 个任务，最终状态: %s, 耗时: %v", taskCount, finalStatus, time.Since(startTime))

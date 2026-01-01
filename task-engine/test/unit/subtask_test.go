@@ -704,9 +704,14 @@ func TestSubTask_ParameterInheritance(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -777,9 +782,14 @@ func TestSubTask_GetParentResult(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 注册Handler来验证结果传递
 	resultCaptured := make(chan interface{}, 1)
@@ -869,9 +879,14 @@ func TestSubTask_ParameterTypes(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 创建子任务，继承父任务的参数类型
 	subTask, err := builder.NewTaskBuilder("sub-task", "子任务", registry).
@@ -971,10 +986,19 @@ func TestSubTask_DownstreamGetSubTaskResult(t *testing.T) {
 		t.Fatalf("构建下游任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
-	wf.Tasks[downstreamTask.GetID()] = downstreamTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
+	if _, exists := wf.GetTask(downstreamTask.GetID()); !exists {
+		if err := wf.AddTask(downstreamTask); err != nil {
+			t.Fatalf("添加下游任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -1025,9 +1049,14 @@ func TestSubTask_ParameterCombination(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 创建多个子任务，每个子任务使用不同的参数组合
 	subTask1, err := builder.NewTaskBuilder("sub-task-1", "子任务1", registry).
@@ -1127,9 +1156,14 @@ func TestSubTask_EmptyAndNilParameters(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 创建子任务，继承这些特殊参数
 	subTask, err := builder.NewTaskBuilder("sub-task", "子任务", registry).
@@ -1230,9 +1264,14 @@ func TestSubTask_DependencyTriggerExecution(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -1310,9 +1349,14 @@ func TestSubTask_JobFunctionExecution(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -1413,9 +1457,14 @@ func TestSubTask_SuccessHandlerExecution(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -1501,9 +1550,14 @@ func TestSubTask_FailedHandlerExecution(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -1611,9 +1665,14 @@ func TestSubTask_CompleteExecutionFlow(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -1768,9 +1827,14 @@ func TestSubTask_ExecutionOrder_MultipleSubTasks(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -1917,9 +1981,14 @@ func TestSubTask_ExecutionOrder_SubTaskChain(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2092,10 +2161,19 @@ func TestSubTask_ExecutionOrder_DownstreamWaitsForAllSubTasks(t *testing.T) {
 		t.Fatalf("构建下游任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
-	wf.Tasks[downstreamTask.GetID()] = downstreamTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
+	if _, exists := wf.GetTask(downstreamTask.GetID()); !exists {
+		if err := wf.AddTask(downstreamTask); err != nil {
+			t.Fatalf("添加下游任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2264,9 +2342,14 @@ func TestSubTask_ExecutionOrder_DynamicAddAfterParentStarted(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2566,9 +2649,14 @@ func TestSubTask_Generation_EmptyData(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2619,9 +2707,14 @@ func TestSubTask_Generation_DimensionSplit(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2726,9 +2819,14 @@ func TestSubTask_Execution_ConcurrentControl(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2813,9 +2911,14 @@ func TestSubTask_Execution_PartialFailure(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2897,9 +3000,14 @@ func TestSubTask_Result_Aggregation(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -2966,9 +3074,14 @@ func TestSubTask_Result_EmptyResult(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -3034,11 +3147,24 @@ func TestSubTask_DAG_MultipleParents(t *testing.T) {
 		t.Fatalf("构建下游任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask1.GetID()] = parentTask1
-	wf.Tasks[parentTask2.GetID()] = parentTask2
-	wf.Tasks[downstreamTask.GetID()] = downstreamTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask1.GetID()); !exists {
+		if err := wf.AddTask(parentTask1); err != nil {
+			t.Fatalf("添加父任务1失败: %v", err)
+		}
+	}
+	if _, exists := wf.GetTask(parentTask2.GetID()); !exists {
+		if err := wf.AddTask(parentTask2); err != nil {
+			t.Fatalf("添加父任务2失败: %v", err)
+		}
+	}
+	if _, exists := wf.GetTask(downstreamTask.GetID()); !exists {
+		if err := wf.AddTask(downstreamTask); err != nil {
+			t.Fatalf("添加下游任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -3124,9 +3250,14 @@ func TestSubTask_DAG_NoDownstream(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -3247,9 +3378,14 @@ func TestSubTask_Handler_MultipleHandlers(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -3352,9 +3488,14 @@ func TestSubTask_Handler_FailureIsolation(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -3409,9 +3550,14 @@ func TestSubTask_Boundary_GenerationFailureRollback(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -3475,9 +3621,14 @@ func TestSubTask_Boundary_AllSubTasksFailed(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow
-	wf.Tasks = make(map[string]workflow.Task)
-	wf.Tasks[parentTask.GetID()] = parentTask
+	// 更新Workflow（清空现有任务并添加新任务）
+	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
+	// 这里我们直接添加，如果已存在会报错，所以先检查
+	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
+		if err := wf.AddTask(parentTask); err != nil {
+			t.Fatalf("添加父任务失败: %v", err)
+		}
+	}
 
 	// 提交Workflow创建实例
 	controller, err := eng.SubmitWorkflow(ctx, wf)

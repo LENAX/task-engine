@@ -358,8 +358,7 @@ func TestFeatureIntegration_DAGOptimization(t *testing.T) {
 	if err := wf.AddTask(task3); err != nil {
 		t.Fatalf("添加任务3失败: %v", err)
 	}
-	wf.Dependencies.Store(task2.GetID(), []string{task1.GetID()})
-	wf.Dependencies.Store(task3.GetID(), []string{task2.GetID()})
+	// 注意：依赖关系已通过WithDependency在构建时设置，AddTask会自动处理
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)

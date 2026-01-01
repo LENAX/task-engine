@@ -57,16 +57,11 @@ func TestMultiHandlers_SequentialExecution(t *testing.T) {
 	}
 
 	// 创建Task，配置多个Handler
-	taskObj := &task.Task{
-		ID:             "test-task",
-		Name:           "test-task",
-		Description:    "测试任务",
-		Status:         task.TaskStatusPending,
-		StatusHandlers: map[string][]string{
-			task.TaskStatusSuccess: {handler1ID, handler2ID, handler3ID},
-		},
-		Params: make(map[string]any),
-	}
+	taskObj := task.NewTask("test-task", "测试任务", "", make(map[string]any), map[string][]string{
+		task.TaskStatusSuccess: {handler1ID, handler2ID, handler3ID},
+	})
+	taskObj.ID = "test-task" // 设置固定ID用于测试
+	taskObj.SetStatus(task.TaskStatusPending)
 
 	// 执行Handler（同步执行以验证顺序）
 	err = task.ExecuteTaskHandlerSync(registry, taskObj, task.TaskStatusSuccess, "test result", "")
@@ -133,15 +128,11 @@ func TestMultiHandlers_FailureIsolation(t *testing.T) {
 	handler3ID, _ := registry.RegisterTaskHandler(ctx, "handler3_fail", handler3, "Handler 3")
 
 	// 创建Task
-	taskObj := &task.Task{
-		ID:             "test-task-fail",
-		Name:           "test-task-fail",
-		Status:         task.TaskStatusPending,
-		StatusHandlers: map[string][]string{
-			task.TaskStatusSuccess: {handler1ID, handler2ID, handler3ID},
-		},
-		Params: make(map[string]any),
-	}
+	taskObj := task.NewTask("test-task-fail", "测试任务失败", "", make(map[string]any), map[string][]string{
+		task.TaskStatusSuccess: {handler1ID, handler2ID, handler3ID},
+	})
+	taskObj.ID = "test-task-fail" // 设置固定ID用于测试
+	taskObj.SetStatus(task.TaskStatusPending)
 
 	// 执行Handler（同步执行）
 	err := task.ExecuteTaskHandlerSync(registry, taskObj, task.TaskStatusSuccess, "test result", "")
@@ -182,17 +173,13 @@ func TestMultiHandlers_ParameterPassing(t *testing.T) {
 	handlerID, _ := registry.RegisterTaskHandler(ctx, "param_handler", handler, "参数Handler")
 
 	// 创建Task
-	taskObj := &task.Task{
-		ID:     "test-task-param",
-		Name:   "test-task-param",
-		Status: task.TaskStatusPending,
-		StatusHandlers: map[string][]string{
-			task.TaskStatusSuccess: {handlerID},
-		},
-		Params: map[string]any{
-			"custom_param": "custom_value",
-		},
-	}
+	taskObj := task.NewTask("test-task-param", "测试任务参数", "", map[string]any{
+		"custom_param": "custom_value",
+	}, map[string][]string{
+		task.TaskStatusSuccess: {handlerID},
+	})
+	taskObj.ID = "test-task-param" // 设置固定ID用于测试
+	taskObj.SetStatus(task.TaskStatusPending)
 
 	// 执行Handler
 	err := task.ExecuteTaskHandlerSync(registry, taskObj, task.TaskStatusSuccess, "test result", "")

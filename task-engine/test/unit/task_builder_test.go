@@ -71,8 +71,11 @@ func TestTaskBuilder_Basic(t *testing.T) {
 		t.Errorf("重试次数错误，期望: 3, 实际: %d", task.RetryCount)
 	}
 
-	if task.Params["fileName"] != "test.txt" {
-		t.Errorf("参数错误，期望: test.txt, 实际: %s", task.Params["fileName"])
+	fileName, exists := task.Params.Load("fileName")
+	if !exists {
+		t.Error("参数fileName不存在")
+	} else if fileName != "test.txt" {
+		t.Errorf("参数错误，期望: test.txt, 实际: %v", fileName)
 	}
 }
 

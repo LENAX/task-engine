@@ -43,21 +43,22 @@ func TestDefaultLogError(t *testing.T) {
 	task.DefaultLogError(ctx)
 }
 
+// MockSaveRepository 实现SaveRepository接口的Mock对象
+type MockSaveRepository struct {
+	savedData []map[string]interface{}
+}
+
+// Save 实现SaveRepository接口
+func (r *MockSaveRepository) Save(data map[string]interface{}) error {
+	r.savedData = append(r.savedData, data)
+	return nil
+}
+
 // TestDefaultSaveResult 测试DefaultSaveResult Handler
 func TestDefaultSaveResult(t *testing.T) {
 	// 创建Mock Repository
-	type MockRepository struct {
-		savedData []map[string]interface{}
-	}
-
-	saveFunc := func(data map[string]interface{}) error {
-		return nil
-	}
-
-	repo := &struct {
-		Save func(map[string]interface{}) error
-	}{
-		Save: saveFunc,
+	repo := &MockSaveRepository{
+		savedData: make([]map[string]interface{}, 0),
 	}
 
 	// 注册依赖
@@ -83,8 +84,19 @@ func TestDefaultSaveResult(t *testing.T) {
 	// 执行Handler
 	task.DefaultSaveResult(taskCtx)
 
-	// 等待Handler执行完成
-	time.Sleep(50 * time.Millisecond)
+	// 验证数据已保存
+	if len(repo.savedData) == 0 {
+		t.Error("期望数据已保存，但savedData为空")
+	}
+
+	// 验证保存的数据
+	savedData := repo.savedData[0]
+	if savedData["task_id"] != "test-task" {
+		t.Errorf("期望task_id为'test-task'，实际为%v", savedData["task_id"])
+	}
+	if savedData["result_data"] != "test result" {
+		t.Errorf("期望result_data为'test result'，实际为%v", savedData["result_data"])
+	}
 }
 
 // TestDefaultAggregateSubTaskResults 测试DefaultAggregateSubTaskResults Handler

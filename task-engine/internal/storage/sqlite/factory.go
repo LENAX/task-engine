@@ -8,6 +8,38 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
 
+// configureSQLite 配置SQLite数据库连接，启用WAL模式和其他优化设置
+func configureSQLite(db *sqlx.DB) error {
+	// 启用WAL模式：允许并发读写，显著提高并发性能
+	_, err := db.Exec("PRAGMA journal_mode=WAL;")
+	if err != nil {
+		return fmt.Errorf("启用WAL模式失败: %w", err)
+	}
+
+	// 设置busy_timeout：当数据库被锁定时，等待最多30秒而不是立即失败
+	// 这可以减少"database is locked"错误
+	_, err = db.Exec("PRAGMA busy_timeout=30000;")
+	if err != nil {
+		return fmt.Errorf("设置busy_timeout失败: %w", err)
+	}
+
+	// 设置WAL自动检查点：当WAL文件达到1000页时自动执行检查点
+	// 防止WAL文件无限增长
+	_, err = db.Exec("PRAGMA wal_autocheckpoint=1000;")
+	if err != nil {
+		return fmt.Errorf("设置wal_autocheckpoint失败: %w", err)
+	}
+
+	// 设置同步模式为NORMAL（WAL模式下推荐）
+	// WAL模式下，NORMAL同步模式已经足够安全，且性能更好
+	_, err = db.Exec("PRAGMA synchronous=NORMAL;")
+	if err != nil {
+		return fmt.Errorf("设置synchronous失败: %w", err)
+	}
+
+	return nil
+}
+
 // Repositories 存储Repository集合（内部使用）
 type Repositories struct {
 	Workflow         storage.WorkflowRepository
@@ -29,6 +61,12 @@ func NewRepositories(dsn string) (*Repositories, error) {
 	// 测试连接
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("数据库连接失败: %w", err)
+	}
+
+	// 配置SQLite：启用WAL模式和其他优化设置
+	if err := configureSQLite(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("配置SQLite失败: %w", err)
 	}
 
 	workflowRepo, err := NewWorkflowRepoWithDB(db)

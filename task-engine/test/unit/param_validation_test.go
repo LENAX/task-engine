@@ -85,9 +85,12 @@ func TestParamValidation_RequiredParams(t *testing.T) {
 	}
 
 	// 添加到Workflow
-	wf.Tasks[parentTask.GetID()] = parentTask
-	wf.Tasks[childTask.GetID()] = childTask
-	wf.Dependencies[childTask.GetID()] = []string{parentTask.GetID()}
+	if err := wf.AddTask(parentTask); err != nil {
+		t.Fatalf("添加父任务失败: %v", err)
+	}
+	if err := wf.AddTask(childTask); err != nil {
+		t.Fatalf("添加子任务失败: %v", err)
+	}
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -151,9 +154,12 @@ func TestParamValidation_ResultMapping(t *testing.T) {
 	}
 
 	// 添加到Workflow
-	wf.Tasks[parentTask.GetID()] = parentTask
-	wf.Tasks[childTask.GetID()] = childTask
-	wf.Dependencies[childTask.GetID()] = []string{parentTask.GetID()}
+	if err := wf.AddTask(parentTask); err != nil {
+		t.Fatalf("添加父任务失败: %v", err)
+	}
+	if err := wf.AddTask(childTask); err != nil {
+		t.Fatalf("添加子任务失败: %v", err)
+	}
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -224,9 +230,12 @@ func TestParamValidation_MissingRequiredParams(t *testing.T) {
 	}
 
 	// 添加到Workflow
-	wf.Tasks[parentTask.GetID()] = parentTask
-	wf.Tasks[childTask.GetID()] = childTask
-	wf.Dependencies[childTask.GetID()] = []string{parentTask.GetID()}
+	if err := wf.AddTask(parentTask); err != nil {
+		t.Fatalf("添加父任务失败: %v", err)
+	}
+	if err := wf.AddTask(childTask); err != nil {
+		t.Fatalf("添加子任务失败: %v", err)
+	}
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)

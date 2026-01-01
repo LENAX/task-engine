@@ -60,7 +60,9 @@ func TestErrorHandling_StorageFailure(t *testing.T) {
 		WithJobFunction("mockFunc", nil).
 		Build()
 
-	wf.Tasks[task1.GetID()] = task1
+	if err := wf.AddTask(task1); err != nil {
+		t.Fatalf("添加任务失败: %v", err)
+	}
 
 	// 提交Workflow（应该能正常处理，即使存储有故障）
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -117,7 +119,9 @@ func TestErrorHandling_NetworkTimeout(t *testing.T) {
 		t.Fatalf("构建任务失败: %v", err)
 	}
 
-	wf.Tasks[task1.GetID()] = task1
+	if err := wf.AddTask(task1); err != nil {
+		t.Fatalf("添加任务失败: %v", err)
+	}
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)
@@ -177,7 +181,9 @@ func TestErrorHandling_APIRateLimit(t *testing.T) {
 		t.Fatalf("构建任务失败: %v", err)
 	}
 
-	wf.Tasks[task1.GetID()] = task1
+	if err := wf.AddTask(task1); err != nil {
+		t.Fatalf("添加任务失败: %v", err)
+	}
 
 	// 提交Workflow
 	controller, err := eng.SubmitWorkflow(ctx, wf)

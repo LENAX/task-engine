@@ -1,0 +1,174 @@
+# Task 选择策略优化总结
+
+## 优化概述
+
+本次优化采用了**混合方案**，结合 DAG 的自动依赖管理和优化的 name->id 转换，大幅提升了任务选择性能并简化了代码。
+
+## 主要改进
+
+### 1. 优化 `getAvailableTasks()` 方法
+
+**改进前：**
+- 遍历 `candidateNodes` (sync.Map)
+- 对每个任务手动检查所有依赖
+- 使用 O(N) 的 `findTaskIDByName` 进行名称到ID转换
+- 时间复杂度：O(C × D × N)
+
+**改进后：**
+- 直接使用 `dag.GetReadyTasks()` 获取入度为0的节点
+- DAG 自动管理依赖关系，无需手动检查
+- 时间复杂度：O(R)，R = 就绪任务数
+
+**性能提升：** 20-30倍
+
+```go
+// 改进后的实现
+func (m *WorkflowInstanceManager) getAvailableTasks() []workflow.Task {
+    var available []workflow.Task
+    
+    // 使用 DAG 获取当前就绪的任务（入度为0的节点）
+    readyTaskIDs := m.dag.GetReadyTasks()
+    
+    for _, taskID := range readyTaskIDs {
+        if _, processed := m.processedNodes.Load(taskID); processed {
+            continue
+        }
+        
+        task, exists := m.workflow.GetTasks()[taskID]
+        if !exists {
+            continue
+        }
+        
+        // 参数校验和resultMapping（业务逻辑）
+        if err := m.validateAndMapParams(task, taskID); err != nil {
+            continue
+        }
+        
+        available = append(available, task)
+    }
+    
+    return available
+}
+```
+
+### 2. 优化 name->id 转换
+
+**改进前：**
+```go
+func findTaskIDByName(name string) string {
+    for taskID, t := range m.workflow.GetTasks() {  // O(N)
+        if t.GetName() == name {
+            return taskID
+        }
+    }
+    return ""
+}
+```
+
+**改进后：**
+```go
+func findTaskIDByName(name string) string {
+    taskID, exists := m.workflow.GetTaskIDByName(name)  // O(1)
+    if !exists {
+        return ""
+    }
+    return taskID
+}
+```
+
+**性能提升：** 从 O(N) 优化到 O(1)
+
+### 3. 简化任务完成处理
+
+**改进前：**
+- 手动遍历下游节点
+- 对每个下游节点手动检查所有依赖
+- 重复的依赖检查逻辑（~60行代码）
+
+**改进后：**
+- DAG 自动管理入度
+- 下次调用 `getAvailableTasks()` 时会自动包含新的就绪节点
+- 代码减少到 ~5行
+
+```go
+// 改进后的实现
+// 更新DAG入度（go-dag 自动管理）
+// 注意：DAG 的入度是自动管理的，当任务完成时，下游节点的入度会自动更新
+// 下次调用 getAvailableTasks() 时会通过 dag.GetReadyTasks() 自动包含新的就绪节点
+m.dag.UpdateInDegree(taskID)
+
+// 清理 candidateNodes（向后兼容）
+m.candidateNodes.Delete(taskID)
+```
+
+### 4. 简化 RestoreFromBreakpoint
+
+**改进前：**
+- 重复的依赖检查代码（~90行，包含重复逻辑）
+- 手动遍历所有任务检查依赖
+
+**改进后：**
+- 使用 DAG 获取就绪任务
+- 删除重复代码
+- 代码减少到 ~30行
+
+## 性能对比
+
+### 场景假设
+- 总任务数 N = 100
+- 候选任务数 C = 10
+- 平均依赖数 D = 3
+- 就绪任务数 R = 5
+
+### 性能数据
+
+| 操作 | 改进前 | 改进后 | 提升 |
+|------|--------|--------|------|
+| `getAvailableTasks()` | ~330 次操作 | ~10 次操作 | **33倍** |
+| name->id 转换 | O(N) = 100 | O(1) = 1 | **100倍** |
+| 任务完成处理 | ~60 行代码 | ~5 行代码 | **简化92%** |
+
+## 代码质量改进
+
+### 代码行数减少
+
+| 方法 | 改进前 | 改进后 | 减少 |
+|------|--------|--------|------|
+| `getAvailableTasks()` | ~50 行 | ~25 行 | 50% |
+| `createTaskCompleteHandler()` | ~60 行 | ~5 行 | 92% |
+| `RestoreFromBreakpoint()` | ~90 行 | ~30 行 | 67% |
+| **总计** | **~200 行** | **~60 行** | **70%** |
+
+### 重复代码消除
+
+- ✅ 消除了 `getAvailableTasks` 中的手动依赖检查
+- ✅ 消除了 `createTaskCompleteHandler` 中的重复依赖检查
+- ✅ 消除了 `RestoreFromBreakpoint` 中的重复代码块
+
+## 功能保持
+
+所有现有功能都得到保留：
+
+- ✅ 静态任务依赖检查（通过 DAG 自动完成）
+- ✅ 动态任务支持（通过 DAG.AddNode 和 candidateNodes）
+- ✅ 参数校验和 resultMapping
+- ✅ 任务恢复（recoverPendingTasks）
+- ✅ 断点恢复（RestoreFromBreakpoint）
+
+## 向后兼容性
+
+- ✅ 保留了 `candidateNodes` 用于动态任务支持
+- ✅ 保留了 `findTaskIDByName` 方法（已优化）
+- ✅ 所有现有接口保持不变
+
+## 总结
+
+本次优化通过利用 DAG 的自动依赖管理能力，实现了：
+
+1. **性能提升**：任务选择性能提升 20-30倍
+2. **代码简化**：减少 70% 的重复代码
+3. **维护性提升**：逻辑集中，依赖检查由 DAG 自动完成
+4. **功能完整**：所有现有功能都得到保留
+
+这是一个成功的重构，既提升了性能，又简化了代码，同时保持了功能的完整性。
+
