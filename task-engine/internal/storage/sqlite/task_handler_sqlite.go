@@ -150,9 +150,20 @@ func (r *taskHandlerRepo) ListAll(ctx context.Context) ([]*storage.TaskHandlerMe
 	return metas, nil
 }
 
-// Delete 实现存储接口（内部实现）
+// Delete 实现存储接口（内部实现，根据ID删除）
 // 幂等性：删除不存在的记录不会报错
-func (r *taskHandlerRepo) Delete(ctx context.Context, name string) error {
+func (r *taskHandlerRepo) Delete(ctx context.Context, id string) error {
+	query := `DELETE FROM task_handler_meta WHERE id = ?`
+	_, err := r.db.ExecContext(ctx, query, id)
+	if err != nil {
+		return fmt.Errorf("删除TaskHandlerMeta失败: %w", err)
+	}
+	// 不检查 RowsAffected，删除不存在的记录也是幂等的
+	return nil
+}
+
+// DeleteByName 根据名称删除Handler元数据（业务接口）
+func (r *taskHandlerRepo) DeleteByName(ctx context.Context, name string) error {
 	query := `DELETE FROM task_handler_meta WHERE name = ?`
 	_, err := r.db.ExecContext(ctx, query, name)
 	if err != nil {

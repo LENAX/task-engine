@@ -59,6 +59,27 @@ func (r *FunctionRegistry) Register(ctx context.Context, name string, fn interfa
 		name = generateFunctionName(fn)
 	}
 
+	// 检查名称是否已存在（先检查内存，再检查数据库）
+	r.mu.RLock()
+	for _, existingMeta := range r.metaMap {
+		if existingMeta.Name == name {
+			r.mu.RUnlock()
+			return "", fmt.Errorf("JobFunction名称 %s 已存在（FuncID: %s）", name, existingMeta.ID)
+		}
+	}
+	r.mu.RUnlock()
+
+	// 如果配置了Repository，检查数据库中是否已存在
+	if r.jobFunctionRepo != nil {
+		existingMeta, err := r.jobFunctionRepo.GetByName(ctx, name)
+		if err != nil {
+			return "", fmt.Errorf("检查函数名称唯一性失败: %w", err)
+		}
+		if existingMeta != nil {
+			return "", fmt.Errorf("JobFunction名称 %s 已存在（FuncID: %s）", name, existingMeta.ID)
+		}
+	}
+
 	// 包装函数
 	wrappedFunc, err := WrapJobFunc(fn)
 	if err != nil {
@@ -156,7 +177,7 @@ func (r *FunctionRegistry) Unregister(ctx context.Context, funcID string) error 
 
 	// 从数据库删除元数据
 	if r.jobFunctionRepo != nil && meta != nil {
-		if err := r.jobFunctionRepo.Delete(ctx, meta.Name); err != nil {
+		if err := r.jobFunctionRepo.DeleteByName(ctx, meta.Name); err != nil {
 			return fmt.Errorf("删除函数元数据失败: %w", err)
 		}
 	}
@@ -402,7 +423,7 @@ func (r *FunctionRegistry) UnregisterTaskHandler(ctx context.Context, handlerID 
 
 	// 从数据库删除元数据
 	if r.taskHandlerRepo != nil && meta != nil {
-		if err := r.taskHandlerRepo.Delete(ctx, meta.Name); err != nil {
+		if err := r.taskHandlerRepo.DeleteByName(ctx, meta.Name); err != nil {
 			return fmt.Errorf("删除TaskHandler元数据失败: %w", err)
 		}
 	}

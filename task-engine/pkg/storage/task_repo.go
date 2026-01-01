@@ -5,20 +5,30 @@ import (
 	"time"
 )
 
-// TaskRepository Task存储接口（对外导出）
-type TaskRepository interface {
-	// Save 保存Task实例
+// TaskCRUDRepository Task通用CRUD接口（对外导出）
+// 提供基础的增删改查操作
+type TaskCRUDRepository interface {
+	BaseRepository
+	// Save 保存Task实例（创建或更新）
 	Save(ctx context.Context, task *TaskInstance) error
 	// GetByID 根据ID查询Task实例
 	GetByID(ctx context.Context, id string) (*TaskInstance, error)
-	// GetByWorkflowInstanceID 根据WorkflowInstance ID查询所有Task
-	GetByWorkflowInstanceID(ctx context.Context, instanceID string) ([]*TaskInstance, error)
-	// UpdateStatus 更新Task状态
-	UpdateStatus(ctx context.Context, id string, status string) error
-	// UpdateStatusWithError 更新Task状态和错误信息
-	UpdateStatusWithError(ctx context.Context, id string, status string, errorMsg string) error
 	// Delete 删除Task实例
 	Delete(ctx context.Context, id string) error
+}
+
+// TaskRepository Task业务存储接口（对外导出）
+// 组合了通用CRUD接口，并添加了业务特定的方法
+type TaskRepository interface {
+	// 继承通用CRUD接口
+	TaskCRUDRepository
+
+	// GetByWorkflowInstanceID 根据WorkflowInstance ID查询所有Task（业务接口）
+	GetByWorkflowInstanceID(ctx context.Context, instanceID string) ([]*TaskInstance, error)
+	// UpdateStatus 更新Task状态（业务接口）
+	UpdateStatus(ctx context.Context, id string, status string) error
+	// UpdateStatusWithError 更新Task状态和错误信息（业务接口）
+	UpdateStatusWithError(ctx context.Context, id string, status string, errorMsg string) error
 }
 
 // TaskInstance Task实例结构（对外导出）

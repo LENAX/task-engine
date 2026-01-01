@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
-    "github.com/stevelan1995/task-engine/pkg/core/workflow"
-    "github.com/stevelan1995/task-engine/pkg/storage"
+	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/stevelan1995/task-engine/pkg/storage"
 	"github.com/stevelan1995/task-engine/pkg/storage/dao"
 )
 
@@ -28,6 +30,12 @@ func NewWorkflowRepo(dsn string) (storage.WorkflowRepository, error) {
 	// 测试连接
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("数据库连接失败: %w", err)
+	}
+
+	// 配置SQLite：启用WAL模式和其他优化设置
+	if err := configureSQLite(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("配置SQLite失败: %w", err)
 	}
 
 	repo := &workflowRepo{
@@ -67,8 +75,17 @@ func (r *workflowRepo) Save(ctx context.Context, wf *workflow.Workflow) error {
 		return fmt.Errorf("序列化依赖关系失败: %w", err)
 	}
 
-	// 序列化参数
-	paramsJSON, err := json.Marshal(wf.Params)
+	// 序列化参数（sync.Map需要先转换为普通map）
+	paramsMap := make(map[string]string)
+	wf.Params.Range(func(key, value interface{}) bool {
+		if k, ok := key.(string); ok {
+			if v, ok := value.(string); ok {
+				paramsMap[k] = v
+			}
+		}
+		return true
+	})
+	paramsJSON, err := json.Marshal(paramsMap)
 	if err != nil {
 		return fmt.Errorf("序列化参数失败: %w", err)
 	}
@@ -81,7 +98,7 @@ func (r *workflowRepo) Save(ctx context.Context, wf *workflow.Workflow) error {
 		Params:       string(paramsJSON),
 		Dependencies: string(depsJSON),
 		CreateTime:   wf.CreateTime,
-		Status:       wf.Status,
+		Status:       wf.GetStatus(),
 	}
 
 	query := `
@@ -92,7 +109,131 @@ func (r *workflowRepo) Save(ctx context.Context, wf *workflow.Workflow) error {
 	if err != nil {
 		return fmt.Errorf("保存Workflow失败: %w", err)
 	}
-    return nil
+	return nil
+}
+
+// SaveWithTasks 在事务中同时保存Workflow和所有预定义的Task（内部实现）
+func (r *workflowRepo) SaveWithTasks(ctx context.Context, wf *workflow.Workflow, workflowInstanceID string, taskRepo storage.TaskRepository, registry interface{}) error {
+	// 开始事务
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. 保存Workflow
+	depsJSON, err := json.Marshal(wf.GetDependencies())
+	if err != nil {
+		return fmt.Errorf("序列化依赖关系失败: %w", err)
+	}
+
+	// 序列化参数（sync.Map需要先转换为普通map）
+	paramsMap := make(map[string]string)
+	wf.Params.Range(func(key, value interface{}) bool {
+		if k, ok := key.(string); ok {
+			if v, ok := value.(string); ok {
+				paramsMap[k] = v
+			}
+		}
+		return true
+	})
+	paramsJSON, err := json.Marshal(paramsMap)
+	if err != nil {
+		return fmt.Errorf("序列化参数失败: %w", err)
+	}
+
+	workflowDAO := &dao.WorkflowDAO{
+		ID:           wf.GetID(),
+		Name:         wf.GetName(),
+		Description:  wf.Description,
+		Params:       string(paramsJSON),
+		Dependencies: string(depsJSON),
+		CreateTime:   wf.CreateTime,
+		Status:       wf.GetStatus(),
+	}
+
+	query := `
+	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status)
+	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status)
+	`
+	_, err = tx.NamedExecContext(ctx, query, workflowDAO)
+	if err != nil {
+		return fmt.Errorf("保存Workflow失败: %w", err)
+	}
+
+	// 2. 保存所有预定义的Task
+	tasks := wf.GetTasks()
+	if len(tasks) > 0 {
+		// 获取registry以获取JobFuncID
+		var getJobFuncID func(string) string
+		if registry != nil {
+			// 尝试类型断言为 *task.FunctionRegistry
+			if reg, ok := registry.(interface {
+				GetIDByName(name string) string
+			}); ok {
+				getJobFuncID = reg.GetIDByName
+			}
+		}
+
+		for taskID, t := range tasks {
+			jobFuncID := ""
+			if getJobFuncID != nil {
+				jobFuncID = getJobFuncID(t.GetJobFuncName())
+			}
+
+			// 序列化参数
+			paramsJSON, err := json.Marshal(t.GetParams())
+			if err != nil {
+				return fmt.Errorf("序列化Task %s 参数失败: %w", taskID, err)
+			}
+
+			// 获取超时时间（从Task配置中获取，如果没有则使用默认值30）
+			timeoutSeconds := 30
+			if taskObj, ok := t.(*task.Task); ok {
+				if taskObj.TimeoutSeconds > 0 {
+					timeoutSeconds = taskObj.TimeoutSeconds
+				}
+			}
+
+			// 构建TaskDAO对象
+			taskDAO := &dao.TaskDAO{
+				ID:                 taskID,
+				Name:               t.GetName(),
+				WorkflowInstanceID: workflowInstanceID,
+				JobFuncName:        t.GetJobFuncName(),
+				Params:             string(paramsJSON),
+				Status:             "Pending",
+				TimeoutSeconds:     timeoutSeconds,
+				RetryCount:         0,
+				CreateTime:         time.Now(),
+			}
+
+			if jobFuncID != "" {
+				taskDAO.JobFuncID.Valid = true
+				taskDAO.JobFuncID.String = jobFuncID
+			}
+
+			// 保存Task到数据库（在事务中）
+			taskQuery := `
+			INSERT OR REPLACE INTO task_instance 
+			(id, name, workflow_instance_id, job_func_id, job_func_name, params, status, 
+			 timeout_seconds, retry_count, start_time, end_time, error_msg, create_time)
+			VALUES (:id, :name, :workflow_instance_id, :job_func_id, :job_func_name, :params, :status, 
+			 :timeout_seconds, :retry_count, :start_time, :end_time, :error_msg, :create_time)
+			`
+			_, err = tx.NamedExecContext(ctx, taskQuery, taskDAO)
+			if err != nil {
+				return fmt.Errorf("保存Task %s (%s) 失败: %w", taskID, t.GetName(), err)
+			}
+		}
+	}
+
+	// 提交事务
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	return nil
 }
 
 // GetByID 实现存储接口（内部实现）
@@ -133,9 +274,12 @@ func (r *workflowRepo) GetByID(ctx context.Context, id string) (*workflow.Workfl
 	for k, v := range deps {
 		wf.Dependencies.Store(k, v)
 	}
-	wf.Params = params
+	// 将map转换为sync.Map
+	for k, v := range params {
+		wf.Params.Store(k, v)
+	}
 	wf.CreateTime = dao.CreateTime
-	wf.Status = dao.Status
+	wf.SetStatus(dao.Status)
 	// 注意：Tasks需要从其他地方加载，这里只加载定义
 
 	return wf, nil
@@ -150,5 +294,5 @@ func (r *workflowRepo) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("删除Workflow失败: %w", err)
 	}
 	// 不检查 RowsAffected，删除不存在的记录也是幂等的
-    return nil
+	return nil
 }

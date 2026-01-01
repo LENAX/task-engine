@@ -513,11 +513,6 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 		return nil, fmt.Errorf("Workflow校验失败: %w", err)
 	}
 
-	// 持久化Workflow模板
-	if err := e.workflowRepo.Save(ctx, wf); err != nil {
-		return nil, fmt.Errorf("保存Workflow模板失败: %w", err)
-	}
-
 	// 创建WorkflowInstance
 	instance := workflow.NewWorkflowInstance(wf.GetID())
 	instance.Status = "Ready"
@@ -525,6 +520,11 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 	// 持久化WorkflowInstance
 	if err := e.workflowInstanceRepo.Save(ctx, instance); err != nil {
 		return nil, fmt.Errorf("保存WorkflowInstance失败: %w", err)
+	}
+
+	// 在事务中同时保存Workflow模板和所有预定义的Task
+	if err := e.workflowRepo.SaveWithTasks(ctx, wf, instance.ID, e.taskRepo, e.registry); err != nil {
+		return nil, fmt.Errorf("保存Workflow和Task失败: %w", err)
 	}
 
 	// 创建WorkflowInstanceManager
