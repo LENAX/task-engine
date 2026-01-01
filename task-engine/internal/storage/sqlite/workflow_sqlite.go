@@ -129,7 +129,10 @@ func (r *workflowRepo) GetByID(ctx context.Context, id string) (*workflow.Workfl
 
 	wf := workflow.NewWorkflow(dao.Name, dao.Description)
 	wf.ID = dao.ID
-	wf.Dependencies = deps
+	// 将map转换为sync.Map
+	for k, v := range deps {
+		wf.Dependencies.Store(k, v)
+	}
 	wf.Params = params
 	wf.CreateTime = dao.CreateTime
 	wf.Status = dao.Status

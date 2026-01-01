@@ -285,11 +285,11 @@ func TestTaskBuilder_WithTaskHandler_Logging(t *testing.T) {
 		t.Fatal("StatusHandlers应该不为nil")
 	}
 
-	if taskInstance.StatusHandlers[task.TaskStatusSuccess] == "" {
+	if len(taskInstance.StatusHandlers[task.TaskStatusSuccess]) == 0 {
 		t.Error("成功状态的Handler未设置")
 	}
 
-	if taskInstance.StatusHandlers[task.TaskStatusFailed] == "" {
+	if len(taskInstance.StatusHandlers[task.TaskStatusFailed]) == 0 {
 		t.Error("失败状态的Handler未设置")
 	}
 }
@@ -367,15 +367,15 @@ func TestTaskBuilder_WithTaskHandler_Database(t *testing.T) {
 		t.Errorf("Handler数量错误，期望: 3, 实际: %d", len(taskInstance.StatusHandlers))
 	}
 
-	if taskInstance.StatusHandlers[task.TaskStatusSuccess] == "" {
+	if len(taskInstance.StatusHandlers[task.TaskStatusSuccess]) == 0 {
 		t.Error("成功状态的Handler未设置")
 	}
 
-	if taskInstance.StatusHandlers[task.TaskStatusFailed] == "" {
+	if len(taskInstance.StatusHandlers[task.TaskStatusFailed]) == 0 {
 		t.Error("失败状态的Handler未设置")
 	}
 
-	if taskInstance.StatusHandlers[task.TaskStatusTimeout] == "" {
+	if len(taskInstance.StatusHandlers[task.TaskStatusTimeout]) == 0 {
 		t.Error("超时状态的Handler未设置")
 	}
 }
@@ -447,13 +447,13 @@ func TestTaskBuilder_WithTaskHandler_Combined(t *testing.T) {
 	}
 
 	// 验证Handler已设置
-	if taskInstance.StatusHandlers[task.TaskStatusSuccess] == "" {
+	if len(taskInstance.StatusHandlers[task.TaskStatusSuccess]) == 0 {
 		t.Error("成功状态的Handler未设置")
 	}
 
 	// 注意：同一个状态只能设置一个Handler，后设置的会覆盖前面的
 	// 如果需要多个Handler，应该在Handler内部组合调用
-	if taskInstance.StatusHandlers[task.TaskStatusSuccess] == "" {
+	if len(taskInstance.StatusHandlers[task.TaskStatusSuccess]) == 0 {
 		t.Logf("注意：同一个状态只能设置一个Handler，当前使用: %s", taskInstance.StatusHandlers[task.TaskStatusSuccess])
 	}
 }
