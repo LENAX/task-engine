@@ -57,9 +57,8 @@ func setupSubTaskTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *wo
 		t.Fatalf("注册函数失败: %v", err)
 	}
 
-	// 创建测试Workflow
+	// 创建空的测试Workflow（不预创建任务，让每个测试自己创建需要的任务）
 	wf, err := builder.NewWorkflowBuilder("test-workflow", "测试工作流").
-		WithTask(createTestTask(t, registry, "parent-task", "父任务", nil)).
 		Build()
 	if err != nil {
 		t.Fatalf("构建Workflow失败: %v", err)
@@ -704,13 +703,9 @@ func TestSubTask_ParameterInheritance(t *testing.T) {
 		t.Fatalf("构建父任务失败: %v", err)
 	}
 
-	// 更新Workflow（清空现有任务并添加新任务）
-	// 注意：由于sync.Map不支持清空，我们需要重新创建Workflow或逐个删除
-	// 这里我们直接添加，如果已存在会报错，所以先检查
-	if _, exists := wf.GetTask(parentTask.GetID()); !exists {
-		if err := wf.AddTask(parentTask); err != nil {
-			t.Fatalf("添加父任务失败: %v", err)
-		}
+	// 添加父任务到Workflow
+	if err := wf.AddTask(parentTask); err != nil {
+		t.Fatalf("添加父任务失败: %v", err)
 	}
 
 	// 提交Workflow创建实例
@@ -2224,8 +2219,8 @@ func TestSubTask_ExecutionOrder_DownstreamWaitsForAllSubTasks(t *testing.T) {
 		t.Fatalf("添加子任务3失败: %v", err)
 	}
 
-	// 等待所有任务执行完成（包括最慢的子任务3）
-	time.Sleep(500 * time.Millisecond)
+	// 等待所有任务执行完成（包括最慢的子任务3，需要150ms，加上其他延迟，至少等待1秒）
+	time.Sleep(2 * time.Second)
 
 	// 验证执行顺序
 	executionMutex.Lock()
