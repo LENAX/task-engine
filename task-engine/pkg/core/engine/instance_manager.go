@@ -20,9 +20,10 @@ type WorkflowInstanceManager struct {
 	instance             *workflow.WorkflowInstance
 	workflow             *workflow.Workflow
 	dag                  *dag.DAG
-	processedNodes       sync.Map // 已处理的Task ID -> bool
-	candidateNodes       sync.Map // 候选Task ID -> workflow.Task
-	contextData          sync.Map // Task间传递的数据
+	processedNodes       sync.Map     // 已处理的Task ID -> bool
+	readyTasksSet        sync.Map     // 就绪任务集合（taskID -> workflow.Task），O(1)访问
+	readyTasksMu         sync.RWMutex // 保护readyTasksSet的批量操作和复合操作
+	contextData          sync.Map     // Task间传递的数据
 	controlSignalChan    chan workflow.ControlSignal
 	statusUpdateChan     chan string
 	mu                   sync.RWMutex
@@ -76,35 +77,20 @@ func NewWorkflowInstanceManager(
 		resultCache:          resultCache,
 	}
 
-	// 初始化candidateNodes（根节点，入度为0的Task）
-	readyTasks := dagInstance.GetReadyTasks()
-	addedCount := 0
-	for _, taskID := range readyTasks {
-		if t, exists := wf.GetTasks()[taskID]; exists {
-			manager.candidateNodes.Store(taskID, t)
-			addedCount++
-		} else {
-			log.Printf("⚠️ WorkflowInstance %s: 初始化时发现任务 %s 在DAG中但不在Workflow中", instance.ID, taskID)
-		}
-	}
+	// 初始化readyTasksSet（根节点，入度为0的Task）
+	manager.initReadyTasksSet()
 
-	// 验证初始化：检查所有任务是否都被正确添加到 candidateNodes
+	// 验证初始化：检查所有任务是否都被正确添加到 readyTasksSet
 	totalTasks := len(wf.GetTasks())
-	missingTasks := make([]string, 0)
+	readyTasks := dagInstance.GetReadyTasks()
+	readyCount := 0
+	manager.readyTasksSet.Range(func(key, value interface{}) bool {
+		readyCount++
+		return true
+	})
 
-	// 检查所有没有依赖的任务是否都被添加到 candidateNodes
-	for taskID, t := range wf.GetTasks() {
-		deps := t.GetDependencies()
-		// 如果没有依赖，应该是根节点，应该被添加到 candidateNodes
-		if len(deps) == 0 {
-			if _, exists := manager.candidateNodes.Load(taskID); !exists {
-				missingTasks = append(missingTasks, fmt.Sprintf("%s (%s)", taskID, t.GetName()))
-			}
-		}
-	}
-
-	log.Printf("✅ WorkflowInstance %s: 初始化完成，总任务数: %d, 就绪任务数: %d, 已添加到 candidateNodes: %d",
-		instance.ID, totalTasks, len(readyTasks), addedCount)
+	log.Printf("✅ WorkflowInstance %s: 初始化完成，总任务数: %d, 就绪任务数: %d, 已添加到 readyTasksSet: %d",
+		instance.ID, totalTasks, len(readyTasks), readyCount)
 
 	return manager, nil
 }
@@ -222,8 +208,8 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 
 				// 再次检查任务是否已被处理（防止并发问题：任务在执行过程中被标记为已处理）
 				if _, processed := m.processedNodes.Load(taskID); processed {
-					// 任务已被处理，从candidateNodes中删除并跳过
-					m.candidateNodes.Delete(taskID)
+					// 任务已被处理，从就绪任务集合中删除并跳过
+					m.readyTasksSet.Delete(taskID)
 					continue
 				}
 
@@ -268,18 +254,18 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 				if err := m.executor.SubmitTask(pendingTask); err != nil {
 					log.Printf("❌ WorkflowInstance %s: 提交Task到Executor失败: TaskID=%s, TaskName=%s, Error=%v",
 						m.instance.ID, taskID, taskName, err)
-					// 提交失败，需要回滚：将任务重新添加到 candidateNodes，以便重试
+					// 提交失败，需要回滚：将任务重新添加到就绪任务集合，以便重试
 					// 注意：任务已经保存到数据库，但还没有被标记为已处理
 					// 不更新数据库状态，只在instance完成/保存breakpoint/被取消时批量保存
-					m.candidateNodes.Store(taskID, t)
+					m.readyTasksSet.Store(taskID, t)
 					continue
 				}
 
-				// 提交成功，从 candidateNodes 中删除（但不标记为已处理，等任务真正完成后再标记）
+				// 提交成功，从就绪任务集合中删除（但不标记为已处理，等任务真正完成后再标记）
 				// 注意：任务被提交到Executor后，会在异步执行完成后通过OnComplete/OnError回调更新状态
 				// 我们不应该在这里标记为已处理，因为任务可能还在Executor队列中等待执行
 				// 不更新数据库状态，只在instance完成/保存breakpoint/被取消时批量保存
-				m.candidateNodes.Delete(taskID)
+				m.readyTasksSet.Delete(taskID)
 			}
 		}
 	}
@@ -379,33 +365,100 @@ func (m *WorkflowInstanceManager) handleTerminate() {
 	log.Printf("WorkflowInstance %s: 已终止", m.instance.ID)
 }
 
-// getAvailableTasks 获取可执行的任务列表（优化版：使用 DAG 获取就绪任务）
+// initReadyTasksSet 初始化就绪任务集合（内部方法）
+func (m *WorkflowInstanceManager) initReadyTasksSet() {
+	m.readyTasksMu.Lock()
+	defer m.readyTasksMu.Unlock()
+
+	readyTaskIDs := m.dag.GetReadyTasks()
+	for _, taskID := range readyTaskIDs {
+		if task, exists := m.workflow.GetTasks()[taskID]; exists {
+			m.readyTasksSet.Store(taskID, task)
+		}
+	}
+}
+
+// checkAndAddToReady 检查并添加任务到就绪集合（复合操作，需要锁保护）
+func (m *WorkflowInstanceManager) checkAndAddToReady(childID string) {
+	m.readyTasksMu.Lock()
+	defer m.readyTasksMu.Unlock()
+
+	// 双重检查：在锁内再次检查是否已存在
+	if _, exists := m.readyTasksSet.Load(childID); exists {
+		return
+	}
+
+	// 检查所有父节点是否都已完成
+	parents, err := m.dag.GetParents(childID)
+	if err != nil {
+		return
+	}
+
+	allParentsProcessed := true
+	for _, parentID := range parents {
+		if _, processed := m.processedNodes.Load(parentID); !processed {
+			allParentsProcessed = false
+			break
+		}
+	}
+
+	// 如果所有父节点都已完成，添加到就绪集合
+	if allParentsProcessed {
+		if task, exists := m.workflow.GetTasks()[childID]; exists {
+			m.readyTasksSet.Store(childID, task)
+		}
+	}
+}
+
+// onTaskCompleted 任务完成时更新就绪集合（内部方法）
+func (m *WorkflowInstanceManager) onTaskCompleted(taskID string) {
+	// 从就绪集合中删除已完成的任务
+	m.readyTasksSet.Delete(taskID)
+
+	// 检查下游任务是否可以就绪
+	children, err := m.dag.GetChildren(taskID)
+	if err != nil {
+		return
+	}
+
+	for _, childID := range children {
+		m.checkAndAddToReady(childID)
+	}
+}
+
+// getAvailableTasks 获取可执行的任务列表（优化版：使用 readyTasksSet，O(1)访问）
 func (m *WorkflowInstanceManager) getAvailableTasks() []workflow.Task {
 	var available []workflow.Task
 
-	// 使用 DAG 获取当前就绪的任务（入度为0的节点）
-	readyTaskIDs := m.dag.GetReadyTasks()
+	// 使用读锁保护 Range 操作，确保遍历时的一致性
+	m.readyTasksMu.RLock()
+	m.readyTasksSet.Range(func(key, value interface{}) bool {
+		taskID := key.(string)
+		task := value.(workflow.Task)
 
-	for _, taskID := range readyTaskIDs {
-		// 检查是否已处理
+		// 检查是否已处理 - O(1)
 		if _, processed := m.processedNodes.Load(taskID); processed {
-			continue
+			// 跳过已处理的任务，稍后删除
+			return true
 		}
 
-		// 获取任务实例
-		task, exists := m.workflow.GetTasks()[taskID]
-		if !exists {
-			// 任务不在 workflow 中，可能是动态任务或已删除
-			continue
-		}
-
-		// 执行参数校验和resultMapping（业务逻辑）
+		// 参数校验 - O(D)，业务逻辑无法避免
 		if err := m.validateAndMapParams(task, taskID); err != nil {
 			log.Printf("参数校验失败: TaskID=%s, Error=%v", taskID, err)
-			continue
+			return true
 		}
 
 		available = append(available, task)
+		return true
+	})
+	m.readyTasksMu.RUnlock()
+
+	// 在锁外删除已处理的任务（避免在 Range 中修改）
+	for _, task := range available {
+		taskID := task.GetID()
+		if _, processed := m.processedNodes.Load(taskID); processed {
+			m.readyTasksSet.Delete(taskID)
+		}
 	}
 
 	return available
@@ -604,39 +657,20 @@ func (m *WorkflowInstanceManager) isAllTasksCompleted() bool {
 		return false
 	}
 
-	// 还需要检查是否有任务在候选队列中但未处理
-	hasUnprocessedCandidate := false
-	m.candidateNodes.Range(func(key, value interface{}) bool {
+	// 还需要检查是否有任务在就绪任务集合中但未处理
+	hasUnprocessedReady := false
+	m.readyTasksSet.Range(func(key, value interface{}) bool {
 		taskID := key.(string)
 		if _, processed := m.processedNodes.Load(taskID); !processed {
-			hasUnprocessedCandidate = true
+			hasUnprocessedReady = true
 			return false // 停止遍历
 		}
 		return true
 	})
 
-	// 如果有未处理的候选任务，说明还有任务未完成
-	if hasUnprocessedCandidate {
+	// 如果有未处理的就绪任务，说明还有任务未完成
+	if hasUnprocessedReady {
 		return false
-	}
-
-	// 额外检查：从数据库查询实际的任务状态，确保所有任务都已完成
-	// 这对于大型工作流很重要，因为可能存在任务还没有被提交到执行队列的情况
-	ctx := context.Background()
-	taskInstances, err := m.taskRepo.GetByWorkflowInstanceID(ctx, m.instance.ID)
-	if err == nil {
-		// 检查是否有待处理或运行中的任务
-		for _, ti := range taskInstances {
-			if ti.Status == "Pending" || ti.Status == "Running" {
-				log.Printf("WorkflowInstance %s: 发现任务 %s 状态为 %s，尚未完成", m.instance.ID, ti.ID, ti.Status)
-				return false
-			}
-		}
-		// 检查任务数量是否匹配（可能有些任务还没有被创建到数据库）
-		if len(taskInstances) < totalTasks {
-			log.Printf("WorkflowInstance %s: 数据库中的任务数 (%d) 少于工作流中的任务数 (%d)，可能还有任务未创建", m.instance.ID, len(taskInstances), totalTasks)
-			return false
-		}
 	}
 
 	return true
@@ -720,8 +754,8 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 			}
 		}
 
-		// 检查是否已在候选队列
-		if _, exists := m.candidateNodes.Load(taskID); exists {
+		// 检查是否已在就绪任务集合
+		if _, exists := m.readyTasksSet.Load(taskID); exists {
 			skippedInQueue++
 			continue
 		}
@@ -763,20 +797,21 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 				log.Printf("⚠️ WorkflowInstance %s: 任务 %s (%s) 在恢复过程中被标记为已处理，跳过", m.instance.ID, taskID, ti.Name)
 				continue
 			}
-			// 再次检查任务是否已在候选队列（防止并发问题）
-			if _, exists := m.candidateNodes.Load(taskID); exists {
+			// 再次检查任务是否已在就绪任务集合（防止并发问题）
+			if _, exists := m.readyTasksSet.Load(taskID); exists {
 				skippedInQueue++
-				log.Printf("⚠️ WorkflowInstance %s: 任务 %s (%s) 在恢复过程中被添加到候选队列，跳过", m.instance.ID, taskID, ti.Name)
+				log.Printf("⚠️ WorkflowInstance %s: 任务 %s (%s) 在恢复过程中被添加到就绪任务集合，跳过", m.instance.ID, taskID, ti.Name)
 				continue
 			}
-			m.candidateNodes.Store(taskID, t)
+			// 添加到就绪任务集合
+			m.readyTasksSet.Store(taskID, t)
 			recoveredCount++
 			// 如果任务状态是Failed，重置为Pending以便重试
 			if ti.Status == "Failed" {
 				_ = m.taskRepo.UpdateStatus(ctx, taskID, "Pending")
-				log.Printf("✅ WorkflowInstance %s: 恢复Failed任务 %s (%s) 到候选队列并重置为Pending", m.instance.ID, taskID, ti.Name)
+				log.Printf("✅ WorkflowInstance %s: 恢复Failed任务 %s (%s) 到就绪任务集合并重置为Pending", m.instance.ID, taskID, ti.Name)
 			} else {
-				log.Printf("✅ WorkflowInstance %s: 恢复Pending任务 %s (%s) 到候选队列", m.instance.ID, taskID, ti.Name)
+				log.Printf("✅ WorkflowInstance %s: 恢复Pending任务 %s (%s) 到就绪任务集合", m.instance.ID, taskID, ti.Name)
 			}
 		} else {
 			skippedDepsNotMet++
@@ -939,11 +974,11 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 		}
 	}
 
-	// 3. 重新计算候选节点（基于已完成的Task）
-	// 注意：由于现在使用 DAG.GetReadyTasks() 来获取就绪任务，这里只需要初始化 candidateNodes
-	// 实际的就绪任务会在下次调用 getAvailableTasks() 时通过 DAG 自动获取
-	// 但为了向后兼容和恢复场景，我们仍然可以预先填充一些就绪任务
-	m.candidateNodes = sync.Map{}
+	// 3. 重新初始化就绪任务集合（基于已完成的Task）
+	// 清空现有的就绪任务集合
+	m.readyTasksMu.Lock()
+	m.readyTasksSet = sync.Map{}
+	m.readyTasksMu.Unlock()
 
 	// 使用 DAG 获取当前就绪的任务（基于已完成的节点，DAG 会自动计算入度）
 	readyTasks := m.dag.GetReadyTasks()
@@ -962,7 +997,7 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 				}
 				if allParentsProcessed {
 					if t, exists := m.workflow.GetTasks()[taskID]; exists {
-						m.candidateNodes.Store(taskID, t)
+						m.readyTasksSet.Store(taskID, t)
 					}
 				}
 			}
@@ -1034,12 +1069,10 @@ func (m *WorkflowInstanceManager) createTaskCompleteHandler(taskID string) func(
 
 		// 更新DAG入度（go-dag 自动管理，这里保留用于兼容性）
 		// 注意：DAG 的入度是自动管理的，当任务完成时，下游节点的入度会自动更新
-		// 下次调用 getAvailableTasks() 时会通过 dag.GetReadyTasks() 自动包含新的就绪节点
 		m.dag.UpdateInDegree(taskID)
 
-		// 注意：由于现在使用 DAG.GetReadyTasks() 来获取就绪任务，不再需要手动维护 candidateNodes
-		// 但为了支持动态任务和向后兼容，保留 candidateNodes 的清理逻辑
-		m.candidateNodes.Delete(taskID)
+		// 更新就绪任务集合：从集合中删除已完成的任务，并检查下游任务是否可以就绪
+		m.onTaskCompleted(taskID)
 
 		// 保存结果数据到上下文
 		if result.Data != nil {
@@ -1113,6 +1146,10 @@ func (m *WorkflowInstanceManager) createTaskErrorHandler(taskID string) func(err
 				log.Printf("执行Task Handler失败: Task=%s, Status=Failed, Error=%v", taskID, handlerErr)
 			}
 		}
+
+		// 更新就绪任务集合：从集合中删除已失败的任务，并检查下游任务是否可以就绪
+		// 注意：失败的任务也会标记为已处理，但下游任务仍然可以继续执行（如果依赖已满足）
+		m.onTaskCompleted(taskID)
 
 		// 标记WorkflowInstance为Failed
 		m.mu.Lock()
@@ -1279,10 +1316,10 @@ func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID
 		}
 	}
 
-	// 如果子任务的依赖已满足，加入候选队列
+	// 如果子任务的依赖已满足，加入就绪任务集合
 	if allDepsProcessed {
-		m.candidateNodes.Store(subTask.GetID(), subTask)
-		log.Printf("WorkflowInstance %s: 子任务 %s 已添加，依赖已满足，加入候选队列", m.instance.ID, subTask.GetName())
+		m.readyTasksSet.Store(subTask.GetID(), subTask)
+		log.Printf("WorkflowInstance %s: 子任务 %s 已添加，依赖已满足，加入就绪任务集合", m.instance.ID, subTask.GetName())
 	} else {
 		log.Printf("WorkflowInstance %s: 子任务 %s 已添加，等待依赖满足（父任务: %s）", m.instance.ID, subTask.GetName(), parentTaskID)
 	}
