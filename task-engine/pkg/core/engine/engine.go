@@ -11,6 +11,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/builder"
 	"github.com/stevelan1995/task-engine/pkg/core/executor"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
@@ -37,8 +38,8 @@ type Engine struct {
 	running              bool
 	MaxConcurrency       int
 	Timeout              int
-	managers             map[string]*WorkflowInstanceManager    // WorkflowInstance ID -> Manager映射
-	controllers          map[string]workflow.WorkflowController // WorkflowInstance ID -> Controller映射
+	managers             map[string]types.WorkflowInstanceManager // WorkflowInstance ID -> Manager映射
+	controllers          map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
 	mu                   sync.RWMutex
 }
 
@@ -85,7 +86,7 @@ func NewEngineWithRepos(
 		MaxConcurrency:       maxConcurrency,
 		Timeout:              timeout,
 		running:              false,
-		managers:             make(map[string]*WorkflowInstanceManager),
+		managers:             make(map[string]types.WorkflowInstanceManager),
 		controllers:          make(map[string]workflow.WorkflowController),
 	}, nil
 }
@@ -163,7 +164,7 @@ func (e *Engine) GetInstanceManager(instanceID string) (interface{}, error) {
 
 // InstanceManagerInterface 暴露给Handler的Manager接口，避免循环引用
 type InstanceManagerInterface struct {
-	manager *WorkflowInstanceManager
+	manager types.WorkflowInstanceManager
 }
 
 // AddSubTask 添加子任务（对外导出）
@@ -285,7 +286,7 @@ func (e *Engine) Stop() {
 
 	// 2. 通知所有WorkflowInstance准备关闭（发送Terminate信号）
 	e.mu.RLock()
-	instances := make([]*WorkflowInstanceManager, 0, len(e.managers))
+	instances := make([]types.WorkflowInstanceManager, 0, len(e.managers))
 	for _, manager := range e.managers {
 		instances = append(instances, manager)
 	}
@@ -293,11 +294,17 @@ func (e *Engine) Stop() {
 
 	// 发送Terminate信号到所有实例
 	for _, manager := range instances {
+		// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
+		controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
+		if !ok {
+			log.Printf("WorkflowInstance %s 控制信号通道类型转换失败", manager.GetInstanceID())
+			continue
+		}
 		select {
-		case manager.GetControlSignalChannel() <- workflow.SignalTerminate:
+		case controlChan <- workflow.SignalTerminate:
 		default:
 			// channel已满，记录日志
-			log.Printf("WorkflowInstance %s 控制信号channel已满，跳过", manager.instance.ID)
+			log.Printf("WorkflowInstance %s 控制信号channel已满，跳过", manager.GetInstanceID())
 		}
 	}
 
@@ -323,19 +330,24 @@ func (e *Engine) Stop() {
 	// 4. 保存所有Running状态的WorkflowInstance的断点数据
 	ctx := context.Background()
 	for _, manager := range instances {
-		manager.mu.RLock()
-		status := manager.instance.Status
-		manager.mu.RUnlock()
+		status := manager.GetStatus()
 
 		if status == "Running" {
 			// 记录断点数据
-			breakpoint := manager.createBreakpoint()
-			if err := e.workflowInstanceRepo.UpdateBreakpoint(ctx, manager.instance.ID, breakpoint); err != nil {
-				log.Printf("保存WorkflowInstance %s 断点数据失败: %v", manager.instance.ID, err)
+			breakpointValue := manager.CreateBreakpoint()
+			// 类型转换：从 interface{} 转换为 *workflow.BreakpointData
+			breakpoint, ok := breakpointValue.(*workflow.BreakpointData)
+			if !ok {
+				log.Printf("WorkflowInstance %s 断点数据类型转换失败", manager.GetInstanceID())
+				continue
+			}
+			instanceID := manager.GetInstanceID()
+			if err := e.workflowInstanceRepo.UpdateBreakpoint(ctx, instanceID, breakpoint); err != nil {
+				log.Printf("保存WorkflowInstance %s 断点数据失败: %v", instanceID, err)
 			}
 			// 更新状态为Paused（而不是Terminated，便于恢复）
-			if err := e.workflowInstanceRepo.UpdateStatus(ctx, manager.instance.ID, "Paused"); err != nil {
-				log.Printf("更新WorkflowInstance %s 状态失败: %v", manager.instance.ID, err)
+			if err := e.workflowInstanceRepo.UpdateStatus(ctx, instanceID, "Paused"); err != nil {
+				log.Printf("更新WorkflowInstance %s 状态失败: %v", instanceID, err)
 			}
 		}
 	}
@@ -345,7 +357,7 @@ func (e *Engine) Stop() {
 
 	// 6. 清理内存映射
 	e.mu.Lock()
-	e.managers = make(map[string]*WorkflowInstanceManager)
+	e.managers = make(map[string]types.WorkflowInstanceManager)
 	e.controllers = make(map[string]workflow.WorkflowController)
 	e.mu.Unlock()
 
@@ -667,7 +679,12 @@ func (e *Engine) PauseWorkflowInstance(ctx context.Context, instanceID string) e
 	}
 
 	// 发送暂停信号
-	manager.GetControlSignalChannel() <- workflow.SignalPause
+	// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
+	controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
+	if !ok {
+		return fmt.Errorf("WorkflowInstance %s 控制信号通道类型转换失败", instanceID)
+	}
+	controlChan <- workflow.SignalPause
 
 	log.Printf("✅ WorkflowInstance %s 已发送暂停信号", instanceID)
 	return nil
@@ -721,7 +738,12 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 	}
 
 	// 发送恢复信号
-	manager.GetControlSignalChannel() <- workflow.SignalResume
+	// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
+	controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
+	if !ok {
+		return fmt.Errorf("WorkflowInstance %s 控制信号通道类型转换失败", instanceID)
+	}
+	controlChan <- workflow.SignalResume
 
 	log.Printf("✅ WorkflowInstance %s 已发送恢复信号", instanceID)
 	return nil
@@ -736,9 +758,7 @@ func (e *Engine) TerminateWorkflowInstance(ctx context.Context, instanceID strin
 	// 先检查当前状态
 	var currentStatus string
 	if exists {
-		manager.mu.RLock()
-		currentStatus = manager.instance.Status
-		manager.mu.RUnlock()
+		currentStatus = manager.GetStatus()
 	} else {
 		// 从数据库加载
 		instance, err := e.workflowInstanceRepo.GetByID(ctx, instanceID)
@@ -773,7 +793,12 @@ func (e *Engine) TerminateWorkflowInstance(ctx context.Context, instanceID strin
 	}
 
 	// 发送终止信号
-	manager.GetControlSignalChannel() <- workflow.SignalTerminate
+	// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
+	controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
+	if !ok {
+		return fmt.Errorf("WorkflowInstance %s 控制信号通道类型转换失败", instanceID)
+	}
+	controlChan <- workflow.SignalTerminate
 
 	log.Printf("✅ WorkflowInstance %s 已发送终止信号，原因: %s", instanceID, reason)
 	return nil
@@ -787,10 +812,7 @@ func (e *Engine) GetWorkflowInstanceStatus(ctx context.Context, instanceID strin
 
 	if exists {
 		// 从manager获取状态
-		manager.mu.RLock()
-		status := manager.instance.Status
-		manager.mu.RUnlock()
-		return status, nil
+		return manager.GetStatus(), nil
 	}
 
 	// 从数据库加载
@@ -807,7 +829,7 @@ func (e *Engine) GetWorkflowInstanceStatus(ctx context.Context, instanceID strin
 
 // forwardStatusUpdates 转发状态更新（内部方法）
 // 将Manager的状态更新转发到Controller，使Controller能够等待状态变更确认
-func (e *Engine) forwardStatusUpdates(instanceID string, manager *WorkflowInstanceManager, controller workflow.WorkflowController) {
+func (e *Engine) forwardStatusUpdates(instanceID string, manager types.WorkflowInstanceManager, controller workflow.WorkflowController) {
 	// 获取Manager的状态更新通道
 	managerStatusChan := manager.GetStatusUpdateChannel()
 
@@ -818,7 +840,7 @@ func (e *Engine) forwardStatusUpdates(instanceID string, manager *WorkflowInstan
 			// 通过Controller的UpdateStatus方法更新状态
 			// UpdateStatus现在是接口方法，可以直接调用
 			controller.UpdateStatus(status)
-		case <-manager.ctx.Done():
+		case <-manager.Context().Done():
 			// Manager已关闭，退出转发协程
 			return
 		}

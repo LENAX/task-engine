@@ -104,7 +104,7 @@ func NewWorkflowInstanceManager(
 	return manager, nil
 }
 
-// Start 启动WorkflowInstance执行（内部方法）
+// Start 启动WorkflowInstance执行（公共方法，实现接口）
 func (m *WorkflowInstanceManager) Start() {
 	// 更新状态为Running
 	m.mu.Lock()
@@ -183,6 +183,7 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 				// 注意：这个调用比较昂贵，所以只在没有可用任务且可能还有未完成任务时才调用
 				if !m.isAllTasksCompleted() {
 					// 可能还有未完成的任务，尝试恢复
+					log.Printf("WorkflowInstance %s: 可能还有未完成的任务，尝试恢复", m.instance.ID)
 					m.recoverPendingTasks()
 					// 恢复后再次检查
 					availableTasks = m.getAvailableTasks()
@@ -336,7 +337,13 @@ func (m *WorkflowInstanceManager) handlePause() {
 	m.saveAllTaskStatuses(ctx)
 
 	// 记录断点数据
-	breakpoint := m.createBreakpoint()
+	breakpointValue := m.CreateBreakpoint()
+	// 类型转换：从 interface{} 转换为 *workflow.BreakpointData
+	breakpoint, ok := breakpointValue.(*workflow.BreakpointData)
+	if !ok {
+		log.Printf("WorkflowInstance %s 断点数据类型转换失败", m.instance.ID)
+		return
+	}
 	m.workflowInstanceRepo.UpdateBreakpoint(ctx, m.instance.ID, breakpoint)
 	m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Paused")
 
@@ -1059,8 +1066,8 @@ func (m *WorkflowInstanceManager) saveAllTaskStatuses(ctx context.Context) {
 	}
 }
 
-// createBreakpoint 创建断点数据
-func (m *WorkflowInstanceManager) createBreakpoint() *workflow.BreakpointData {
+// CreateBreakpoint 创建断点数据（公共方法，实现接口）
+func (m *WorkflowInstanceManager) CreateBreakpoint() interface{} {
 	completedTaskNames := make([]string, 0)
 	m.processedNodes.Range(func(key, value interface{}) bool {
 		taskID := key.(string)
@@ -1095,15 +1102,26 @@ func (m *WorkflowInstanceManager) createBreakpoint() *workflow.BreakpointData {
 	}
 }
 
-// RestoreFromBreakpoint 从断点数据恢复WorkflowInstance状态（内部方法）
-func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.BreakpointData) error {
+// GetControlSignalChannelTyped 获取控制信号通道（类型化版本，供内部使用）
+func (m *WorkflowInstanceManager) GetControlSignalChannelTyped() chan<- workflow.ControlSignal {
+	return m.controlSignalChan
+}
+
+// RestoreFromBreakpoint 从断点数据恢复WorkflowInstance状态（公共方法，实现接口）
+func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint interface{}) error {
 	if breakpoint == nil {
 		return nil
 	}
 
+	// 类型转换：从 interface{} 转换为 *workflow.BreakpointData
+	bp, ok := breakpoint.(*workflow.BreakpointData)
+	if !ok {
+		return fmt.Errorf("断点数据类型错误，期望 *workflow.BreakpointData")
+	}
+
 	// 1. 恢复已完成的Task列表
 	m.processedNodes = sync.Map{}
-	for _, taskName := range breakpoint.CompletedTaskNames {
+	for _, taskName := range bp.CompletedTaskNames {
 		if taskID, exists := m.workflow.GetTaskIDByName(taskName); exists {
 			m.processedNodes.Store(taskID, true)
 		}
@@ -1111,8 +1129,8 @@ func (m *WorkflowInstanceManager) RestoreFromBreakpoint(breakpoint *workflow.Bre
 
 	// 2. 恢复上下文数据
 	m.contextData = sync.Map{}
-	if breakpoint.ContextData != nil {
-		for k, v := range breakpoint.ContextData {
+	if bp.ContextData != nil {
+		for k, v := range bp.ContextData {
 			m.contextData.Store(k, v)
 		}
 	}
@@ -1306,18 +1324,18 @@ func (m *WorkflowInstanceManager) createTaskErrorHandler(taskID string) func(err
 	}
 }
 
-// GetControlSignalChannel 获取控制信号通道（内部方法）
-func (m *WorkflowInstanceManager) GetControlSignalChannel() chan<- workflow.ControlSignal {
+// GetControlSignalChannel 获取控制信号通道（公共方法，实现接口）
+func (m *WorkflowInstanceManager) GetControlSignalChannel() interface{} {
 	return m.controlSignalChan
 }
 
-// GetStatusUpdateChannel 获取状态更新通道（内部方法）
+// GetStatusUpdateChannel 获取状态更新通道（公共方法，实现接口）
 // 用于Engine转发状态更新到Controller
 func (m *WorkflowInstanceManager) GetStatusUpdateChannel() <-chan string {
 	return m.statusUpdateChan
 }
 
-// AddSubTask 动态添加子任务到WorkflowInstance（内部方法）
+// AddSubTask 动态添加子任务到WorkflowInstance（公共方法，实现接口）
 // subTask: 动态生成的子Task
 // parentTaskID: 父Task ID
 func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID string) error {
@@ -1471,7 +1489,7 @@ func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID
 	return nil
 }
 
-// Shutdown 优雅关闭WorkflowInstanceManager（内部方法）
+// Shutdown 优雅关闭WorkflowInstanceManager（公共方法，实现接口）
 // 取消context，等待所有协程完成
 func (m *WorkflowInstanceManager) Shutdown() {
 	// 取消context，通知所有协程退出
@@ -1492,4 +1510,23 @@ func (m *WorkflowInstanceManager) Shutdown() {
 		// 超时，记录日志
 		log.Printf("WorkflowInstance %s: 等待协程退出超时", m.instance.ID)
 	}
+}
+
+// GetInstanceID 获取WorkflowInstance ID（公共方法，实现接口）
+func (m *WorkflowInstanceManager) GetInstanceID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.instance.ID
+}
+
+// GetStatus 获取WorkflowInstance状态（公共方法，实现接口）
+func (m *WorkflowInstanceManager) GetStatus() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.instance.Status
+}
+
+// Context 获取context（公共方法，实现接口）
+func (m *WorkflowInstanceManager) Context() context.Context {
+	return m.ctx
 }
