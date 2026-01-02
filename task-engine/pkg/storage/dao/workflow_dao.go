@@ -16,4 +16,5 @@ type WorkflowDAO struct {
 	SubTaskErrorTolerance float64   `db:"sub_task_error_tolerance"` // 子任务错误容忍度（0-1），默认0
 	Transactional        bool      `db:"transactional"`             // 是否启用事务（预留字段）
 	TransactionMode      string    `db:"transaction_mode"`           // 事务模式（预留字段）
+	MaxConcurrentTask     int       `db:"max_concurrent_task"`       // 最大并发任务数，默认10
 }

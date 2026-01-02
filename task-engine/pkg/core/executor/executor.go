@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -239,16 +238,10 @@ func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 
 	e.mu.RLock()
 	running := e.running
-	queueLen := len(e.taskQueue)
+	// queueLen := len(e.taskQueue) // 相关debuglog已去除
 	e.mu.RUnlock()
 
-	// #region agent log
-	logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if logFile != nil {
-		fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:231","message":"SubmitTask调用","data":{"taskID":"%s","taskName":"%s","running":%t,"queueLen":%d},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName(), running, queueLen)
-		logFile.Close()
-	}
-	// #endregion
+	// agentlog已清理
 
 	if !running {
 		return fmt.Errorf("Executor未运行")
@@ -257,13 +250,7 @@ func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 	// 提交到任务队列（阻塞等待，直到有空间或Executor关闭）
 	select {
 	case e.taskQueue <- pendingTask:
-		// #region agent log
-		logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if logFile != nil {
-			fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:249","message":"任务已加入taskQueue","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
-			logFile.Close()
-		}
-		// #endregion
+		// agentlog已清理
 		return nil
 	case <-e.shutdown:
 		return fmt.Errorf("Executor已关闭")
@@ -279,13 +266,7 @@ func (e *Executor) scheduler() {
 				// 任务队列已关闭
 				return
 			}
-			// #region agent log
-			logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:260","message":"scheduler从taskQueue取出任务","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
-				logFile.Close()
-			}
-			// #endregion
+			// agentlog已清理
 			// 分配任务到Worker
 			e.dispatchTask(pendingTask)
 		case <-e.shutdown:
@@ -296,16 +277,7 @@ func (e *Executor) scheduler() {
 
 // dispatchTask 分配任务到Worker（内部方法）
 func (e *Executor) dispatchTask(pendingTask *PendingTask) {
-	// #region agent log
-	logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if logFile != nil {
-		e.mu.RLock()
-		workerPoolLen := len(e.workerPool)
-		e.mu.RUnlock()
-		fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:274","message":"dispatchTask被调用","data":{"taskID":"%s","taskName":"%s","workerPoolAvailable":%d},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName(), e.maxWorkers-workerPoolLen)
-		logFile.Close()
-	}
-	// #endregion
+	// agentlog已清理
 	// 如果有业务域，使用业务域子池
 	if pendingTask.Domain != "" {
 		e.mu.RLock()
@@ -319,25 +291,13 @@ func (e *Executor) dispatchTask(pendingTask *PendingTask) {
 				pool.mu.Lock()
 				pool.current++
 				pool.mu.Unlock()
-				// #region agent log
-				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:289","message":"任务分配到domainPool worker","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
-					logFile.Close()
-				}
-				// #endregion
+				// agentlog已清理
 				e.wg.Add(1)
 				go e.executeTask(pendingTask, pool)
 				return
 			default:
 				// 业务域子池已满，回退到全局池
-				// #region agent log
-				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:292","message":"domainPool已满，回退到全局池","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
-					logFile.Close()
-				}
-				// #endregion
+				// agentlog已清理
 			}
 		}
 	}
@@ -347,19 +307,44 @@ func (e *Executor) dispatchTask(pendingTask *PendingTask) {
 	// 这可能导致任务无法及时执行，但可以确保任务最终会被执行
 	select {
 	case e.workerPool <- struct{}{}:
-		// #region agent log
-		logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if logFile != nil {
-			fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:301","message":"任务分配到全局workerPool","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}`+"\n", time.Now().UnixMilli(), pendingTask.Task.GetID(), pendingTask.Task.GetName())
-			logFile.Close()
-		}
-		// #endregion
+		// agentlog已清理
 		e.wg.Add(1)
 		go e.executeTask(pendingTask, nil)
 	case <-e.shutdown:
 		// Executor已关闭，通知任务失败
+		err := fmt.Errorf("Executor已关闭")
+		// 发送状态事件到 channel（如果提供）
+		if pendingTask.StatusChan != nil {
+			t := pendingTask.Task
+			isTemplate := false
+			isSubTask := false
+			if t != nil {
+				if taskWithFlags, ok := t.(interface {
+					IsTemplate() bool
+					IsSubTask() bool
+				}); ok {
+					isTemplate = taskWithFlags.IsTemplate()
+					isSubTask = taskWithFlags.IsSubTask()
+				}
+			}
+			event := &TaskStatusEvent{
+				TaskID:     t.GetID(),
+				Status:     "Failed",
+				Error:      err,
+				IsTemplate: isTemplate,
+				IsSubTask:  isSubTask,
+				Timestamp:  time.Now(),
+				Duration:   0,
+			}
+			select {
+			case pendingTask.StatusChan <- event:
+			default:
+				log.Printf("警告: TaskStatusEvent channel 已满，事件可能丢失: TaskID=%s", t.GetID())
+			}
+		}
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
-			pendingTask.OnError(fmt.Errorf("Executor已关闭"))
+			pendingTask.OnError(err)
 		}
 	}
 }
@@ -393,6 +378,9 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 			Error:    fmt.Errorf("Job函数注册中心未配置"),
 			Duration: time.Since(startTime).Milliseconds(),
 		}
+		// 发送状态事件到 channel（如果提供）
+		e.sendStatusEvent(pendingTask, result)
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
 			pendingTask.OnError(result.Error)
 		}
@@ -421,6 +409,9 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 			Error:    fmt.Errorf("Job函数 %s 未找到", t.GetJobFuncName()),
 			Duration: time.Since(startTime).Milliseconds(),
 		}
+		// 发送状态事件到 channel（如果提供）
+		e.sendStatusEvent(pendingTask, result)
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
 			pendingTask.OnError(result.Error)
 		}
@@ -480,29 +471,11 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 			t.SetStatus("SUCCESS")
 			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%v",
 				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, state.Data)
-			// #region agent log
-			logFile, _ := os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if logFile != nil {
-				fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:438","message":"任务执行成功，准备调用OnComplete","data":{"taskID":"%s","taskName":"%s","hasOnComplete":%t},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), t.GetID(), t.GetName(), pendingTask.OnComplete != nil)
-				logFile.Close()
-			}
-			// #endregion
+			// 发送状态事件到 channel（如果提供）
+			e.sendStatusEvent(pendingTask, result)
+			// 调用完成回调（如果提供）
 			if pendingTask.OnComplete != nil {
-				// #region agent log
-				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:439","message":"调用OnComplete回调前","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), t.GetID(), t.GetName())
-					logFile.Close()
-				}
-				// #endregion
 				pendingTask.OnComplete(result)
-				// #region agent log
-				logFile, _ = os.OpenFile("/Users/stevelan/Desktop/projects/task-engine/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if logFile != nil {
-					fmt.Fprintf(logFile, `{"timestamp":%d,"location":"executor.go:439","message":"调用OnComplete回调后","data":{"taskID":"%s","taskName":"%s"},"sessionId":"debug-session","runId":"run1","hypothesisId":"C"}`+"\n", time.Now().UnixMilli(), t.GetID(), t.GetName())
-					logFile.Close()
-				}
-				// #endregion
 			}
 		} else {
 			t.SetStatus("FAILED")
@@ -519,6 +492,9 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 				pendingTask.RetryCount++
 				e.SubmitTask(pendingTask)
 			} else {
+				// 发送状态事件到 channel（如果提供）
+				e.sendStatusEvent(pendingTask, result)
+				// 调用错误回调（如果提供）
 				if pendingTask.OnError != nil {
 					pendingTask.OnError(state.Error)
 				}
@@ -536,8 +512,62 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 			Error:    fmt.Errorf("任务执行超时（%d秒）", timeoutSeconds),
 			Duration: duration,
 		}
+		// 发送状态事件到 channel（如果提供）
+		e.sendStatusEvent(pendingTask, result)
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
 			pendingTask.OnError(result.Error)
 		}
+	}
+}
+
+// sendStatusEvent 发送任务状态事件到 channel（内部方法）
+// 如果 PendingTask 提供了 StatusChan，则将任务结果转换为事件并发送
+func (e *Executor) sendStatusEvent(pendingTask *PendingTask, result *TaskResult) {
+	if pendingTask.StatusChan == nil {
+		return
+	}
+
+	// 确定状态字符串
+	status := result.Status
+	if status == "TimeoutFailed" {
+		status = "Timeout"
+	}
+
+	// 从 Task 中获取额外信息
+	t := pendingTask.Task
+	isTemplate := false
+	isSubTask := false
+	if t != nil {
+		// 尝试获取 IsTemplate 和 IsSubTask 信息
+		// 注意：workflow.Task 接口可能没有这些方法，需要类型断言
+		if taskWithFlags, ok := t.(interface {
+			IsTemplate() bool
+			IsSubTask() bool
+		}); ok {
+			isTemplate = taskWithFlags.IsTemplate()
+			isSubTask = taskWithFlags.IsSubTask()
+		}
+	}
+
+	// 构建事件
+	event := &TaskStatusEvent{
+		TaskID:     result.TaskID,
+		Status:     status,
+		Result:     result.Data,
+		Error:      result.Error,
+		IsTemplate: isTemplate,
+		IsSubTask:  isSubTask,
+		Timestamp:  time.Now(),
+		Duration:   result.Duration,
+	}
+
+	// 非阻塞发送（避免阻塞 executor）
+	select {
+	case pendingTask.StatusChan <- event:
+		// 成功发送
+	default:
+		// channel 已满，记录警告但不阻塞
+		log.Printf("警告: TaskStatusEvent channel 已满，事件可能丢失: TaskID=%s", result.TaskID)
 	}
 }

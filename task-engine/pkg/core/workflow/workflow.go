@@ -32,7 +32,8 @@ type Workflow struct {
 	SubTaskErrorTolerance float64      `json:"sub_task_error_tolerance"` // 子任务错误容忍度（0-1），默认0
 	Transactional         bool         `json:"transactional"`            // 是否启用事务（预留字段）
 	TransactionMode       string       `json:"transaction_mode"`         // 事务模式（预留字段）
-	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode 字段
+	MaxConcurrentTask     int          `json:"max_concurrent_task"`      // 最大并发任务数，默认10
+	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode, MaxConcurrentTask 字段
 }
 
 // BreakpointData 断点数据（对外导出）
@@ -70,6 +71,7 @@ func NewWorkflow(name, desc string) *Workflow {
 		SubTaskErrorTolerance: 0.0,   // 默认值0，不允许子任务失败
 		Transactional:         false, // 默认不启用事务
 		TransactionMode:       "",    // 默认空字符串
+		MaxConcurrentTask:     10,    // 默认最大并发任务数为10
 	}
 	return wf
 }
@@ -664,4 +666,23 @@ func (w *Workflow) SetTransactionMode(mode string) {
 	w.fieldsMu.Lock()
 	defer w.fieldsMu.Unlock()
 	w.TransactionMode = mode
+}
+
+// GetMaxConcurrentTask 获取最大并发任务数（对外导出，线程安全）
+func (w *Workflow) GetMaxConcurrentTask() int {
+	w.fieldsMu.RLock()
+	defer w.fieldsMu.RUnlock()
+	return w.MaxConcurrentTask
+}
+
+// SetMaxConcurrentTask 设置最大并发任务数（对外导出，线程安全）
+// maxConcurrent: 最大并发任务数，必须大于0
+func (w *Workflow) SetMaxConcurrentTask(maxConcurrent int) error {
+	if maxConcurrent <= 0 {
+		return fmt.Errorf("最大并发任务数必须大于0，当前值: %d", maxConcurrent)
+	}
+	w.fieldsMu.Lock()
+	defer w.fieldsMu.Unlock()
+	w.MaxConcurrentTask = maxConcurrent
+	return nil
 }

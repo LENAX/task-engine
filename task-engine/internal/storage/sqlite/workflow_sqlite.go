@@ -63,7 +63,8 @@ func (r *workflowRepo) initSchema() error {
 		status TEXT NOT NULL DEFAULT 'ENABLED',
 		sub_task_error_tolerance REAL NOT NULL DEFAULT 0.0,
 		transactional INTEGER NOT NULL DEFAULT 0,
-		transaction_mode TEXT DEFAULT ''
+		transaction_mode TEXT DEFAULT '',
+		max_concurrent_task INTEGER NOT NULL DEFAULT 10
 	);
 	`
 	_, err := r.db.Exec(createTableSQL)
@@ -77,6 +78,7 @@ func (r *workflowRepo) initSchema() error {
 		`ALTER TABLE workflow_definition ADD COLUMN sub_task_error_tolerance REAL NOT NULL DEFAULT 0.0`,
 		`ALTER TABLE workflow_definition ADD COLUMN transactional INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE workflow_definition ADD COLUMN transaction_mode TEXT DEFAULT ''`,
+		`ALTER TABLE workflow_definition ADD COLUMN max_concurrent_task INTEGER NOT NULL DEFAULT 10`,
 	}
 
 	for _, alterSQL := range alterSQLs {
@@ -122,11 +124,12 @@ func (r *workflowRepo) Save(ctx context.Context, wf *workflow.Workflow) error {
 		SubTaskErrorTolerance: wf.GetSubTaskErrorTolerance(),
 		Transactional:         wf.GetTransactional(),
 		TransactionMode:       wf.GetTransactionMode(),
+		MaxConcurrentTask:      wf.GetMaxConcurrentTask(),
 	}
 
 	query := `
-	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode)
-	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status, :sub_task_error_tolerance, :transactional, :transaction_mode)
+	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode, max_concurrent_task)
+	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status, :sub_task_error_tolerance, :transactional, :transaction_mode, :max_concurrent_task)
 	`
 	_, err = r.db.NamedExecContext(ctx, query, dao)
 	if err != nil {
@@ -176,11 +179,12 @@ func (r *workflowRepo) SaveWithTasks(ctx context.Context, wf *workflow.Workflow,
 		SubTaskErrorTolerance: wf.GetSubTaskErrorTolerance(),
 		Transactional:         wf.GetTransactional(),
 		TransactionMode:       wf.GetTransactionMode(),
+		MaxConcurrentTask:      wf.GetMaxConcurrentTask(),
 	}
 
 	query := `
-	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode)
-	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status, :sub_task_error_tolerance, :transactional, :transaction_mode)
+	INSERT OR REPLACE INTO workflow_definition (id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode, max_concurrent_task)
+	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status, :sub_task_error_tolerance, :transactional, :transaction_mode, :max_concurrent_task)
 	`
 	_, err = tx.NamedExecContext(ctx, query, workflowDAO)
 	if err != nil {
@@ -265,7 +269,7 @@ func (r *workflowRepo) SaveWithTasks(ctx context.Context, wf *workflow.Workflow,
 // GetByID 实现存储接口（内部实现）
 func (r *workflowRepo) GetByID(ctx context.Context, id string) (*workflow.Workflow, error) {
 	var dao dao.WorkflowDAO
-	query := `SELECT id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode FROM workflow_definition WHERE id = ?`
+	query := `SELECT id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, transactional, transaction_mode, max_concurrent_task FROM workflow_definition WHERE id = ?`
 	err := r.db.GetContext(ctx, &dao, query, id)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
@@ -314,6 +318,9 @@ func (r *workflowRepo) GetByID(ctx context.Context, id string) (*workflow.Workfl
 		return nil, fmt.Errorf("设置事务模式失败: %w", err)
 	}
 	wf.SetTransactionMode(dao.TransactionMode)
+	if err := wf.SetMaxConcurrentTask(dao.MaxConcurrentTask); err != nil {
+		return nil, fmt.Errorf("设置最大并发任务数失败: %w", err)
+	}
 	// 注意：Tasks需要从其他地方加载，这里只加载定义
 
 	return wf, nil
