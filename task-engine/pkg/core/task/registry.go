@@ -11,8 +11,8 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
 
-// 统一函数注册中心（对外导出）
-type FunctionRegistry struct {
+// functionRegistryImpl 函数注册中心实现（内部实现）
+type functionRegistryImpl struct {
 	mu              sync.RWMutex
 	functions       map[string]JobFunctionType          // Job函数ID -> 包装后的Job函数
 	metaMap         map[string]*storage.JobFunctionMeta // Job函数ID -> 元数据（用于快速查找）
@@ -25,8 +25,8 @@ type FunctionRegistry struct {
 }
 
 // NewFunctionRegistry 创建函数注册中心（对外导出）
-func NewFunctionRegistry(jobFunctionRepo storage.JobFunctionRepository, taskHandlerRepo storage.TaskHandlerRepository) *FunctionRegistry {
-	return &FunctionRegistry{
+func NewFunctionRegistry(jobFunctionRepo storage.JobFunctionRepository, taskHandlerRepo storage.TaskHandlerRepository) FunctionRegistry {
+	return &functionRegistryImpl{
 		functions:       make(map[string]JobFunctionType),
 		metaMap:         make(map[string]*storage.JobFunctionMeta),
 		taskHandlers:    make(map[string]TaskHandlerType),
@@ -53,7 +53,7 @@ func generateFunctionName(fn interface{}) string {
 // fn: 用户自定义函数，首个参数必须是context.Context
 // description: 函数描述（可选）
 // 返回: 函数ID和错误
-func (r *FunctionRegistry) Register(ctx context.Context, name string, fn interface{}, description string) (string, error) {
+func (r *functionRegistryImpl) Register(ctx context.Context, name string, fn interface{}, description string) (string, error) {
 	// 如果名称为空，自动生成
 	if name == "" {
 		name = generateFunctionName(fn)
@@ -127,14 +127,14 @@ func (r *FunctionRegistry) Register(ctx context.Context, name string, fn interfa
 }
 
 // Get 根据函数ID获取包装后的函数（对外导出）
-func (r *FunctionRegistry) Get(funcID string) JobFunctionType {
+func (r *functionRegistryImpl) Get(funcID string) JobFunctionType {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.functions[funcID]
 }
 
 // GetByName 根据函数名获取包装后的函数（对外导出）
-func (r *FunctionRegistry) GetByName(name string) JobFunctionType {
+func (r *functionRegistryImpl) GetByName(name string) JobFunctionType {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -148,14 +148,14 @@ func (r *FunctionRegistry) GetByName(name string) JobFunctionType {
 }
 
 // GetMeta 根据函数ID获取元数据（对外导出）
-func (r *FunctionRegistry) GetMeta(funcID string) *storage.JobFunctionMeta {
+func (r *functionRegistryImpl) GetMeta(funcID string) *storage.JobFunctionMeta {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.metaMap[funcID]
 }
 
 // Exists 检查函数是否已注册（对外导出）
-func (r *FunctionRegistry) Exists(funcID string) bool {
+func (r *functionRegistryImpl) Exists(funcID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	_, exists := r.functions[funcID]
@@ -163,7 +163,7 @@ func (r *FunctionRegistry) Exists(funcID string) bool {
 }
 
 // Unregister 注销函数（对外导出）
-func (r *FunctionRegistry) Unregister(ctx context.Context, funcID string) error {
+func (r *functionRegistryImpl) Unregister(ctx context.Context, funcID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -186,7 +186,7 @@ func (r *FunctionRegistry) Unregister(ctx context.Context, funcID string) error 
 }
 
 // ListAll 列出所有已注册的函数ID（对外导出）
-func (r *FunctionRegistry) ListAll() []string {
+func (r *functionRegistryImpl) ListAll() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -199,7 +199,7 @@ func (r *FunctionRegistry) ListAll() []string {
 
 // LoadFunction 从数据库加载函数元数据并注册函数实例（对外导出）
 // 用于系统重启后恢复函数
-func (r *FunctionRegistry) LoadFunction(ctx context.Context, funcID string, fn interface{}) error {
+func (r *functionRegistryImpl) LoadFunction(ctx context.Context, funcID string, fn interface{}) error {
 	if r.jobFunctionRepo == nil {
 		return fmt.Errorf("未配置存储仓库，无法加载")
 	}
@@ -230,7 +230,7 @@ func (r *FunctionRegistry) LoadFunction(ctx context.Context, funcID string, fn i
 
 // RestoreFromDB 从数据库恢复函数元数据（对外导出）
 // 注意：此方法只恢复元数据，函数实例需要用户通过LoadFunction重新注册
-func (r *FunctionRegistry) RestoreFromDB(ctx context.Context) ([]*storage.JobFunctionMeta, error) {
+func (r *functionRegistryImpl) RestoreFromDB(ctx context.Context) ([]*storage.JobFunctionMeta, error) {
 	if r.jobFunctionRepo == nil {
 		return nil, fmt.Errorf("未配置存储仓库，无法恢复")
 	}
@@ -258,7 +258,7 @@ type JobFunctionDef struct {
 }
 
 // RegisterBatch 批量注册函数（对外导出）
-func (r *FunctionRegistry) RegisterBatch(ctx context.Context, functions []JobFunctionDef) error {
+func (r *functionRegistryImpl) RegisterBatch(ctx context.Context, functions []JobFunctionDef) error {
 	for _, def := range functions {
 		_, err := r.Register(ctx, def.Name, def.Function, def.Description)
 		if err != nil {
@@ -270,7 +270,7 @@ func (r *FunctionRegistry) RegisterBatch(ctx context.Context, functions []JobFun
 
 // RestoreFunctions 从数据库恢复函数元数据，并通过函数映射表恢复函数实例（对外导出）
 // funcMap: 函数名称 -> 函数实例的映射
-func (r *FunctionRegistry) RestoreFunctions(ctx context.Context, funcMap map[string]interface{}) error {
+func (r *functionRegistryImpl) RestoreFunctions(ctx context.Context, funcMap map[string]interface{}) error {
 	if r.jobFunctionRepo == nil {
 		return fmt.Errorf("未配置存储仓库，无法恢复")
 	}
@@ -302,7 +302,7 @@ func (r *FunctionRegistry) RestoreFunctions(ctx context.Context, funcMap map[str
 }
 
 // GetIDByName 根据函数名称获取函数ID（对外导出）
-func (r *FunctionRegistry) GetIDByName(name string) string {
+func (r *functionRegistryImpl) GetIDByName(name string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -319,7 +319,7 @@ func (r *FunctionRegistry) GetIDByName(name string) string {
 // handler: Task Handler函数
 // description: Handler描述（可选）
 // 返回: Handler ID和错误
-func (r *FunctionRegistry) RegisterTaskHandler(ctx context.Context, name string, handler TaskHandlerType, description string) (string, error) {
+func (r *functionRegistryImpl) RegisterTaskHandler(ctx context.Context, name string, handler TaskHandlerType, description string) (string, error) {
 	// 如果名称为空，自动生成
 	if name == "" {
 		name = generateHandlerName(handler)
@@ -374,15 +374,15 @@ func (r *FunctionRegistry) RegisterTaskHandler(ctx context.Context, name string,
 	return handlerID, nil
 }
 
-// GetTaskHandler 根据Handler ID获取Task Handler（对外导出）
-func (r *FunctionRegistry) GetTaskHandler(handlerID string) TaskHandlerType {
+// GetTaskHandler 根据Handler ID获取Task Handler（实现FunctionRegistry接口）
+func (r *functionRegistryImpl) GetTaskHandler(handlerID string) TaskHandlerType {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.taskHandlers[handlerID]
 }
 
 // GetTaskHandlerByName 根据Handler名称获取Task Handler（对外导出）
-func (r *FunctionRegistry) GetTaskHandlerByName(name string) TaskHandlerType {
+func (r *functionRegistryImpl) GetTaskHandlerByName(name string) TaskHandlerType {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -396,7 +396,7 @@ func (r *FunctionRegistry) GetTaskHandlerByName(name string) TaskHandlerType {
 }
 
 // GetTaskHandlerIDByName 根据Handler名称获取Handler ID（对外导出）
-func (r *FunctionRegistry) GetTaskHandlerIDByName(name string) string {
+func (r *functionRegistryImpl) GetTaskHandlerIDByName(name string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -409,7 +409,7 @@ func (r *FunctionRegistry) GetTaskHandlerIDByName(name string) string {
 }
 
 // UnregisterTaskHandler 注销Task Handler（对外导出）
-func (r *FunctionRegistry) UnregisterTaskHandler(ctx context.Context, handlerID string) error {
+func (r *functionRegistryImpl) UnregisterTaskHandler(ctx context.Context, handlerID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -432,7 +432,7 @@ func (r *FunctionRegistry) UnregisterTaskHandler(ctx context.Context, handlerID 
 }
 
 // ListAllTaskHandlers 列出所有已注册的Task Handler ID（对外导出）
-func (r *FunctionRegistry) ListAllTaskHandlers() []string {
+func (r *functionRegistryImpl) ListAllTaskHandlers() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -444,7 +444,7 @@ func (r *FunctionRegistry) ListAllTaskHandlers() []string {
 }
 
 // TaskHandlerExists 检查Task Handler是否已注册（对外导出）
-func (r *FunctionRegistry) TaskHandlerExists(handlerID string) bool {
+func (r *functionRegistryImpl) TaskHandlerExists(handlerID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	_, exists := r.taskHandlers[handlerID]
@@ -480,7 +480,7 @@ func extractFunctionMeta(fn interface{}, name, description string) (*storage.Job
 // 支持注册任意类型的依赖，如 repository、service 等
 // 依赖通过类型作为 key 进行存储，确保类型安全
 // 示例: registry.RegisterDependency(userRepo)
-func (r *FunctionRegistry) RegisterDependency(dep interface{}) error {
+func (r *functionRegistryImpl) RegisterDependency(dep interface{}) error {
 	return r.RegisterDependencyWithKey("", dep)
 }
 
@@ -488,7 +488,7 @@ func (r *FunctionRegistry) RegisterDependency(dep interface{}) error {
 // key: 依赖的字符串标识（可选，如果为空则只通过类型查找）
 // dep: 依赖实例
 // 示例: registry.RegisterDependencyWithKey("ExampleService", exampleService)
-func (r *FunctionRegistry) RegisterDependencyWithKey(key string, dep interface{}) error {
+func (r *functionRegistryImpl) RegisterDependencyWithKey(key string, dep interface{}) error {
 	if dep == nil {
 		return fmt.Errorf("依赖不能为 nil")
 	}
@@ -561,7 +561,7 @@ func GetDependency[T any](ctx context.Context) (T, bool) {
 // WithDependencies 将依赖注入到 context 中（对外导出）
 // 将 registry 中注册的所有依赖添加到 context 中
 // 返回一个新的 context，包含所有依赖
-func (r *FunctionRegistry) WithDependencies(ctx context.Context) context.Context {
+func (r *functionRegistryImpl) WithDependencies(ctx context.Context) context.Context {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 

@@ -37,12 +37,12 @@ const (
 
 // Engine 调度引擎核心结构体（对外导出）
 type Engine struct {
-	executor                *executor.Executor
+	executor                executor.Executor
 	workflowRepo            storage.WorkflowRepository
 	workflowInstanceRepo    storage.WorkflowInstanceRepository
 	taskRepo                storage.TaskRepository
 	aggregateRepo           storage.WorkflowAggregateRepository // 聚合Repository（优先使用）
-	registry                *task.FunctionRegistry
+	registry                task.FunctionRegistry
 	cfg                     *config.EngineConfig   // 框架配置
 	jobRegistry             sync.Map               // Job函数注册表（funcKey -> function）
 	callbackRegistry        sync.Map               // Callback函数注册表（funcKey -> function）
@@ -254,7 +254,7 @@ func (e *Engine) EnableFunctionRestoreOnStart() {
 }
 
 // GetRegistry 获取函数注册中心（对外导出，用于测试和函数注册）
-func (e *Engine) GetRegistry() *task.FunctionRegistry {
+func (e *Engine) GetRegistry() task.FunctionRegistry {
 	return e.registry
 }
 

@@ -32,12 +32,12 @@ type coordinatorImpl struct {
 	transactionID string
 	state         TransactionState
 	steps         []*TransactionStep
-	registry      *task.FunctionRegistry
+	registry      task.FunctionRegistry
 	mu            sync.RWMutex
 }
 
 // NewCoordinator 创建SAGA协调器（对外导出）
-func NewCoordinator(transactionID string, registry *task.FunctionRegistry) Coordinator {
+func NewCoordinator(transactionID string, registry task.FunctionRegistry) Coordinator {
 	return &coordinatorImpl{
 		transactionID: transactionID,
 		state:         TransactionStatePending,

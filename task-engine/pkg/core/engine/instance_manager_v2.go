@@ -263,12 +263,12 @@ type WorkflowInstanceManagerV2 struct {
 	// 原有字段
 	instance             *workflow.WorkflowInstance
 	workflow             *workflow.Workflow
-	dag                  *dag.DAG
-	executor             *executor.Executor
+	dag                  dag.DAG
+	executor             executor.Executor
 	aggregateRepo        storage.WorkflowAggregateRepository // 聚合Repository（优先使用）
 	taskRepo             storage.TaskRepository
 	workflowInstanceRepo storage.WorkflowInstanceRepository
-	registry             *task.FunctionRegistry
+	registry             task.FunctionRegistry
 	resultCache          cache.ResultCache
 	ctx                  context.Context
 	cancel               context.CancelFunc
@@ -316,10 +316,10 @@ type WorkflowInstanceManagerV2 struct {
 func NewWorkflowInstanceManagerV2(
 	instance *workflow.WorkflowInstance,
 	wf *workflow.Workflow,
-	exec *executor.Executor,
+	exec executor.Executor,
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
-	registry *task.FunctionRegistry,
+	registry task.FunctionRegistry,
 	pluginManager plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG
@@ -398,11 +398,11 @@ func NewWorkflowInstanceManagerV2(
 func NewWorkflowInstanceManagerV2WithAggregate(
 	instance *workflow.WorkflowInstance,
 	wf *workflow.Workflow,
-	exec *executor.Executor,
+	exec executor.Executor,
 	aggregateRepo storage.WorkflowAggregateRepository,
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
-	registry *task.FunctionRegistry,
+	registry task.FunctionRegistry,
 	pluginManager plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG

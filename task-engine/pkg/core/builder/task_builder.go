@@ -23,12 +23,12 @@ type TaskBuilder struct {
 	statusHandlers       map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
 	requiredParams       []string            // 必需参数列表
 	resultMapping        map[string]string   // 上游结果字段到下游参数的映射规则
-	registry             *task.FunctionRegistry
+	registry             task.FunctionRegistry
 }
 
 // NewTaskBuilder 创建Task构建器（对外导出，必须包含registry）
 // registry: 函数注册中心，用于验证JobFunction和TaskHandler是否存在（不能为nil）
-func NewTaskBuilder(name, description string, registry *task.FunctionRegistry) *TaskBuilder {
+func NewTaskBuilder(name, description string, registry task.FunctionRegistry) *TaskBuilder {
 	if registry == nil {
 		panic("registry不能为nil，TaskBuilder必须使用registry")
 	}

@@ -5,15 +5,15 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
 
-// DAG 有向无环图结构（对外导出）
+// dagImpl 有向无环图实现（内部实现）
 // 封装 go-dag 库的 DAG，使用 workflow.Task 作为节点值
-type DAG struct {
+type dagImpl struct {
 	*godag.DAG[workflow.Task] // 嵌入 go-dag 的 DAG
 }
 
 // NewDAG 创建新的DAG实例（对外导出）
-func NewDAG() *DAG {
-	return &DAG{
+func NewDAG() DAG {
+	return &dagImpl{
 		DAG: godag.NewDAG[workflow.Task](),
 	}
 }
