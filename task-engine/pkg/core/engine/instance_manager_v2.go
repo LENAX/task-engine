@@ -495,6 +495,25 @@ func (m *WorkflowInstanceManagerV2) Start() {
 		log.Printf("警告: WorkflowInstance %s 状态更新通道已满", m.instance.ID)
 	}
 
+	// 触发Workflow启动插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowStarted,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Running",
+			Error:      nil,
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowStarted, pluginData); err != nil {
+			log.Printf("触发Workflow启动插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
+	}
+
 	// 启动三个核心goroutine
 	m.wg.Add(1)
 	go func() {
@@ -799,6 +818,37 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 					case m.statusUpdateChan <- finalStatus:
 					default:
 						log.Printf("警告: WorkflowInstance %s 状态更新通道已满", m.instance.ID)
+					}
+
+					// 触发Workflow完成/失败插件
+					if m.pluginManager != nil {
+						var event plugin.TriggerEvent
+						if finalStatus == "Success" {
+							event = plugin.EventWorkflowCompleted
+						} else {
+							event = plugin.EventWorkflowFailed
+						}
+						pluginData := plugin.PluginData{
+							Event:      event,
+							WorkflowID: m.instance.WorkflowID,
+							InstanceID: m.instance.ID,
+							TaskID:     "",
+							TaskName:   "",
+							Status:     finalStatus,
+							Error:      nil,
+							Data: map[string]interface{}{
+								"workflow_name": m.workflow.Name,
+								"total_tasks":   totalCount,
+								"completed":     completed,
+							},
+						}
+						if finalStatus == "Failed" {
+							pluginData.Error = fmt.Errorf("部分任务执行失败")
+							pluginData.Data["error"] = "部分任务执行失败"
+						}
+						if err := m.pluginManager.Trigger(m.ctx, event, pluginData); err != nil {
+							log.Printf("触发Workflow %s插件失败: InstanceID=%s, Error=%v", finalStatus, m.instance.ID, err)
+						}
 					}
 
 					log.Printf("WorkflowInstance %s: 所有任务已完成，最终状态: %s", m.instance.ID, finalStatus)
@@ -1966,6 +2016,25 @@ func (m *WorkflowInstanceManagerV2) handlePause() {
 		log.Printf("更新WorkflowInstance状态失败: %v", err)
 	}
 
+	// 触发Workflow暂停插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowPaused,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Paused",
+			Error:      nil,
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowPaused, pluginData); err != nil {
+			log.Printf("触发Workflow暂停插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
+	}
+
 	select {
 	case m.statusUpdateChan <- "Paused":
 	default:
@@ -1993,6 +2062,25 @@ func (m *WorkflowInstanceManagerV2) handleResume() {
 	default:
 	}
 
+	// 触发Workflow恢复插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowResumed,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Running",
+			Error:      nil,
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowResumed, pluginData); err != nil {
+			log.Printf("触发Workflow恢复插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
+	}
+
 	log.Printf("WorkflowInstance %s: 已恢复", m.instance.ID)
 }
 
@@ -2018,6 +2106,26 @@ func (m *WorkflowInstanceManagerV2) handleTerminate() {
 
 	// 取消context，停止所有协程
 	m.cancel()
+
+	// 触发Workflow终止插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowTerminated,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Terminated",
+			Error:      fmt.Errorf("用户终止"),
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+				"reason":        "用户终止",
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowTerminated, pluginData); err != nil {
+			log.Printf("触发Workflow终止插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
+	}
 
 	log.Printf("WorkflowInstance %s: 已终止", m.instance.ID)
 }
