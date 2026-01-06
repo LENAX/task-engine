@@ -11,6 +11,7 @@ import (
 	"github.com/stevelan1995/task-engine/internal/storage/sqlite"
 	"github.com/stevelan1995/task-engine/pkg/config"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/stevelan1995/task-engine/pkg/plugin"
 )
 
 // JobFunc Job函数类型（兼容现有代码）
@@ -26,8 +27,10 @@ type EngineBuilder struct {
 	jobFuncs                map[string]JobFunc
 	callbackFuncs           map[string]CallbackFunc
 	services                map[string]interface{}
-	functionMap             map[string]interface{} // 函数映射表，用于函数恢复
-	restoreFunctionsOnStart bool                   // 是否在启动时自动恢复函数
+	functionMap             map[string]interface{}        // 函数映射表，用于函数恢复
+	restoreFunctionsOnStart bool                        // 是否在启动时自动恢复函数
+	plugins                 map[string]plugin.Plugin     // 已注册的插件
+	pluginBindings          []plugin.PluginBinding       // 插件绑定规则
 	err                     error
 }
 
@@ -40,6 +43,8 @@ func NewEngineBuilder(engineConfigPath string) *EngineBuilder {
 		services:                make(map[string]interface{}),
 		functionMap:             make(map[string]interface{}),
 		restoreFunctionsOnStart: false,
+		plugins:                 make(map[string]plugin.Plugin),
+		pluginBindings:          make([]plugin.PluginBinding, 0),
 	}
 }
 
@@ -108,6 +113,46 @@ func (b *EngineBuilder) RestoreFunctionsOnStart() *EngineBuilder {
 		return b
 	}
 	b.restoreFunctionsOnStart = true
+	return b
+}
+
+// WithPlugin 注册插件（链式）
+func (b *EngineBuilder) WithPlugin(p plugin.Plugin) *EngineBuilder {
+	if b.err != nil {
+		return b
+	}
+	if p == nil {
+		b.err = errors.New("plugin cannot be nil")
+		return b
+	}
+	name := p.Name()
+	if name == "" {
+		b.err = errors.New("plugin name cannot be empty")
+		return b
+	}
+	b.plugins[name] = p
+	return b
+}
+
+// WithPluginBinding 绑定插件到事件（链式）
+func (b *EngineBuilder) WithPluginBinding(binding plugin.PluginBinding) *EngineBuilder {
+	if b.err != nil {
+		return b
+	}
+	if binding.PluginName == "" {
+		b.err = errors.New("plugin name cannot be empty")
+		return b
+	}
+	if binding.Event == "" {
+		b.err = errors.New("trigger event cannot be empty")
+		return b
+	}
+	// 检查插件是否已注册
+	if _, exists := b.plugins[binding.PluginName]; !exists {
+		b.err = fmt.Errorf("plugin %s not registered, please register it first using WithPlugin", binding.PluginName)
+		return b
+	}
+	b.pluginBindings = append(b.pluginBindings, binding)
 	return b
 }
 
@@ -216,6 +261,24 @@ func (b *EngineBuilder) Build() (*Engine, error) {
 	if b.restoreFunctionsOnStart {
 		engine.EnableFunctionRestoreOnStart()
 		log.Printf("📝 [EngineBuilder] 已启用启动时自动恢复函数功能")
+	}
+
+	// 12. 注册插件并应用绑定规则
+	if len(b.plugins) > 0 {
+		for name, p := range b.plugins {
+			if err := engine.pluginManager.Register(p); err != nil {
+				return nil, fmt.Errorf("register plugin %s failed: %w", name, err)
+			}
+			log.Printf("📝 [EngineBuilder] 已注册插件: %s", name)
+		}
+	}
+	if len(b.pluginBindings) > 0 {
+		for _, binding := range b.pluginBindings {
+			if err := engine.pluginManager.Bind(binding); err != nil {
+				return nil, fmt.Errorf("bind plugin %s to event %s failed: %w", binding.PluginName, binding.Event, err)
+			}
+			log.Printf("📝 [EngineBuilder] 已绑定插件: %s -> %s", binding.PluginName, binding.Event)
+		}
 	}
 
 	return engine, nil
