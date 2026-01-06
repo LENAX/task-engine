@@ -400,17 +400,28 @@ func (e *Engine) Stop() {
 
 	// 发送Terminate信号到所有实例
 	for _, manager := range instances {
-		// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
-		controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
-		if !ok {
-			log.Printf("WorkflowInstance %s 控制信号通道类型转换失败", manager.GetInstanceID())
+		// 类型转换：从 interface{} 转换为双向通道或只写通道
+		controlChanRaw := manager.GetControlSignalChannel()
+		if controlChanRaw == nil {
+			log.Printf("WorkflowInstance %s 控制信号通道为nil", manager.GetInstanceID())
 			continue
 		}
-		select {
-		case controlChan <- workflow.SignalTerminate:
-		default:
-			// channel已满，记录日志
-			log.Printf("WorkflowInstance %s 控制信号channel已满，跳过", manager.GetInstanceID())
+		// 尝试转换为双向通道
+		if controlChan, ok := controlChanRaw.(chan workflow.ControlSignal); ok {
+			select {
+			case controlChan <- workflow.SignalTerminate:
+			default:
+				log.Printf("WorkflowInstance %s 控制信号channel已满，跳过", manager.GetInstanceID())
+			}
+		} else if controlChanWrite, ok := controlChanRaw.(chan<- workflow.ControlSignal); ok {
+			// 尝试转换为只写通道（兼容旧版本）
+			select {
+			case controlChanWrite <- workflow.SignalTerminate:
+			default:
+				log.Printf("WorkflowInstance %s 控制信号channel已满，跳过", manager.GetInstanceID())
+			}
+		} else {
+			log.Printf("WorkflowInstance %s 控制信号通道类型转换失败", manager.GetInstanceID())
 		}
 	}
 
@@ -806,12 +817,20 @@ func (e *Engine) PauseWorkflowInstance(ctx context.Context, instanceID string) e
 	}
 
 	// 发送暂停信号
-	// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
-	controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
-	if !ok {
+	// 类型转换：从 interface{} 转换为双向通道或只写通道
+	controlChanRaw := manager.GetControlSignalChannel()
+	if controlChanRaw == nil {
+		return fmt.Errorf("WorkflowInstance %s 控制信号通道为nil", instanceID)
+	}
+	// 尝试转换为双向通道
+	if controlChan, ok := controlChanRaw.(chan workflow.ControlSignal); ok {
+		controlChan <- workflow.SignalPause
+	} else if controlChanWrite, ok := controlChanRaw.(chan<- workflow.ControlSignal); ok {
+		// 尝试转换为只写通道（兼容旧版本）
+		controlChanWrite <- workflow.SignalPause
+	} else {
 		return fmt.Errorf("WorkflowInstance %s 控制信号通道类型转换失败", instanceID)
 	}
-	controlChan <- workflow.SignalPause
 
 	log.Printf("✅ WorkflowInstance %s 已发送暂停信号", instanceID)
 	return nil
@@ -877,12 +896,20 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 	}
 
 	// 发送恢复信号
-	// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
-	controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
-	if !ok {
+	// 类型转换：从 interface{} 转换为双向通道或只写通道
+	controlChanRaw := manager.GetControlSignalChannel()
+	if controlChanRaw == nil {
+		return fmt.Errorf("WorkflowInstance %s 控制信号通道为nil", instanceID)
+	}
+	// 尝试转换为双向通道
+	if controlChan, ok := controlChanRaw.(chan workflow.ControlSignal); ok {
+		controlChan <- workflow.SignalResume
+	} else if controlChanWrite, ok := controlChanRaw.(chan<- workflow.ControlSignal); ok {
+		// 尝试转换为只写通道（兼容旧版本）
+		controlChanWrite <- workflow.SignalResume
+	} else {
 		return fmt.Errorf("WorkflowInstance %s 控制信号通道类型转换失败", instanceID)
 	}
-	controlChan <- workflow.SignalResume
 
 	log.Printf("✅ WorkflowInstance %s 已发送恢复信号", instanceID)
 	return nil
@@ -932,12 +959,20 @@ func (e *Engine) TerminateWorkflowInstance(ctx context.Context, instanceID strin
 	}
 
 	// 发送终止信号
-	// 类型转换：从 interface{} 转换为 chan<- workflow.ControlSignal
-	controlChan, ok := manager.GetControlSignalChannel().(chan<- workflow.ControlSignal)
-	if !ok {
+	// 类型转换：从 interface{} 转换为双向通道或只写通道
+	controlChanRaw := manager.GetControlSignalChannel()
+	if controlChanRaw == nil {
+		return fmt.Errorf("WorkflowInstance %s 控制信号通道为nil", instanceID)
+	}
+	// 尝试转换为双向通道
+	if controlChan, ok := controlChanRaw.(chan workflow.ControlSignal); ok {
+		controlChan <- workflow.SignalTerminate
+	} else if controlChanWrite, ok := controlChanRaw.(chan<- workflow.ControlSignal); ok {
+		// 尝试转换为只写通道（兼容旧版本）
+		controlChanWrite <- workflow.SignalTerminate
+	} else {
 		return fmt.Errorf("WorkflowInstance %s 控制信号通道类型转换失败", instanceID)
 	}
-	controlChan <- workflow.SignalTerminate
 
 	log.Printf("✅ WorkflowInstance %s 已发送终止信号，原因: %s", instanceID, reason)
 	return nil
