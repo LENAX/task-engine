@@ -187,4 +187,3 @@ func (c *coordinatorImpl) MarkStepFailed(taskID string) {
 		}
 	}
 }
-
