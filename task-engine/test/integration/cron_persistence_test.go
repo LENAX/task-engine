@@ -111,7 +111,10 @@ func TestCronPersistence_WithoutCron(t *testing.T) {
 	defer repos.Close()
 
 	// 创建Workflow但不设置Cron
-	wf := builder.NewWorkflowBuilder("test-no-cron", "测试无Cron Workflow").Build()
+	wf, err := builder.NewWorkflowBuilder("test-no-cron", "测试无Cron Workflow").Build()
+	if err != nil {
+		t.Fatalf("创建Workflow失败: %v", err)
+	}
 	if wf == nil {
 		t.Fatal("创建Workflow失败")
 	}
