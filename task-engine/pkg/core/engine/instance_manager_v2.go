@@ -16,6 +16,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/stevelan1995/task-engine/pkg/plugin"
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
 
@@ -306,6 +307,9 @@ type WorkflowInstanceManagerV2 struct {
 	// SAGA事务协调器（可选）
 	sagaCoordinator *saga.Coordinator
 	sagaEnabled     bool // 是否启用SAGA
+
+	// 插件管理器（可选）
+	pluginManager *plugin.PluginManager
 }
 
 // NewWorkflowInstanceManagerV2 创建WorkflowInstanceManagerV2实例
@@ -316,6 +320,7 @@ func NewWorkflowInstanceManagerV2(
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
 	registry *task.FunctionRegistry,
+	pluginManager *plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG
 	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())
@@ -378,6 +383,7 @@ func NewWorkflowInstanceManagerV2(
 		statusUpdateChan:  make(chan string, 10),
 		sagaCoordinator:   sagaCoordinator,
 		sagaEnabled:       sagaEnabled,
+		pluginManager:     pluginManager,
 	}
 
 	log.Printf("WorkflowInstance %s: V2初始化完成，总任务数: %d，Channel 容量: %d",
@@ -397,6 +403,7 @@ func NewWorkflowInstanceManagerV2WithAggregate(
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
 	registry *task.FunctionRegistry,
+	pluginManager *plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG
 	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())
@@ -458,6 +465,7 @@ func NewWorkflowInstanceManagerV2WithAggregate(
 		statusUpdateChan:  make(chan string, 10),
 		sagaCoordinator:   sagaCoordinator,
 		sagaEnabled:       sagaEnabled,
+		pluginManager:     pluginManager,
 	}
 
 	log.Printf("WorkflowInstance %s: V2初始化完成（聚合Repository模式），总任务数: %d，Channel 容量: %d",
@@ -1669,6 +1677,35 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 			}
 		}
 
+		// 触发Task成功插件
+		if m.pluginManager != nil {
+			var workflowTask workflow.Task
+			var exists bool
+			if workflowTask, exists = m.workflow.GetTasks()[taskID]; !exists {
+				if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
+					workflowTask = runtimeTask.(workflow.Task)
+					exists = true
+				}
+			}
+			if exists {
+				pluginData := plugin.PluginData{
+					Event:      plugin.EventTaskSuccess,
+					WorkflowID: m.instance.WorkflowID,
+					InstanceID: m.instance.ID,
+					TaskID:     taskID,
+					TaskName:   workflowTask.GetName(),
+					Status:     "SUCCESS",
+					Error:      nil,
+					Data: map[string]interface{}{
+						"result": result.Data,
+					},
+				}
+				if err := m.pluginManager.Trigger(m.ctx, plugin.EventTaskSuccess, pluginData); err != nil {
+					log.Printf("触发Task成功插件失败: TaskID=%s, Error=%v", taskID, err)
+				}
+			}
+		}
+
 		// 发送任务完成事件到taskStatusChan
 		isTemplate := false
 		isSubTask := false
@@ -1812,6 +1849,35 @@ func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(e
 				m.sagaCoordinator.AddStep(step)
 				m.sagaCoordinator.MarkStepFailed(taskID)
 				log.Printf("🔍 [SAGA] 已记录失败步骤: TaskID=%s, TaskName=%s", taskID, workflowTask.GetName())
+			}
+		}
+
+		// 触发Task失败插件
+		if m.pluginManager != nil {
+			var workflowTask workflow.Task
+			var exists bool
+			if workflowTask, exists = m.workflow.GetTasks()[taskID]; !exists {
+				if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
+					workflowTask = runtimeTask.(workflow.Task)
+					exists = true
+				}
+			}
+			if exists {
+				pluginData := plugin.PluginData{
+					Event:      plugin.EventTaskFailed,
+					WorkflowID: m.instance.WorkflowID,
+					InstanceID: m.instance.ID,
+					TaskID:     taskID,
+					TaskName:   workflowTask.GetName(),
+					Status:     "FAILED",
+					Error:      err,
+					Data: map[string]interface{}{
+						"error": err.Error(),
+					},
+				}
+				if triggerErr := m.pluginManager.Trigger(m.ctx, plugin.EventTaskFailed, pluginData); triggerErr != nil {
+					log.Printf("触发Task失败插件失败: TaskID=%s, Error=%v", taskID, triggerErr)
+				}
 			}
 		}
 

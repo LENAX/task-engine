@@ -181,4 +181,3 @@ func TestMultiDatabase_UnsupportedType(t *testing.T) {
 		t.Errorf("错误信息不匹配，期望包含'unsupported database type: oracle'，实际: %v", err)
 	}
 }
-

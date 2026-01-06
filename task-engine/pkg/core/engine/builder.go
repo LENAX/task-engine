@@ -22,23 +22,23 @@ type CallbackFunc interface{}
 
 // EngineBuilder 引擎构建器（链式调用）
 type EngineBuilder struct {
-	engineConfigPath      string
-	jobFuncs              map[string]JobFunc
-	callbackFuncs         map[string]CallbackFunc
-	services              map[string]interface{}
-	functionMap           map[string]interface{} // 函数映射表，用于函数恢复
-	restoreFunctionsOnStart bool                 // 是否在启动时自动恢复函数
-	err                   error
+	engineConfigPath        string
+	jobFuncs                map[string]JobFunc
+	callbackFuncs           map[string]CallbackFunc
+	services                map[string]interface{}
+	functionMap             map[string]interface{} // 函数映射表，用于函数恢复
+	restoreFunctionsOnStart bool                   // 是否在启动时自动恢复函数
+	err                     error
 }
 
 // NewEngineBuilder 创建引擎构建器（入口）
 func NewEngineBuilder(engineConfigPath string) *EngineBuilder {
 	return &EngineBuilder{
-		engineConfigPath:       engineConfigPath,
-		jobFuncs:               make(map[string]JobFunc),
+		engineConfigPath:        engineConfigPath,
+		jobFuncs:                make(map[string]JobFunc),
 		callbackFuncs:           make(map[string]CallbackFunc),
-		services:               make(map[string]interface{}),
-		functionMap:            make(map[string]interface{}),
+		services:                make(map[string]interface{}),
+		functionMap:             make(map[string]interface{}),
 		restoreFunctionsOnStart: false,
 	}
 }
@@ -165,8 +165,8 @@ func (b *EngineBuilder) Build() (*Engine, error) {
 			repos.Workflow,
 			repos.WorkflowInstance,
 			repos.Task,
-			repos.JobFunction,  // 启用JobFunction默认存储
-			repos.TaskHandler,  // 启用TaskHandler默认存储
+			repos.JobFunction, // 启用JobFunction默认存储
+			repos.TaskHandler, // 启用TaskHandler默认存储
 		)
 		if err != nil {
 			return nil, fmt.Errorf("create engine failed: %w", err)
