@@ -6,9 +6,40 @@ CREATE TABLE IF NOT EXISTS workflow_definition (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT,
+    params TEXT,  -- JSON格式存储参数
     dependencies TEXT,  -- JSON格式存储依赖关系
-    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'ENABLED',
+    sub_task_error_tolerance REAL NOT NULL DEFAULT 0.0,
+    transactional INTEGER NOT NULL DEFAULT 0,
+    transaction_mode TEXT DEFAULT '',
+    max_concurrent_task INTEGER NOT NULL DEFAULT 10,
+    cron_expr TEXT DEFAULT '',
+    cron_enabled INTEGER NOT NULL DEFAULT 0
 );
+
+-- Task定义表（存储Workflow中的Task定义，与task_instance运行时实例区分）
+CREATE TABLE IF NOT EXISTS task_definition (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    job_func_id TEXT,
+    job_func_name TEXT,
+    compensation_func_id TEXT,
+    compensation_func_name TEXT,
+    params TEXT,  -- JSON格式存储参数
+    timeout_seconds INTEGER DEFAULT 30,
+    retry_count INTEGER DEFAULT 0,
+    dependencies TEXT,  -- JSON数组，存储依赖的Task名称
+    required_params TEXT,  -- JSON数组，必需参数列表
+    result_mapping TEXT,  -- JSON对象，结果映射规则
+    status_handlers TEXT,  -- JSON对象，状态处理器映射
+    is_template INTEGER DEFAULT 0,
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (workflow_id) REFERENCES workflow_definition(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_definition_workflow_id ON task_definition(workflow_id);
 
 -- WorkflowInstance表
 CREATE TABLE IF NOT EXISTS workflow_instance (

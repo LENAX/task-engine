@@ -6,6 +6,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stevelan1995/task-engine/pkg/storage"
+	pkgsqlite "github.com/stevelan1995/task-engine/pkg/storage/sqlite"
 )
 
 // configureSQLite 配置SQLite数据库连接，启用WAL模式和其他优化设置
@@ -42,12 +43,13 @@ func configureSQLite(db *sqlx.DB) error {
 
 // Repositories 存储Repository集合（内部使用）
 type Repositories struct {
-	Workflow         storage.WorkflowRepository
-	WorkflowInstance storage.WorkflowInstanceRepository
-	Task             storage.TaskRepository
-	JobFunction      storage.JobFunctionRepository
-	TaskHandler      storage.TaskHandlerRepository
-	db               *sqlx.DB
+	Workflow          storage.WorkflowRepository
+	WorkflowInstance  storage.WorkflowInstanceRepository
+	Task              storage.TaskRepository
+	JobFunction       storage.JobFunctionRepository
+	TaskHandler       storage.TaskHandlerRepository
+	WorkflowAggregate storage.WorkflowAggregateRepository // 聚合根Repository
+	db                *sqlx.DB
 }
 
 // NewRepositories 创建所有Repository实例（内部工厂方法，不导出）
@@ -74,13 +76,19 @@ func NewRepositories(dsn string) (*Repositories, error) {
 		return nil, fmt.Errorf("创建WorkflowRepository失败: %w", err)
 	}
 
+	workflowAggregateRepo, err := pkgsqlite.NewWorkflowAggregateRepo(db)
+	if err != nil {
+		return nil, fmt.Errorf("创建WorkflowAggregateRepository失败: %w", err)
+	}
+
 	repos := &Repositories{
-		Workflow:         workflowRepo,
-		WorkflowInstance: NewWorkflowInstanceRepo(db),
-		Task:             NewTaskRepo(db),
-		JobFunction:      NewJobFunctionRepo(db),
-		TaskHandler:      NewTaskHandlerRepo(db),
-		db:               db,
+		Workflow:          workflowRepo,
+		WorkflowInstance:  NewWorkflowInstanceRepo(db),
+		Task:              NewTaskRepo(db),
+		JobFunction:       NewJobFunctionRepo(db),
+		TaskHandler:       NewTaskHandlerRepo(db),
+		WorkflowAggregate: workflowAggregateRepo,
+		db:                db,
 	}
 
 	return repos, nil
