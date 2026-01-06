@@ -188,8 +188,15 @@ func GetDependencyTyped[T any](ctx context.Context, key string) (T, bool) {
 	}
 
 	// 如果直接类型断言失败，尝试通过反射转换
+	// 使用 reflect.TypeOf((*T)(nil)).Elem() 来获取类型信息，这样可以正确处理接口类型
+	var typeT T
+	targetType := reflect.TypeOf(&typeT).Elem()
+	if targetType == nil {
+		return zero, false
+	}
+
 	depValue := reflect.ValueOf(dep)
-	if depValue.Type().AssignableTo(reflect.TypeOf(zero)) {
+	if depValue.IsValid() && depValue.Type().AssignableTo(targetType) {
 		return depValue.Interface().(T), true
 	}
 

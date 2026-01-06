@@ -70,13 +70,20 @@ func (r *jobFunctionRepo) Save(ctx context.Context, meta *storage.JobFunctionMet
 	// 这里假设这些字段在后续Phase 6中会添加到JobFunctionMeta结构
 	// 暂时使用空值
 
+	// 检查名称是否已存在（使用唯一约束检查）
+	// 由于name字段有UNIQUE约束，直接使用INSERT，如果名称已存在会返回错误
 	query := `
-	INSERT OR REPLACE INTO job_function_meta 
+	INSERT INTO job_function_meta 
 	(id, name, description, code_path, hash, param_types, create_time, update_time)
 	VALUES (:id, :name, :description, :code_path, :hash, :param_types, :create_time, :update_time)
 	`
 	_, err := r.db.NamedExecContext(ctx, query, dao)
 	if err != nil {
+		// 检查是否是唯一性约束错误
+		if err.Error() != "" && (err.Error() == "UNIQUE constraint failed: job_function_meta.name" ||
+			err.Error() == "UNIQUE constraint failed: job_function_meta.name (19)") {
+			return fmt.Errorf("JobFunction名称 %s 已存在", meta.Name)
+		}
 		return fmt.Errorf("保存JobFunctionMeta失败: %w", err)
 	}
 	return nil
@@ -157,13 +164,22 @@ func (r *jobFunctionRepo) ListAll(ctx context.Context) ([]*storage.JobFunctionMe
 	return result, nil
 }
 
-// Delete 实现存储接口（内部实现）
+// Delete 实现存储接口（内部实现，根据ID删除）
 // 幂等性：删除不存在的记录不会报错
-func (r *jobFunctionRepo) Delete(ctx context.Context, name string) error {
-	query := `DELETE FROM job_function_meta WHERE name = :name`
-	_, err := r.db.NamedExecContext(ctx, query, map[string]interface{}{
-		"name": name,
-	})
+func (r *jobFunctionRepo) Delete(ctx context.Context, id string) error {
+	query := `DELETE FROM job_function_meta WHERE id = ?`
+	_, err := r.db.ExecContext(ctx, query, id)
+	if err != nil {
+		return fmt.Errorf("删除JobFunctionMeta失败: %w", err)
+	}
+	// 不检查 RowsAffected，删除不存在的记录也是幂等的
+	return nil
+}
+
+// DeleteByName 根据名称删除函数元数据（业务接口）
+func (r *jobFunctionRepo) DeleteByName(ctx context.Context, name string) error {
+	query := `DELETE FROM job_function_meta WHERE name = ?`
+	_, err := r.db.ExecContext(ctx, query, name)
 	if err != nil {
 		return fmt.Errorf("删除JobFunctionMeta失败: %w", err)
 	}

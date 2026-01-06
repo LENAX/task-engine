@@ -6,24 +6,135 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
 
+// BuildDAGOptions DAG构建选项
+type BuildDAGOptions struct {
+	SkipCycleCheck bool // 跳过循环检测（适用于已知无环的场景，如层级依赖）
+}
+
 // BuildDAG 从Workflow构建DAG（对外导出）
 // tasks: Task ID -> Task接口的映射
 // dependencies: 后置Task ID -> 前置Task ID列表的映射
 func BuildDAG(tasks map[string]workflow.Task, dependencies map[string][]string) (*DAG, error) {
-	d := NewDAG()
+	return BuildDAGWithOptions(tasks, dependencies, BuildDAGOptions{})
+}
 
-	// 1. 创建所有节点
+// detectCycleDFS 使用DFS检测图中是否存在循环（高效的循环检测算法）
+// graph: 邻接表，key是节点ID，value是该节点的所有子节点ID列表
+func detectCycleDFS(graph map[string][]string) (bool, []string) {
+	// 使用三色标记法：0=白色（未访问），1=灰色（正在访问），2=黑色（已访问）
+	color := make(map[string]int)
+	parent := make(map[string]string)
+	cyclePath := make([]string, 0)
+
+	// 初始化所有节点为白色
+	for nodeID := range graph {
+		color[nodeID] = 0
+	}
+
+	// DFS遍历所有节点
+	var dfs func(nodeID string) bool
+	dfs = func(nodeID string) bool {
+		// 标记为灰色（正在访问）
+		color[nodeID] = 1
+
+		// 遍历所有子节点
+		for _, childID := range graph[nodeID] {
+			if color[childID] == 0 {
+				// 白色节点，递归访问
+				parent[childID] = nodeID
+				if dfs(childID) {
+					return true
+				}
+			} else if color[childID] == 1 {
+				// 灰色节点，说明存在后向边，检测到循环
+				// 构建循环路径
+				cyclePath = append(cyclePath, childID)
+				cur := nodeID
+				for cur != childID && cur != "" {
+					cyclePath = append(cyclePath, cur)
+					cur = parent[cur]
+				}
+				cyclePath = append(cyclePath, childID) // 闭合循环
+				return true
+			}
+			// 黑色节点，跳过（已访问且无循环）
+		}
+
+		// 标记为黑色（已访问）
+		color[nodeID] = 2
+		return false
+	}
+
+	// 对所有节点进行DFS
+	for nodeID := range graph {
+		if color[nodeID] == 0 {
+			if dfs(nodeID) {
+				return true, cyclePath
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// BuildDAGWithOptions 从Workflow构建DAG（带选项）
+// tasks: Task ID -> Task接口的映射
+// dependencies: 后置Task ID -> 前置Task ID列表的映射
+// options: 构建选项
+func BuildDAGWithOptions(tasks map[string]workflow.Task, dependencies map[string][]string, options BuildDAGOptions) (*DAG, error) {
+	// 优化：先构建临时图结构，一次性检测循环，然后再添加到 go-dag 的 DAG 中
+	// 这样可以避免在每次 AddEdge 时都进行递归检查，大大提高性能
+
+	// 1. 构建临时图结构（邻接表）
+	graph := make(map[string][]string)
+	// 初始化所有节点（确保所有节点都在图中，即使没有边）
+	for taskID := range tasks {
+		graph[taskID] = make([]string, 0)
+	}
+	// 添加所有边到临时图
+	for taskID, depIDs := range dependencies {
+		// 确保 taskID 在图中
+		if _, exists := graph[taskID]; !exists {
+			graph[taskID] = make([]string, 0)
+		}
+		// 添加边：depID -> taskID（前置Task -> 后置Task）
+		for _, depID := range depIDs {
+			// 确保 depID 在图中
+			if _, exists := graph[depID]; !exists {
+				graph[depID] = make([]string, 0)
+			}
+			// 添加边到邻接表
+			graph[depID] = append(graph[depID], taskID)
+		}
+	}
+
+	// 2. 一次性检测循环（使用高效的DFS算法）
+	if !options.SkipCycleCheck {
+		hasCycle, cyclePath := detectCycleDFS(graph)
+		if hasCycle {
+			return nil, fmt.Errorf("检测到循环依赖: %v", cyclePath)
+		}
+	}
+
+	// 3. 创建 go-dag 的 DAG 实例并添加所有节点
+	d := NewDAG()
 	for taskID, task := range tasks {
 		if err := d.AddVertexByID(taskID, task); err != nil {
 			return nil, fmt.Errorf("添加节点失败: Task ID=%s, Error=%w", taskID, err)
 		}
 	}
 
-	// 2. 构建边（依赖关系）
+	// 4. 一次性添加所有边（虽然 go-dag 库内部仍会检查，但我们已经确认无环，所以不会失败）
+	edgeCount := 0
 	for taskID, depIDs := range dependencies {
 		for _, depID := range depIDs {
+			edgeCount++
 			// 添加边：depID -> taskID（前置Task -> 后置Task）
 			if err := d.AddEdge(depID, taskID); err != nil {
+				// 如果设置了跳过循环检测，但仍然检测到循环，说明确实存在循环
+				if options.SkipCycleCheck {
+					return nil, fmt.Errorf("添加边失败: %s -> %s, Error=%w (即使跳过循环检测，go-dag库仍会检测)", depID, taskID, err)
+				}
 				return nil, fmt.Errorf("添加边失败: %s -> %s, Error=%w", depID, taskID, err)
 			}
 		}

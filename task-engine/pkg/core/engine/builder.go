@@ -106,12 +106,15 @@ func (b *EngineBuilder) Build() (*Engine, error) {
 	timeoutSeconds := int(cfg.GetDefaultTaskTimeout().Seconds())
 
 	// 5. 创建Engine实例（使用配置的并发数和超时，Engine内部会创建Executor）
-	engine, err := NewEngine(
+	// 传入JobFunction和TaskHandler的Repository以启用默认存储
+	engine, err := NewEngineWithRepos(
 		maxConcurrency,
 		timeoutSeconds,
 		repos.Workflow,
 		repos.WorkflowInstance,
 		repos.Task,
+		repos.JobFunction,  // 启用JobFunction默认存储
+		repos.TaskHandler,  // 启用TaskHandler默认存储
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create engine failed: %w", err)

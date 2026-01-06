@@ -5,7 +5,7 @@ import (
 
 	"github.com/stevelan1995/task-engine/pkg/core/dag"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
-    "github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
 
 // WorkflowBuilder Workflow构建器（对外导出）
@@ -16,7 +16,7 @@ type WorkflowBuilder struct {
 
 // NewWorkflowBuilder 创建构建器（对外导出）
 func NewWorkflowBuilder(name, desc string) *WorkflowBuilder {
-    return &WorkflowBuilder{
+	return &WorkflowBuilder{
 		wf:    workflow.NewWorkflow(name, desc),
 		tasks: make([]*task.Task, 0),
 	}
@@ -40,8 +40,8 @@ func (b *WorkflowBuilder) WithTask(t *task.Task) *WorkflowBuilder {
 
 // WithParams 设置自定义参数（链式构建，对外导出）
 func (b *WorkflowBuilder) WithParams(params map[string]string) *WorkflowBuilder {
-    b.wf.Params = params
-    return b
+	b.wf.SetParams(params)
+	return b
 }
 
 // Build 完成Workflow构建（对外导出）
@@ -65,19 +65,14 @@ func (b *WorkflowBuilder) Build() (*workflow.Workflow, error) {
 		nameToID[t.Name] = t.ID
 	}
 
-	// 2. 将Task添加到Workflow中
-	if b.wf.Tasks == nil {
-		b.wf.Tasks = make(map[string]workflow.Task)
-	}
+	// 2. 将Task添加到Workflow中（使用AddTask方法）
 	for _, t := range b.tasks {
-		b.wf.Tasks[t.ID] = t
+		if err := b.wf.AddTask(t); err != nil {
+			return nil, fmt.Errorf("添加Task %s 失败: %w", t.Name, err)
+		}
 	}
 
 	// 3. 根据各Task声明的前置Task名称匹配对应的Task ID，构建全局依赖关系
-	if b.wf.Dependencies == nil {
-		b.wf.Dependencies = make(map[string][]string)
-	}
-
 	for _, t := range b.tasks {
 		// 获取该Task的依赖列表（存储的是Task名称）
 		deps := t.GetDependencies()
@@ -100,11 +95,11 @@ func (b *WorkflowBuilder) Build() (*workflow.Workflow, error) {
 		}
 
 		// 更新全局依赖关系（后置Task ID -> 前置Task ID列表）
-		b.wf.Dependencies[t.ID] = depIDs
+		b.wf.Dependencies.Store(t.ID, depIDs)
 	}
 
 	// 4. 构建DAG并检测循环依赖
-	dagInstance, err := dag.BuildDAG(b.wf.Tasks, b.wf.Dependencies)
+	dagInstance, err := dag.BuildDAG(b.wf.GetTasks(), b.wf.GetDependencies())
 	if err != nil {
 		return nil, fmt.Errorf("构建DAG失败: %w", err)
 	}

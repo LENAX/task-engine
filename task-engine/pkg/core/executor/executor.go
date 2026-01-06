@@ -33,8 +33,8 @@ type domainPool struct {
 }
 
 const (
-	maxGlobalWorkers = 1000 // 全局最大并发数上限
-	defaultQueueSize = 1000 // 默认任务队列大小
+	maxGlobalWorkers = 1000  // 全局最大并发数上限
+	defaultQueueSize = 10000 // 默认任务队列大小（支持大型workflow）
 )
 
 // NewExecutor 创建执行器实例（对外导出的工厂方法，engine包会调用）
@@ -227,6 +227,7 @@ func (e *Executor) SetRegistry(registry *task.FunctionRegistry) {
 }
 
 // SubmitTask 将待调度Task提交至Executor的任务队列（对外导出）
+// 如果队列已满，会阻塞等待直到有空间或Executor关闭
 func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 	if pendingTask == nil {
 		return fmt.Errorf("任务不能为空")
@@ -236,20 +237,23 @@ func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 	}
 
 	e.mu.RLock()
-	if !e.running {
-		e.mu.RUnlock()
-		return fmt.Errorf("Executor未运行")
-	}
+	running := e.running
+	// queueLen := len(e.taskQueue) // 相关debuglog已去除
 	e.mu.RUnlock()
 
-	// 提交到任务队列
+	// agentlog已清理
+
+	if !running {
+		return fmt.Errorf("Executor未运行")
+	}
+
+	// 提交到任务队列（阻塞等待，直到有空间或Executor关闭）
 	select {
 	case e.taskQueue <- pendingTask:
+		// agentlog已清理
 		return nil
 	case <-e.shutdown:
 		return fmt.Errorf("Executor已关闭")
-	default:
-		return fmt.Errorf("任务队列已满")
 	}
 }
 
@@ -262,6 +266,7 @@ func (e *Executor) scheduler() {
 				// 任务队列已关闭
 				return
 			}
+			// agentlog已清理
 			// 分配任务到Worker
 			e.dispatchTask(pendingTask)
 		case <-e.shutdown:
@@ -272,6 +277,7 @@ func (e *Executor) scheduler() {
 
 // dispatchTask 分配任务到Worker（内部方法）
 func (e *Executor) dispatchTask(pendingTask *PendingTask) {
+	// agentlog已清理
 	// 如果有业务域，使用业务域子池
 	if pendingTask.Domain != "" {
 		e.mu.RLock()
@@ -285,24 +291,60 @@ func (e *Executor) dispatchTask(pendingTask *PendingTask) {
 				pool.mu.Lock()
 				pool.current++
 				pool.mu.Unlock()
+				// agentlog已清理
 				e.wg.Add(1)
 				go e.executeTask(pendingTask, pool)
 				return
 			default:
 				// 业务域子池已满，回退到全局池
+				// agentlog已清理
 			}
 		}
 	}
 
 	// 使用全局Worker池
+	// 注意：这里使用阻塞方式，如果workerPool满了，会一直等待
+	// 这可能导致任务无法及时执行，但可以确保任务最终会被执行
 	select {
 	case e.workerPool <- struct{}{}:
+		// agentlog已清理
 		e.wg.Add(1)
 		go e.executeTask(pendingTask, nil)
 	case <-e.shutdown:
 		// Executor已关闭，通知任务失败
+		err := fmt.Errorf("Executor已关闭")
+		// 发送状态事件到 channel（如果提供）
+		if pendingTask.StatusChan != nil {
+			t := pendingTask.Task
+			isTemplate := false
+			isSubTask := false
+			if t != nil {
+				if taskWithFlags, ok := t.(interface {
+					IsTemplate() bool
+					IsSubTask() bool
+				}); ok {
+					isTemplate = taskWithFlags.IsTemplate()
+					isSubTask = taskWithFlags.IsSubTask()
+				}
+			}
+			event := &TaskStatusEvent{
+				TaskID:     t.GetID(),
+				Status:     "Failed",
+				Error:      err,
+				IsTemplate: isTemplate,
+				IsSubTask:  isSubTask,
+				Timestamp:  time.Now(),
+				Duration:   0,
+			}
+			select {
+			case pendingTask.StatusChan <- event:
+			default:
+				log.Printf("警告: TaskStatusEvent channel 已满，事件可能丢失: TaskID=%s", t.GetID())
+			}
+		}
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
-			pendingTask.OnError(fmt.Errorf("Executor已关闭"))
+			pendingTask.OnError(err)
 		}
 	}
 }
@@ -326,16 +368,19 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	t := pendingTask.Task
 
 	// 更新Task状态为Running
-	t.Status = task.TaskStatusRunning
+	t.SetStatus("RUNNING")
 
 	// 如果没有注册中心，无法执行
 	if e.registry == nil {
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   "Failed",
 			Error:    fmt.Errorf("Job函数注册中心未配置"),
 			Duration: time.Since(startTime).Milliseconds(),
 		}
+		// 发送状态事件到 channel（如果提供）
+		e.sendStatusEvent(pendingTask, result)
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
 			pendingTask.OnError(result.Error)
 		}
@@ -343,40 +388,45 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	}
 
 	// 获取Job函数
-	jobFunc := e.registry.GetByName(t.JobFuncName)
+	jobFunc := e.registry.GetByName(t.GetJobFuncName())
 	var funcID string
 	if jobFunc == nil {
 		// 尝试通过JobFuncID获取
-		jobFunc = e.registry.Get(t.JobFuncID)
-		funcID = t.JobFuncID
+		jobFunc = e.registry.Get(t.GetJobFuncID())
+		funcID = t.GetJobFuncID()
 	} else {
 		// 通过名称获取到函数，查找对应的ID
-		funcID = e.registry.GetIDByName(t.JobFuncName)
+		funcID = e.registry.GetIDByName(t.GetJobFuncName())
 		if funcID == "" {
-			funcID = t.JobFuncName
+			funcID = t.GetJobFuncName()
 		}
 	}
 	if jobFunc == nil {
-		log.Printf("❌ [Task执行失败] TaskID=%s, TaskName=%s, 原因: Job函数 %s 未找到", t.ID, t.Name, t.JobFuncName)
+		log.Printf("❌ [Task执行失败] TaskID=%s, TaskName=%s, 原因: Job函数 %s 未找到", t.GetID(), t.GetName(), t.GetJobFuncName())
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   "Failed",
-			Error:    fmt.Errorf("Job函数 %s 未找到", t.JobFuncName),
+			Error:    fmt.Errorf("Job函数 %s 未找到", t.GetJobFuncName()),
 			Duration: time.Since(startTime).Milliseconds(),
 		}
+		// 发送状态事件到 channel（如果提供）
+		e.sendStatusEvent(pendingTask, result)
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
 			pendingTask.OnError(result.Error)
 		}
 		return
 	}
 
+	// 获取参数用于日志打印
+	paramsForLog := t.GetParams()
 	// 打印函数执行开始日志
 	log.Printf("🚀 [开始执行函数] TaskID=%s, TaskName=%s, JobFuncName=%s, JobFuncID=%s, 参数=%v",
-		t.ID, t.Name, t.JobFuncName, funcID, t.Params)
+		t.GetID(), t.GetName(), t.GetJobFuncName(), funcID, paramsForLog)
 
 	// 创建执行上下文
 	ctx := context.Background()
-	timeoutSeconds := t.TimeoutSeconds
+	timeoutSeconds := t.GetTimeoutSeconds()
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 30 // 默认30秒
 	}
@@ -388,18 +438,21 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		ctx = e.registry.WithDependencies(ctx)
 	}
 
+	// 获取参数用于 TaskContext
+	paramsMap := t.GetParams()
+
 	// 创建TaskContext
 	taskCtx := task.NewTaskContext(
 		ctx,
-		t.ID,
-		t.Name,
+		t.GetID(),
+		t.GetName(),
 		pendingTask.WorkflowID,
 		pendingTask.InstanceID,
-		t.Params,
+		paramsMap,
 	)
 
 	// 执行Job函数
-	log.Printf("📞 [调用函数] TaskID=%s, TaskName=%s, JobFuncName=%s, 开始执行...", t.ID, t.Name, t.JobFuncName)
+	log.Printf("📞 [调用函数] TaskID=%s, TaskName=%s, JobFuncName=%s, 开始执行...", t.GetID(), t.GetName(), t.GetJobFuncName())
 	stateCh := jobFunc(taskCtx)
 
 	// 监听执行结果
@@ -407,7 +460,7 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	case state := <-stateCh:
 		duration := time.Since(startTime).Milliseconds()
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   state.Status,
 			Data:     state.Data,
 			Error:    state.Error,
@@ -415,27 +468,33 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 		}
 
 		if state.Status == "Success" {
-			t.Status = task.TaskStatusSuccess
+			t.SetStatus("SUCCESS")
 			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%v",
-				t.ID, t.Name, t.JobFuncName, duration, state.Data)
+				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, state.Data)
+			// 发送状态事件到 channel（如果提供）
+			e.sendStatusEvent(pendingTask, result)
+			// 调用完成回调（如果提供）
 			if pendingTask.OnComplete != nil {
 				pendingTask.OnComplete(result)
 			}
 		} else {
-			t.Status = task.TaskStatusFailed
+			t.SetStatus("FAILED")
 			log.Printf("❌ [函数执行失败] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 错误=%v",
-				t.ID, t.Name, t.JobFuncName, duration, state.Error)
+				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, state.Error)
 			// 检查是否需要重试
 			if pendingTask.RetryCount < pendingTask.MaxRetries {
 				// 重试：计算重试间隔（1s、2s、4s...）
 				retryDelay := time.Duration(1<<uint(pendingTask.RetryCount)) * time.Second
 				log.Printf("🔄 [准备重试] TaskID=%s, TaskName=%s, 当前重试次数=%d, 延迟=%v",
-					t.ID, t.Name, pendingTask.RetryCount, retryDelay)
+					t.GetID(), t.GetName(), pendingTask.RetryCount, retryDelay)
 				time.Sleep(retryDelay)
 				// 重新提交任务
 				pendingTask.RetryCount++
 				e.SubmitTask(pendingTask)
 			} else {
+				// 发送状态事件到 channel（如果提供）
+				e.sendStatusEvent(pendingTask, result)
+				// 调用错误回调（如果提供）
 				if pendingTask.OnError != nil {
 					pendingTask.OnError(state.Error)
 				}
@@ -444,17 +503,71 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 	case <-ctx.Done():
 		// 超时
 		duration := time.Since(startTime).Milliseconds()
-		t.Status = task.TaskStatusTimeout
+		t.SetStatus("TIMEOUT")
 		log.Printf("⏱️  [函数执行超时] TaskID=%s, TaskName=%s, JobFuncName=%s, 超时时间=%ds, 耗时=%dms",
-			t.ID, t.Name, t.JobFuncName, timeoutSeconds, duration)
+			t.GetID(), t.GetName(), t.GetJobFuncName(), timeoutSeconds, duration)
 		result := &TaskResult{
-			TaskID:   t.ID,
+			TaskID:   t.GetID(),
 			Status:   "TimeoutFailed",
 			Error:    fmt.Errorf("任务执行超时（%d秒）", timeoutSeconds),
 			Duration: duration,
 		}
+		// 发送状态事件到 channel（如果提供）
+		e.sendStatusEvent(pendingTask, result)
+		// 调用错误回调（如果提供）
 		if pendingTask.OnError != nil {
 			pendingTask.OnError(result.Error)
 		}
+	}
+}
+
+// sendStatusEvent 发送任务状态事件到 channel（内部方法）
+// 如果 PendingTask 提供了 StatusChan，则将任务结果转换为事件并发送
+func (e *Executor) sendStatusEvent(pendingTask *PendingTask, result *TaskResult) {
+	if pendingTask.StatusChan == nil {
+		return
+	}
+
+	// 确定状态字符串
+	status := result.Status
+	if status == "TimeoutFailed" {
+		status = "Timeout"
+	}
+
+	// 从 Task 中获取额外信息
+	t := pendingTask.Task
+	isTemplate := false
+	isSubTask := false
+	if t != nil {
+		// 尝试获取 IsTemplate 和 IsSubTask 信息
+		// 注意：workflow.Task 接口可能没有这些方法，需要类型断言
+		if taskWithFlags, ok := t.(interface {
+			IsTemplate() bool
+			IsSubTask() bool
+		}); ok {
+			isTemplate = taskWithFlags.IsTemplate()
+			isSubTask = taskWithFlags.IsSubTask()
+		}
+	}
+
+	// 构建事件
+	event := &TaskStatusEvent{
+		TaskID:     result.TaskID,
+		Status:     status,
+		Result:     result.Data,
+		Error:      result.Error,
+		IsTemplate: isTemplate,
+		IsSubTask:  isSubTask,
+		Timestamp:  time.Now(),
+		Duration:   result.Duration,
+	}
+
+	// 非阻塞发送（避免阻塞 executor）
+	select {
+	case pendingTask.StatusChan <- event:
+		// 成功发送
+	default:
+		// channel 已满，记录警告但不阻塞
+		log.Printf("警告: TaskStatusEvent channel 已满，事件可能丢失: TaskID=%s", result.TaskID)
 	}
 }

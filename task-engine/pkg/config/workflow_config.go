@@ -29,11 +29,14 @@ type WorkflowDefinition struct {
 
 // TaskDefinition Task定义
 type TaskDefinition struct {
-	TaskID       string               `yaml:"task_id"`
-	JobID        string               `yaml:"job_id"`
-	Params       map[string]string    `yaml:"params"`
-	Dependencies []string             `yaml:"dependencies"`
-	Callbacks    []CallbackDefinition `yaml:"callbacks"`
+	TaskID         string               `yaml:"task_id"`
+	JobID          string               `yaml:"job_id"`
+	Params         map[string]string    `yaml:"params"`
+	Dependencies   []string             `yaml:"dependencies"`
+	Callbacks      []CallbackDefinition `yaml:"callbacks"`
+	RequiredParams []string             `yaml:"required_params"` // 必需参数列表
+	ResultMapping  map[string]string    `yaml:"result_mapping"`  // 上游结果字段到下游参数的映射
+	IsTemplate     bool                 `yaml:"is_template"`     // 是否为模板任务（模板任务不执行，仅用于生成子任务）
 }
 
 // CallbackDefinition Callback定义

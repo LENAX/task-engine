@@ -53,7 +53,7 @@ func TestWorkflowRepository_SaveAndGet(t *testing.T) {
 
 	// 创建测试Workflow
 	wf := workflow.NewWorkflow("test-workflow", "测试工作流")
-	wf.Params = map[string]string{"key": "value"}
+	wf.SetParams(map[string]string{"key": "value"})
 
 	// 保存
 	err = repo.Save(ctx, wf)
@@ -89,7 +89,7 @@ func TestWorkflowInstanceRepository_CRUD(t *testing.T) {
 	ctx := context.Background()
 
 	// 创建测试实例
-	instance := &storage.WorkflowInstance{
+	instance := &workflow.WorkflowInstance{
 		ID:         uuid.NewString(),
 		WorkflowID: uuid.NewString(),
 		Status:     "Ready",
@@ -134,7 +134,7 @@ func TestWorkflowInstanceRepository_CRUD(t *testing.T) {
 	}
 
 	// 更新断点数据
-	breakpoint := &storage.BreakpointData{
+	breakpoint := &workflow.BreakpointData{
 		CompletedTaskNames: []string{"task1", "task2"},
 		RunningTaskNames:   []string{"task3"},
 		DAGSnapshot:        make(map[string]interface{}),
