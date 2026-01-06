@@ -21,20 +21,24 @@ type CallbackFunc interface{}
 
 // EngineBuilder 引擎构建器（链式调用）
 type EngineBuilder struct {
-	engineConfigPath string
-	jobFuncs         map[string]JobFunc
-	callbackFuncs    map[string]CallbackFunc
-	services         map[string]interface{}
-	err              error
+	engineConfigPath      string
+	jobFuncs              map[string]JobFunc
+	callbackFuncs         map[string]CallbackFunc
+	services              map[string]interface{}
+	functionMap           map[string]interface{} // 函数映射表，用于函数恢复
+	restoreFunctionsOnStart bool                 // 是否在启动时自动恢复函数
+	err                   error
 }
 
 // NewEngineBuilder 创建引擎构建器（入口）
 func NewEngineBuilder(engineConfigPath string) *EngineBuilder {
 	return &EngineBuilder{
-		engineConfigPath: engineConfigPath,
-		jobFuncs:         make(map[string]JobFunc),
-		callbackFuncs:    make(map[string]CallbackFunc),
-		services:         make(map[string]interface{}),
+		engineConfigPath:       engineConfigPath,
+		jobFuncs:               make(map[string]JobFunc),
+		callbackFuncs:           make(map[string]CallbackFunc),
+		services:               make(map[string]interface{}),
+		functionMap:            make(map[string]interface{}),
+		restoreFunctionsOnStart: false,
 	}
 }
 
@@ -74,6 +78,35 @@ func (b *EngineBuilder) WithService(serviceKey string, service interface{}) *Eng
 		return b
 	}
 	b.services[serviceKey] = service
+	return b
+}
+
+// WithFunctionMap 设置函数映射表，用于函数恢复（链式）
+// funcMap: 函数名称 -> 函数实例的映射
+// 注意：函数名称必须与注册时使用的名称一致
+func (b *EngineBuilder) WithFunctionMap(funcMap map[string]interface{}) *EngineBuilder {
+	if b.err != nil {
+		return b
+	}
+	if funcMap == nil {
+		b.functionMap = make(map[string]interface{})
+	} else {
+		// 创建副本，避免外部修改
+		b.functionMap = make(map[string]interface{})
+		for k, v := range funcMap {
+			b.functionMap[k] = v
+		}
+	}
+	return b
+}
+
+// RestoreFunctionsOnStart 设置在启动时自动恢复函数（链式）
+// 如果设置了此选项，Engine.Start() 时会自动从数据库恢复函数
+func (b *EngineBuilder) RestoreFunctionsOnStart() *EngineBuilder {
+	if b.err != nil {
+		return b
+	}
+	b.restoreFunctionsOnStart = true
 	return b
 }
 
@@ -151,6 +184,18 @@ func (b *EngineBuilder) Build() (*Engine, error) {
 			// 依赖已存在时忽略错误（允许重复注册）
 			log.Printf("注册服务依赖 %s 失败（可能已存在）: %v", serviceKey, err)
 		}
+	}
+
+	// 10. 如果提供了functionMap，保存到Engine中，供Start()时恢复使用
+	if len(b.functionMap) > 0 {
+		engine.SetFunctionMap(b.functionMap)
+		log.Printf("📝 [EngineBuilder] 已设置函数映射表，包含 %d 个函数", len(b.functionMap))
+	}
+
+	// 11. 如果设置了自动恢复选项，启用Engine的自动恢复功能
+	if b.restoreFunctionsOnStart {
+		engine.EnableFunctionRestoreOnStart()
+		log.Printf("📝 [EngineBuilder] 已启用启动时自动恢复函数功能")
 	}
 
 	return engine, nil
