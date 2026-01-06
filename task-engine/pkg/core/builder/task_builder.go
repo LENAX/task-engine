@@ -224,16 +224,12 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 		// 尝试通过名称查找函数ID
 		funcID := b.registry.GetIDByName(b.jobFuncName)
 		if funcID == "" {
-			// 如果通过名称找不到，尝试直接使用jobFuncName作为ID检查
-			if !b.registry.Exists(b.jobFuncName) {
-				return nil, fmt.Errorf("Job函数 %s 未在registry中注册", b.jobFuncName)
-			}
-			funcID = b.jobFuncName
-		} else {
-			// 验证函数确实存在
-			if !b.registry.Exists(funcID) {
-				return nil, fmt.Errorf("Job函数 %s (ID: %s) 未在registry中注册", b.jobFuncName, funcID)
-			}
+			// 如果通过名称找不到函数，直接报错
+			return nil, fmt.Errorf("Job函数 %s 未在registry中注册", b.jobFuncName)
+		}
+		// 验证函数确实存在（双重检查，确保数据一致性）
+		if !b.registry.Exists(funcID) {
+			return nil, fmt.Errorf("Job函数 %s (ID: %s) 未在registry中注册", b.jobFuncName, funcID)
 		}
 		b.jobFuncID = funcID
 

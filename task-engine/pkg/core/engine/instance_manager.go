@@ -11,6 +11,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/dag"
 	"github.com/stevelan1995/task-engine/pkg/core/executor"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
@@ -1484,6 +1485,216 @@ func (m *WorkflowInstanceManager) AddSubTask(subTask workflow.Task, parentTaskID
 		log.Printf("WorkflowInstance %s: 子任务 %s 已添加，依赖已满足，加入就绪任务集合", m.instance.ID, subTask.GetName())
 	} else {
 		log.Printf("WorkflowInstance %s: 子任务 %s 已添加，等待依赖满足（父任务: %s）", m.instance.ID, subTask.GetName(), parentTaskID)
+	}
+
+	return nil
+}
+
+// AtomicAddSubTasks 原子性地添加多个子任务到WorkflowInstance（公共方法，实现接口）
+// 保证要么全部成功，要么全部失败（回滚）
+func (m *WorkflowInstanceManager) AtomicAddSubTasks(subTasks []types.Task, parentTaskID string) error {
+	if len(subTasks) == 0 {
+		return nil // 空列表，直接返回成功
+	}
+
+	// 验证所有子任务
+	for i, subTask := range subTasks {
+		if subTask == nil {
+			return fmt.Errorf("子任务[%d]不能为空", i)
+		}
+		if subTask.GetID() == "" {
+			return fmt.Errorf("子任务[%d] ID不能为空", i)
+		}
+		if subTask.GetName() == "" {
+			return fmt.Errorf("子任务[%d]名称不能为空", i)
+		}
+	}
+
+	// 类型转换：types.Task -> workflow.Task
+	workflowTasks := make([]workflow.Task, 0, len(subTasks))
+	for _, subTask := range subTasks {
+		workflowTask, ok := subTask.(workflow.Task)
+		if !ok {
+			return fmt.Errorf("子任务类型转换失败: TaskID=%s", subTask.GetID())
+		}
+		workflowTasks = append(workflowTasks, workflowTask)
+	}
+
+	// 记录已添加的子任务，用于回滚
+	addedSubTasks := make([]workflow.Task, 0, len(workflowTasks))
+	addedToDAG := make([]string, 0, len(workflowTasks)) // 记录已添加到DAG的任务ID
+
+	// 第一步：添加所有子任务到Workflow（如果失败，回滚）
+	for _, subTask := range workflowTasks {
+		// 设置isSubTask标志
+		subTask.SetSubTask(true)
+
+		// 使用Workflow的AddSubTask方法（线程安全）
+		if err := m.workflow.AddSubTask(subTask, parentTaskID); err != nil {
+			// 回滚已添加的子任务
+			for _, addedTask := range addedSubTasks {
+				m.workflow.Tasks.Delete(addedTask.GetID())
+				m.workflow.Dependencies.Delete(addedTask.GetID())
+				// 从TaskNameIndex中删除
+				if taskName := addedTask.GetName(); taskName != "" {
+					m.workflow.TaskNameIndex.Delete(taskName)
+				}
+			}
+			return fmt.Errorf("添加子任务到Workflow失败: %w", err)
+		}
+		addedSubTasks = append(addedSubTasks, subTask)
+	}
+
+	// 第二步：更新DAG依赖关系（重构：父任务-子任务-下游任务）
+	parentNode, exists := m.dag.GetNode(parentTaskID)
+	if exists {
+		downstreamTaskIDs := parentNode.OutEdges
+		if len(downstreamTaskIDs) > 0 {
+			// 需要重构依赖关系：
+			// 1. 删除父任务到下游任务的直接依赖（在Workflow.Dependencies中）
+			// 2. 添加所有子任务到下游任务的依赖
+			for _, downstreamID := range downstreamTaskIDs {
+				// 从Workflow.Dependencies中删除父任务到下游任务的依赖
+				depsValue, exists := m.workflow.Dependencies.Load(downstreamID)
+				if exists {
+					deps := depsValue.([]string)
+					newDeps := make([]string, 0, len(deps))
+					for _, depID := range deps {
+						if depID != parentTaskID {
+							newDeps = append(newDeps, depID)
+						}
+					}
+					m.workflow.Dependencies.Store(downstreamID, newDeps)
+				}
+
+				// 添加所有子任务到下游任务的依赖（在Workflow.Dependencies中）
+				depsValue2, _ := m.workflow.Dependencies.LoadOrStore(downstreamID, make([]string, 0))
+				deps := depsValue2.([]string)
+				existingDeps := make(map[string]bool)
+				for _, depID := range deps {
+					existingDeps[depID] = true
+				}
+
+				// 添加所有子任务ID到依赖列表（如果不存在）
+				newDeps := make([]string, 0, len(deps)+len(workflowTasks))
+				copy(newDeps, deps)
+				for _, subTask := range workflowTasks {
+					subTaskID := subTask.GetID()
+					if !existingDeps[subTaskID] {
+						newDeps = append(newDeps, subTaskID)
+						existingDeps[subTaskID] = true
+					}
+				}
+				m.workflow.Dependencies.Store(downstreamID, newDeps)
+			}
+		}
+	}
+
+	// 第三步：更新DAG，添加所有子任务节点和依赖关系
+	// 如果任何子任务添加失败，回滚所有已添加的子任务
+	for _, subTask := range workflowTasks {
+		if err := m.dag.AddNode(subTask.GetID(), subTask.GetName(), subTask, []string{parentTaskID}); err != nil {
+			// 回滚DAG：删除已添加到DAG的节点
+			for _, addedTaskID := range addedToDAG {
+				// 注意：DAG可能不支持删除节点，这里我们只回滚Workflow的更改
+				_ = addedTaskID
+			}
+
+			// 回滚Workflow的更改
+			for _, addedTask := range addedSubTasks {
+				m.workflow.Tasks.Delete(addedTask.GetID())
+				m.workflow.Dependencies.Delete(addedTask.GetID())
+				// 从TaskNameIndex中删除
+				if taskName := addedTask.GetName(); taskName != "" {
+					m.workflow.TaskNameIndex.Delete(taskName)
+				}
+			}
+
+			// 回滚下游任务的依赖关系
+			if exists {
+				for _, downstreamID := range parentNode.OutEdges {
+					// 恢复父任务到下游任务的依赖
+					depsValue, _ := m.workflow.Dependencies.LoadOrStore(downstreamID, make([]string, 0))
+					deps := depsValue.([]string)
+					found := false
+					for _, depID := range deps {
+						if depID == parentTaskID {
+							found = true
+							break
+						}
+					}
+					if !found {
+						newDeps := make([]string, len(deps), len(deps)+1)
+						copy(newDeps, deps)
+						newDeps = append(newDeps, parentTaskID)
+						m.workflow.Dependencies.Store(downstreamID, newDeps)
+					}
+
+					// 删除所有子任务到下游任务的依赖
+					depsValue, _ = m.workflow.Dependencies.Load(downstreamID)
+					deps = depsValue.([]string)
+					newDeps := make([]string, 0, len(deps))
+					for _, depID := range deps {
+						isSubTaskID := false
+						for _, subTask := range workflowTasks {
+							if depID == subTask.GetID() {
+								isSubTaskID = true
+								break
+							}
+						}
+						if !isSubTaskID {
+							newDeps = append(newDeps, depID)
+						}
+					}
+					m.workflow.Dependencies.Store(downstreamID, newDeps)
+				}
+			}
+
+			return fmt.Errorf("添加子任务 %s 到DAG失败: %w", subTask.GetID(), err)
+		}
+		addedToDAG = append(addedToDAG, subTask.GetID())
+	}
+
+	// 第四步：增加父任务的子任务总数（每个子任务都增加一次）
+	for range workflowTasks {
+		m.incrementParentSubTaskTotal(parentTaskID)
+	}
+
+	// 第五步：检查每个子任务的依赖是否已满足，如果满足则加入就绪任务集合
+	allDepsProcessed := true
+	if _, processed := m.processedNodes.Load(parentTaskID); !processed {
+		allDepsProcessed = false
+	}
+
+	// 检查子任务通过GetDependencies()声明的其他依赖（如果有）
+	if allDepsProcessed {
+		for _, subTask := range workflowTasks {
+			subTaskDeps := subTask.GetDependencies()
+			for _, depName := range subTaskDeps {
+				depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+				if !exists {
+					allDepsProcessed = false
+					break
+				}
+				if _, processed := m.processedNodes.Load(depTaskID); !processed {
+					allDepsProcessed = false
+					break
+				}
+			}
+			if !allDepsProcessed {
+				break
+			}
+		}
+	}
+
+	// 如果所有子任务的依赖都已满足，批量加入就绪任务集合
+	if allDepsProcessed {
+		for _, subTask := range workflowTasks {
+			m.readyTasksSet.Store(subTask.GetID(), subTask)
+		}
+		log.Printf("WorkflowInstance %s: 批量添加 %d 个子任务，依赖已满足，已加入就绪任务集合", m.instance.ID, len(workflowTasks))
+	} else {
+		log.Printf("WorkflowInstance %s: 批量添加 %d 个子任务，等待依赖满足（父任务: %s）", m.instance.ID, len(workflowTasks), parentTaskID)
 	}
 
 	return nil

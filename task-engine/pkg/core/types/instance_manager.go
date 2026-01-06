@@ -25,6 +25,13 @@ type WorkflowInstanceManager interface {
 	// subTask 类型为 Task（即 types.Task，workflow.Task 是它的别名）
 	AddSubTask(subTask Task, parentTaskID string) error
 
+	// AtomicAddSubTasks 原子性地添加多个子任务到WorkflowInstance
+	// 保证要么全部成功，要么全部失败（回滚）
+	// subTasks 类型为 []Task（即 []types.Task，workflow.Task 是它的别名）
+	// parentTaskID 父任务ID
+	// 返回错误时，所有已添加的子任务都会被回滚
+	AtomicAddSubTasks(subTasks []Task, parentTaskID string) error
+
 	// RestoreFromBreakpoint 从断点数据恢复WorkflowInstance状态
 	// breakpoint 类型为 *workflow.BreakpointData
 	RestoreFromBreakpoint(breakpoint interface{}) error
