@@ -55,7 +55,7 @@ type Engine struct {
 	managers                map[string]types.WorkflowInstanceManager // WorkflowInstance ID -> Manager映射
 	controllers             map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
 	cronScheduler           *CronScheduler                           // 定时调度器
-	pluginManager           *plugin.PluginManager                    // 插件管理器
+	pluginManager           plugin.PluginManager                     // 插件管理器（接口）
 	mu                      sync.RWMutex
 	instanceManagerVersion  InstanceManagerVersion // InstanceManager版本，默认V2
 }
@@ -259,7 +259,7 @@ func (e *Engine) GetRegistry() *task.FunctionRegistry {
 }
 
 // GetPluginManager 获取插件管理器（对外导出）
-func (e *Engine) GetPluginManager() *plugin.PluginManager {
+func (e *Engine) GetPluginManager() plugin.PluginManager {
 	return e.pluginManager
 }
 

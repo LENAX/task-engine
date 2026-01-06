@@ -308,8 +308,8 @@ type WorkflowInstanceManagerV2 struct {
 	sagaCoordinator *saga.Coordinator
 	sagaEnabled     bool // 是否启用SAGA
 
-	// 插件管理器（可选）
-	pluginManager *plugin.PluginManager
+	// 插件管理器（可选，接口类型）
+	pluginManager plugin.PluginManager
 }
 
 // NewWorkflowInstanceManagerV2 创建WorkflowInstanceManagerV2实例
@@ -320,7 +320,7 @@ func NewWorkflowInstanceManagerV2(
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
 	registry *task.FunctionRegistry,
-	pluginManager *plugin.PluginManager,
+	pluginManager plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG
 	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())
@@ -403,7 +403,7 @@ func NewWorkflowInstanceManagerV2WithAggregate(
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
 	registry *task.FunctionRegistry,
-	pluginManager *plugin.PluginManager,
+	pluginManager plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG
 	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())

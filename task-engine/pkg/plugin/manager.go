@@ -46,23 +46,41 @@ type PluginData struct {
 	Data       map[string]interface{} // 自定义数据
 }
 
-// PluginManager 插件管理器（对外导出）
-type PluginManager struct {
+// PluginManager 插件管理器接口（对外导出）
+type PluginManager interface {
+	// Register 注册插件
+	Register(plugin Plugin) error
+	// RegisterWithInit 注册并初始化插件
+	RegisterWithInit(plugin Plugin, params map[string]string) error
+	// Bind 绑定插件到事件
+	Bind(binding PluginBinding) error
+	// Trigger 触发插件
+	Trigger(ctx context.Context, event TriggerEvent, data PluginData) error
+	// GetPlugin 获取已注册的插件
+	GetPlugin(name string) (Plugin, bool)
+	// ListPlugins 列出所有已注册的插件
+	ListPlugins() []string
+	// Unregister 取消注册插件
+	Unregister(name string) error
+}
+
+// pluginManagerImpl 插件管理器实现（内部实现）
+type pluginManagerImpl struct {
 	plugins  map[string]Plugin                // 已注册的插件（插件名称 -> 插件实例）
 	bindings map[TriggerEvent][]PluginBinding // 事件绑定（事件类型 -> 绑定列表）
 	mu       sync.RWMutex                     // 读写锁
 }
 
 // NewPluginManager 创建插件管理器（对外导出）
-func NewPluginManager() *PluginManager {
-	return &PluginManager{
+func NewPluginManager() PluginManager {
+	return &pluginManagerImpl{
 		plugins:  make(map[string]Plugin),
 		bindings: make(map[TriggerEvent][]PluginBinding),
 	}
 }
 
-// Register 注册插件（对外导出）
-func (pm *PluginManager) Register(plugin Plugin) error {
+// Register 注册插件（实现PluginManager接口）
+func (pm *pluginManagerImpl) Register(plugin Plugin) error {
 	if plugin == nil {
 		return fmt.Errorf("插件不能为空")
 	}
@@ -83,8 +101,8 @@ func (pm *PluginManager) Register(plugin Plugin) error {
 	return nil
 }
 
-// RegisterWithInit 注册并初始化插件（对外导出）
-func (pm *PluginManager) RegisterWithInit(plugin Plugin, params map[string]string) error {
+// RegisterWithInit 注册并初始化插件（实现PluginManager接口）
+func (pm *pluginManagerImpl) RegisterWithInit(plugin Plugin, params map[string]string) error {
 	if err := pm.Register(plugin); err != nil {
 		return err
 	}
@@ -101,8 +119,8 @@ func (pm *PluginManager) RegisterWithInit(plugin Plugin, params map[string]strin
 	return nil
 }
 
-// Bind 绑定插件到事件（对外导出）
-func (pm *PluginManager) Bind(binding PluginBinding) error {
+// Bind 绑定插件到事件（实现PluginManager接口）
+func (pm *pluginManagerImpl) Bind(binding PluginBinding) error {
 	if binding.PluginName == "" {
 		return fmt.Errorf("插件名称不能为空")
 	}
@@ -126,8 +144,8 @@ func (pm *PluginManager) Bind(binding PluginBinding) error {
 	return nil
 }
 
-// Trigger 触发插件（对外导出）
-func (pm *PluginManager) Trigger(ctx context.Context, event TriggerEvent, data PluginData) error {
+// Trigger 触发插件（实现PluginManager接口）
+func (pm *pluginManagerImpl) Trigger(ctx context.Context, event TriggerEvent, data PluginData) error {
 	pm.mu.RLock()
 	bindings, exists := pm.bindings[event]
 	pm.mu.RUnlock()
@@ -165,16 +183,16 @@ func (pm *PluginManager) Trigger(ctx context.Context, event TriggerEvent, data P
 	return nil
 }
 
-// GetPlugin 获取已注册的插件（对外导出）
-func (pm *PluginManager) GetPlugin(name string) (Plugin, bool) {
+// GetPlugin 获取已注册的插件（实现PluginManager接口）
+func (pm *pluginManagerImpl) GetPlugin(name string) (Plugin, bool) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	plugin, exists := pm.plugins[name]
 	return plugin, exists
 }
 
-// ListPlugins 列出所有已注册的插件（对外导出）
-func (pm *PluginManager) ListPlugins() []string {
+// ListPlugins 列出所有已注册的插件（实现PluginManager接口）
+func (pm *pluginManagerImpl) ListPlugins() []string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
@@ -185,8 +203,8 @@ func (pm *PluginManager) ListPlugins() []string {
 	return names
 }
 
-// Unregister 取消注册插件（对外导出）
-func (pm *PluginManager) Unregister(name string) error {
+// Unregister 取消注册插件（实现PluginManager接口）
+func (pm *pluginManagerImpl) Unregister(name string) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
