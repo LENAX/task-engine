@@ -304,8 +304,8 @@ type WorkflowInstanceManagerV2 struct {
 	statusUpdateChan  chan string
 	mu                sync.RWMutex // 仅保护 instance 状态
 
-	// SAGA事务协调器（可选）
-	sagaCoordinator *saga.Coordinator
+	// SAGA事务协调器（可选，接口类型）
+	sagaCoordinator saga.Coordinator
 	sagaEnabled     bool // 是否启用SAGA
 
 	// 插件管理器（可选，接口类型）
@@ -352,7 +352,7 @@ func NewWorkflowInstanceManagerV2(
 	}
 
 	// 如果启用SAGA，创建协调器
-	var sagaCoordinator *saga.Coordinator
+	var sagaCoordinator saga.Coordinator
 	if sagaEnabled && registry != nil {
 		sagaCoordinator = saga.NewCoordinator(instance.ID, registry)
 		log.Printf("WorkflowInstance %s: SAGA事务已启用", instance.ID)
@@ -435,7 +435,7 @@ func NewWorkflowInstanceManagerV2WithAggregate(
 	}
 
 	// 如果启用SAGA，创建协调器
-	var sagaCoordinator *saga.Coordinator
+	var sagaCoordinator saga.Coordinator
 	if sagaEnabled && registry != nil {
 		sagaCoordinator = saga.NewCoordinator(instance.ID, registry)
 		log.Printf("WorkflowInstance %s: SAGA事务已启用", instance.ID)
