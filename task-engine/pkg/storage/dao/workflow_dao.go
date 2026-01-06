@@ -17,4 +17,6 @@ type WorkflowDAO struct {
 	Transactional        bool      `db:"transactional"`             // 是否启用事务（预留字段）
 	TransactionMode      string    `db:"transaction_mode"`           // 事务模式（预留字段）
 	MaxConcurrentTask     int       `db:"max_concurrent_task"`       // 最大并发任务数，默认10
+	CronExpr              string    `db:"cron_expr"`                  // Cron表达式（定时调度）
+	CronEnabled           bool      `db:"cron_enabled"`               // 是否启用定时调度
 }
