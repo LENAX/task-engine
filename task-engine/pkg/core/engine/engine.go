@@ -24,6 +24,16 @@ type WorkflowDefinition struct {
 	Workflow   *workflow.Workflow     // 转换后的Workflow对象
 }
 
+// InstanceManagerVersion 定义InstanceManager版本类型
+type InstanceManagerVersion int
+
+const (
+	// InstanceManagerV1 使用V1版本的InstanceManager
+	InstanceManagerV1 InstanceManagerVersion = 1
+	// InstanceManagerV2 使用V2版本的InstanceManager（默认，支持SAGA事务）
+	InstanceManagerV2 InstanceManagerVersion = 2
+)
+
 // Engine 调度引擎核心结构体（对外导出）
 type Engine struct {
 	executor                *executor.Executor
@@ -43,6 +53,7 @@ type Engine struct {
 	managers                map[string]types.WorkflowInstanceManager // WorkflowInstance ID -> Manager映射
 	controllers             map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
 	mu                      sync.RWMutex
+	instanceManagerVersion  InstanceManagerVersion // InstanceManager版本，默认V2
 }
 
 // NewEngine 创建Engine实例（对外导出的工厂方法）
@@ -92,7 +103,20 @@ func NewEngineWithRepos(
 		running:                 false,
 		managers:                make(map[string]types.WorkflowInstanceManager),
 		controllers:             make(map[string]workflow.WorkflowController),
+		instanceManagerVersion:  InstanceManagerV2, // 默认使用V2版本
 	}, nil
+}
+
+// SetInstanceManagerVersion 设置使用的InstanceManager版本（对外导出）
+// 必须在Start()之前调用
+func (e *Engine) SetInstanceManagerVersion(version InstanceManagerVersion) {
+	e.instanceManagerVersion = version
+	log.Printf("InstanceManager版本已设置为: V%d", version)
+}
+
+// GetInstanceManagerVersion 获取当前使用的InstanceManager版本（对外导出）
+func (e *Engine) GetInstanceManagerVersion() InstanceManagerVersion {
+	return e.instanceManagerVersion
 }
 
 // Start 启动引擎（对外导出）
@@ -275,15 +299,27 @@ func (e *Engine) restoreInstance(ctx context.Context, instance *workflow.Workflo
 		return fmt.Errorf("Workflow模板不存在: %s", instance.WorkflowID)
 	}
 
-	// 创建WorkflowInstanceManager（会自动从断点数据恢复）
-	manager, err := NewWorkflowInstanceManager(
-		instance,
-		wf,
-		e.executor,
-		e.taskRepo,
-		e.workflowInstanceRepo,
-		e.registry,
-	)
+	// 根据配置创建对应版本的WorkflowInstanceManager（会自动从断点数据恢复）
+	var manager types.WorkflowInstanceManager
+	if e.instanceManagerVersion == InstanceManagerV2 {
+		manager, err = NewWorkflowInstanceManagerV2(
+			instance,
+			wf,
+			e.executor,
+			e.taskRepo,
+			e.workflowInstanceRepo,
+			e.registry,
+		)
+	} else {
+		manager, err = NewWorkflowInstanceManager(
+			instance,
+			wf,
+			e.executor,
+			e.taskRepo,
+			e.workflowInstanceRepo,
+			e.registry,
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("创建WorkflowInstanceManager失败: %w", err)
 	}
@@ -610,17 +646,30 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 		return nil, fmt.Errorf("保存Workflow和Task失败: %w", err)
 	}
 
-	// 创建WorkflowInstanceManager
-	manager, err := NewWorkflowInstanceManager(
-		instance,
-		wf,
-		e.executor,
-		e.taskRepo,
-		e.workflowInstanceRepo,
-		e.registry,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("创建WorkflowInstanceManager失败: %w", err)
+	// 根据配置创建对应版本的WorkflowInstanceManager
+	var manager types.WorkflowInstanceManager
+	var managerErr error
+	if e.instanceManagerVersion == InstanceManagerV2 {
+		manager, managerErr = NewWorkflowInstanceManagerV2(
+			instance,
+			wf,
+			e.executor,
+			e.taskRepo,
+			e.workflowInstanceRepo,
+			e.registry,
+		)
+	} else {
+		manager, managerErr = NewWorkflowInstanceManager(
+			instance,
+			wf,
+			e.executor,
+			e.taskRepo,
+			e.workflowInstanceRepo,
+			e.registry,
+		)
+	}
+	if managerErr != nil {
+		return nil, fmt.Errorf("创建WorkflowInstanceManager失败: %w", managerErr)
 	}
 
 	// 创建WorkflowController
@@ -774,17 +823,29 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 			return logError("workflow_not_found", "Workflow模板不存在")
 		}
 
-		// 重新创建Manager并恢复
-		manager, err = NewWorkflowInstanceManager(
-			instance,
-			wf,
-			e.executor,
-			e.taskRepo,
-			e.workflowInstanceRepo,
-			e.registry,
-		)
-		if err != nil {
-			return fmt.Errorf("恢复WorkflowInstanceManager失败: %w", err)
+		// 根据配置创建对应版本的Manager并恢复
+		var managerErr error
+		if e.instanceManagerVersion == InstanceManagerV2 {
+			manager, managerErr = NewWorkflowInstanceManagerV2(
+				instance,
+				wf,
+				e.executor,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+			)
+		} else {
+			manager, managerErr = NewWorkflowInstanceManager(
+				instance,
+				wf,
+				e.executor,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+			)
+		}
+		if managerErr != nil {
+			return fmt.Errorf("恢复WorkflowInstanceManager失败: %w", managerErr)
 		}
 
 		e.mu.Lock()

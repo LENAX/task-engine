@@ -235,6 +235,25 @@ func (m *WorkflowInstanceManager) taskSubmissionGoroutine() {
 					continue
 				}
 
+				// 检查依赖任务是否有失败的，如果有则跳过当前任务
+				if failedDep := m.checkDependencyFailed(t); failedDep != "" {
+					log.Printf("⚠️ WorkflowInstance %s: 任务 %s (%s) 的依赖任务 %s 已失败，跳过执行并标记为失败",
+						m.instance.ID, taskID, taskName, failedDep)
+
+					// 标记当前任务为失败
+					t.SetStatus(task.TaskStatusFailed)
+					m.processedNodes.Store(taskID, true)
+					m.readyTasksSet.Delete(taskID)
+
+					// 保存错误信息
+					errorKey := fmt.Sprintf("%s:error", taskID)
+					m.contextData.Store(errorKey, fmt.Sprintf("依赖任务 %s 执行失败，跳过当前任务", failedDep))
+
+					// 检查下游任务是否可以就绪（虽然当前任务失败，但下游任务可能需要处理）
+					m.onTaskCompleted(taskID)
+					continue
+				}
+
 				// 检查是否为模板任务（模板任务不执行，仅用于生成子任务）
 				if t.IsTemplate() {
 					log.Printf("📋 WorkflowInstance %s: Task %s (%s) 是模板任务，跳过执行，标记为已处理",
@@ -606,6 +625,32 @@ func (m *WorkflowInstanceManager) onTaskCompleted(taskID string) {
 	for _, childID := range children {
 		m.checkAndAddToReady(childID)
 	}
+}
+
+// checkDependencyFailed 检查任务的依赖是否有失败的
+// 返回失败的依赖任务名称，如果没有失败的依赖则返回空字符串
+func (m *WorkflowInstanceManager) checkDependencyFailed(t workflow.Task) string {
+	deps := t.GetDependencies()
+	for _, depName := range deps {
+		depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+		if !exists {
+			continue
+		}
+
+		// 检查依赖任务是否失败
+		if depTask, exists := m.workflow.GetTasks()[depTaskID]; exists {
+			if depTask.GetStatus() == task.TaskStatusFailed {
+				return depName
+			}
+		}
+
+		// 也检查 contextData 中的错误信息（用于处理状态未及时更新的情况）
+		errorKey := fmt.Sprintf("%s:error", depTaskID)
+		if _, hasError := m.contextData.Load(errorKey); hasError {
+			return depName
+		}
+	}
+	return ""
 }
 
 // getAvailableTasks 获取可执行的任务列表（优化版：使用 readyTasksSet，O(1)访问）

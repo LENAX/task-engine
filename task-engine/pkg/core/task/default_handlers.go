@@ -328,38 +328,67 @@ func DefaultValidateParams(ctx *TaskContext) {
 }
 
 // DefaultCompensate 默认补偿Handler（对外导出）
-// 执行补偿逻辑，回滚已执行的子任务
+// 执行补偿逻辑，通过registry获取补偿函数并执行
 // 配置参数：
-//   - compensate_actions ([]func(*TaskContext) error) - 补偿动作列表（通过参数传递，需要序列化）
+//   - compensate_func_name (string) - 补偿函数名称（作为TaskHandler注册）
+//   - compensate_func_id (string) - 补偿函数ID（可选，优先使用名称）
+// 或者通过Task的CompensationFuncName字段获取
 func DefaultCompensate(ctx *TaskContext) {
-	// 获取补偿动作列表
-	actions := ctx.GetParam("compensate_actions")
-	if actions == nil {
-		log.Printf("⚠️ [DefaultCompensate] TaskID=%s, 未找到补偿动作列表", ctx.TaskID)
+	// 尝试从参数获取补偿函数名称
+	compensateFuncName := ctx.GetParamString("compensate_func_name")
+	if compensateFuncName == "" {
+		// 尝试从Task的CompensationFuncName获取（如果Task信息在context中）
+		// 注意：这里需要从依赖注入获取registry，然后通过TaskID查找Task
+		log.Printf("⚠️ [DefaultCompensate] TaskID=%s, 未找到补偿函数名称", ctx.TaskID)
 		return
 	}
 
-	// 尝试转换为动作列表
-	var actionList []interface{}
-	switch v := actions.(type) {
-	case []interface{}:
-		actionList = v
-	default:
-		log.Printf("⚠️ [DefaultCompensate] TaskID=%s, 补偿动作列表格式不正确", ctx.TaskID)
+	// 从依赖注入获取FunctionRegistry
+	registry, ok := GetDependencyTyped[*FunctionRegistry](ctx.Context(), "FunctionRegistry")
+	if !ok {
+		// 尝试通过字符串key获取
+		dep, ok := ctx.GetDependency("FunctionRegistry")
+		if !ok {
+			log.Printf("⚠️ [DefaultCompensate] TaskID=%s, 未找到FunctionRegistry依赖", ctx.TaskID)
+			return
+		}
+		var ok2 bool
+		registry, ok2 = dep.(*FunctionRegistry)
+		if !ok2 {
+			log.Printf("⚠️ [DefaultCompensate] TaskID=%s, FunctionRegistry类型不正确", ctx.TaskID)
+			return
+		}
+	}
+
+	// 从registry获取补偿函数（作为TaskHandler）
+	compensateHandler := registry.GetTaskHandlerByName(compensateFuncName)
+	if compensateHandler == nil {
+		// 尝试通过ID获取
+		compensateFuncID := ctx.GetParamString("compensate_func_id")
+		if compensateFuncID != "" {
+			compensateHandler = registry.GetTaskHandler(compensateFuncID)
+		}
+	}
+
+	if compensateHandler == nil {
+		log.Printf("⚠️ [DefaultCompensate] TaskID=%s, 补偿函数 %s 未找到", ctx.TaskID, compensateFuncName)
 		return
 	}
 
-	// 逆序执行补偿动作（类似回滚）
-	log.Printf("🔄 [DefaultCompensate] TaskID=%s, 开始执行补偿逻辑，共 %d 个动作", ctx.TaskID, len(actionList))
+	// 执行补偿函数
+	log.Printf("🔄 [DefaultCompensate] TaskID=%s, 开始执行补偿函数: %s", ctx.TaskID, compensateFuncName)
+	
+	// 在goroutine中执行，避免阻塞
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("❌ [DefaultCompensate] TaskID=%s, 补偿函数执行panic: %v", ctx.TaskID, r)
+			}
+		}()
+		compensateHandler(ctx)
+	}()
 
-	for i := len(actionList) - 1; i >= 0; i-- {
-		action := actionList[i]
-		// 这里需要调用补偿动作，但由于类型限制，只记录日志
-		_ = action
-		log.Printf("🔄 [DefaultCompensate] TaskID=%s, 执行补偿动作 %d", ctx.TaskID, i+1)
-	}
-
-	log.Printf("✅ [DefaultCompensate] TaskID=%s, 补偿逻辑执行完成", ctx.TaskID)
+	log.Printf("✅ [DefaultCompensate] TaskID=%s, 补偿函数已启动", ctx.TaskID)
 }
 
 // DefaultSkipIfCached 默认缓存跳过Handler（对外导出）
