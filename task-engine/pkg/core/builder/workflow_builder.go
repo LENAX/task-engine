@@ -29,6 +29,14 @@ func (b *WorkflowBuilder) WithName(name string) *WorkflowBuilder {
 	return b
 }
 
+// WithCronExpr 设置Cron表达式（链式构建，对外导出）
+// cronExpr: Cron表达式，支持秒级精度（如 "0 0 0 * * *" 表示每天凌晨执行）
+func (b *WorkflowBuilder) WithCronExpr(cronExpr string) *WorkflowBuilder {
+	b.wf.SetCronExpr(cronExpr)
+	b.wf.SetCronEnabled(true)
+	return b
+}
+
 // WithTask 向当前Workflow中添加任务（链式构建，对外导出）
 // task: Task实例（需提前通过TaskBuilder构建）
 func (b *WorkflowBuilder) WithTask(t *task.Task) *WorkflowBuilder {
