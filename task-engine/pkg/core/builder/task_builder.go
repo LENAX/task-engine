@@ -10,18 +10,20 @@ import (
 
 // TaskBuilder Task构建器（对外导出）
 type TaskBuilder struct {
-	name           string
-	description    string
-	jobFuncName    string
-	jobFuncID      string // Job函数ID（从registry获取）
-	params         map[string]interface{}
-	timeoutSeconds int
-	retryCount     int
-	dependencies   []string
-	statusHandlers map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
-	requiredParams []string            // 必需参数列表
-	resultMapping  map[string]string   // 上游结果字段到下游参数的映射规则
-	registry       *task.FunctionRegistry
+	name                 string
+	description          string
+	jobFuncName          string
+	jobFuncID            string // Job函数ID（从registry获取）
+	compensationFuncName string // 补偿函数名称
+	compensationFuncID   string // 补偿函数ID（从registry获取）
+	params               map[string]interface{}
+	timeoutSeconds       int
+	retryCount           int
+	dependencies         []string
+	statusHandlers       map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
+	requiredParams       []string            // 必需参数列表
+	resultMapping        map[string]string   // 上游结果字段到下游参数的映射规则
+	registry             *task.FunctionRegistry
 }
 
 // NewTaskBuilder 创建Task构建器（对外导出，必须包含registry）
@@ -199,6 +201,18 @@ func (b *TaskBuilder) WithResultMapping(mapping map[string]string) *TaskBuilder 
 	return b
 }
 
+// WithCompensationFunction 设置补偿函数（链式构建，对外导出）
+// fnName: 已注册的补偿函数名称（作为TaskHandler注册）
+// 注意：函数存在性校验延迟到Build()时进行
+func (b *TaskBuilder) WithCompensationFunction(fnName string) *TaskBuilder {
+	if fnName == "" {
+		return b // 空名称，忽略
+	}
+	b.compensationFuncName = fnName
+	b.compensationFuncID = "" // 在Build()时再查找和验证
+	return b
+}
+
 // Build 完成Task构建（对外导出）
 // 自动生成Task UUID作为唯一标识，校验Task名称唯一性
 // 会验证所有引用的JobFunction和TaskHandler是否存在
@@ -259,6 +273,24 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 				b.statusHandlers[status] = validatedIDs
 			}
 		}
+
+		// 验证补偿函数是否存在（如果提供了）
+		if b.compensationFuncName != "" {
+			compensateHandlerID := b.registry.GetTaskHandlerIDByName(b.compensationFuncName)
+			if compensateHandlerID == "" {
+				// 如果通过名称找不到，尝试直接使用compensationFuncName作为ID检查
+				if !b.registry.TaskHandlerExists(b.compensationFuncName) {
+					return nil, fmt.Errorf("补偿函数 %s 未在registry中注册（需要作为TaskHandler注册）", b.compensationFuncName)
+				}
+				compensateHandlerID = b.compensationFuncName
+			} else {
+				// 验证Handler确实存在
+				if !b.registry.TaskHandlerExists(compensateHandlerID) {
+					return nil, fmt.Errorf("补偿函数 %s (ID: %s) 未在registry中注册", b.compensationFuncName, compensateHandlerID)
+				}
+			}
+			b.compensationFuncID = compensateHandlerID
+		}
 	}
 
 	// 使用 NewTask 创建 Task 实例
@@ -311,6 +343,12 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 			strValue = fmt.Sprintf("%v", val)
 		}
 		t.Params.Store(k, strValue)
+	}
+
+	// 设置补偿函数信息
+	if b.compensationFuncName != "" {
+		t.SetCompensationFuncName(b.compensationFuncName)
+		t.SetCompensationFuncID(b.compensationFuncID)
 	}
 
 	return t, nil

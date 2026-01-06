@@ -12,6 +12,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/cache"
 	"github.com/stevelan1995/task-engine/pkg/core/dag"
 	"github.com/stevelan1995/task-engine/pkg/core/executor"
+	"github.com/stevelan1995/task-engine/pkg/core/saga"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
@@ -300,6 +301,10 @@ type WorkflowInstanceManagerV2 struct {
 	controlSignalChan chan workflow.ControlSignal
 	statusUpdateChan  chan string
 	mu                sync.RWMutex // 仅保护 instance 状态
+
+	// SAGA事务协调器（可选）
+	sagaCoordinator *saga.Coordinator
+	sagaEnabled     bool // 是否启用SAGA
 }
 
 // NewWorkflowInstanceManagerV2 创建WorkflowInstanceManagerV2实例
@@ -331,6 +336,22 @@ func NewWorkflowInstanceManagerV2(
 		channelCapacity = 100 // 最小容量 100，避免过小
 	}
 
+	// 检查是否需要启用SAGA（如果有任务配置了补偿函数）
+	sagaEnabled := false
+	for _, t := range wf.GetTasks() {
+		if t.GetCompensationFuncName() != "" {
+			sagaEnabled = true
+			break
+		}
+	}
+
+	// 如果启用SAGA，创建协调器
+	var sagaCoordinator *saga.Coordinator
+	if sagaEnabled && registry != nil {
+		sagaCoordinator = saga.NewCoordinator(instance.ID, registry)
+		log.Printf("WorkflowInstance %s: SAGA事务已启用", instance.ID)
+	}
+
 	manager := &WorkflowInstanceManagerV2{
 		instance:             instance,
 		workflow:             wf,
@@ -354,6 +375,8 @@ func NewWorkflowInstanceManagerV2(
 		taskStats:         &TaskStatistics{},
 		controlSignalChan: make(chan workflow.ControlSignal, 10),
 		statusUpdateChan:  make(chan string, 10),
+		sagaCoordinator:   sagaCoordinator,
+		sagaEnabled:       sagaEnabled,
 	}
 
 	log.Printf("WorkflowInstance %s: V2初始化完成，总任务数: %d，Channel 容量: %d",
@@ -605,17 +628,43 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 					// 检查是否有失败的任务
 					hasFailedTask := false
 					allTasks := m.workflow.GetTasks()
+					log.Printf("🔍 [Workflow完成检查] 开始检查失败任务，总任务数: %d", len(allTasks))
 					for taskID, task := range allTasks {
-						if task.GetStatus() == "FAILED" {
+						taskStatus := task.GetStatus()
+						taskName := task.GetName()
+						log.Printf("🔍 [Workflow完成检查] 检查任务: TaskID=%s, TaskName=%s, Status=%s", taskID, taskName, taskStatus)
+						if taskStatus == "FAILED" {
+							log.Printf("🔍 [Workflow完成检查] ✅ 发现失败任务: TaskID=%s, TaskName=%s, Status=%s", taskID, taskName, taskStatus)
 							hasFailedTask = true
 							break
 						}
 						// 检查 contextData 中的错误信息
 						errorKey := fmt.Sprintf("%s:error", taskID)
 						if _, hasError := m.contextData.Load(errorKey); hasError {
+							log.Printf("🔍 [Workflow完成检查] ✅ 发现失败任务（通过errorKey）: TaskID=%s, TaskName=%s", taskID, taskName)
 							hasFailedTask = true
 							break
 						}
+					}
+					// 也检查运行时任务（动态添加的子任务）
+					if !hasFailedTask {
+						m.runtimeTasks.Range(func(key, value interface{}) bool {
+							if task, ok := value.(workflow.Task); ok {
+								if task.GetStatus() == "FAILED" {
+									log.Printf("🔍 [Workflow完成检查] 发现失败运行时任务: TaskID=%s, TaskName=%s", task.GetID(), task.GetName())
+									hasFailedTask = true
+									return false // 停止遍历
+								}
+								// 检查 contextData 中的错误信息
+								errorKey := fmt.Sprintf("%s:error", task.GetID())
+								if _, hasError := m.contextData.Load(errorKey); hasError {
+									log.Printf("🔍 [Workflow完成检查] 发现失败运行时任务（通过errorKey）: TaskID=%s, TaskName=%s", task.GetID(), task.GetName())
+									hasFailedTask = true
+									return false // 停止遍历
+								}
+							}
+							return true
+						})
 					}
 
 					// 根据是否有失败任务决定最终状态
@@ -626,10 +675,25 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 						m.instance.Status = "Failed"
 						m.instance.ErrorMessage = "部分任务执行失败"
 						m.mu.Unlock()
+
+						// 如果启用了SAGA，触发补偿
+						if m.sagaEnabled && m.sagaCoordinator != nil {
+							ctx := context.Background()
+							if err := m.sagaCoordinator.Compensate(ctx); err != nil {
+								log.Printf("⚠️ [SAGA] WorkflowInstance %s, 补偿执行失败: %v", m.instance.ID, err)
+							}
+						}
 					} else {
 						m.mu.Lock()
 						m.instance.Status = "Success"
 						m.mu.Unlock()
+
+						// 如果启用了SAGA，提交事务
+						if m.sagaEnabled && m.sagaCoordinator != nil {
+							if err := m.sagaCoordinator.Commit(); err != nil {
+								log.Printf("⚠️ [SAGA] WorkflowInstance %s, 事务提交失败: %v", m.instance.ID, err)
+							}
+						}
 					}
 
 					m.mu.Lock()
@@ -862,6 +926,9 @@ func (m *WorkflowInstanceManagerV2) handleTaskFailure(event TaskStatusEvent) {
 			m.templateTaskCounts[currentLevel].Add(-1)
 		}
 
+		// 执行 Task 的 Failed 状态 Handler（重要：达到最大重试次数时也需要触发）
+		m.executeTaskFailedHandler(event.TaskID, task, errorMsg)
+
 		// 注意：任务失败计数已通过taskStatsChan在processBatch中更新，这里不需要再计数
 	}
 }
@@ -1009,7 +1076,25 @@ func (m *WorkflowInstanceManagerV2) checkAllTasksCompleted(completedCount, total
 		return false, err
 	}
 	if isCompleted {
-		log.Printf("WorkflowInstance %s: 所有任务已完成，最终状态: Success", m.instance.ID)
+		// 检查是否有失败任务（用于日志）
+		hasFailed := false
+		allTasks := m.workflow.GetTasks()
+		for taskID, task := range allTasks {
+			if task.GetStatus() == "FAILED" {
+				hasFailed = true
+				log.Printf("WorkflowInstance %s: 所有任务已完成，但发现失败任务: TaskID=%s, TaskName=%s", m.instance.ID, taskID, task.GetName())
+				break
+			}
+			errorKey := fmt.Sprintf("%s:error", taskID)
+			if _, hasError := m.contextData.Load(errorKey); hasError {
+				hasFailed = true
+				log.Printf("WorkflowInstance %s: 所有任务已完成，但发现失败任务（通过errorKey）: TaskID=%s, TaskName=%s", m.instance.ID, taskID, task.GetName())
+				break
+			}
+		}
+		if !hasFailed {
+			log.Printf("WorkflowInstance %s: 所有任务已完成，最终状态: Success", m.instance.ID)
+		}
 	}
 	return isCompleted, nil
 }
@@ -1119,11 +1204,72 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 	}
 }
 
+// checkDependencyFailed 检查任务的依赖是否有失败的
+// 返回失败的依赖任务名称，如果没有失败的依赖则返回空字符串
+func (m *WorkflowInstanceManagerV2) checkDependencyFailed(t workflow.Task) string {
+	deps := t.GetDependencies()
+	for _, depName := range deps {
+		depTaskID, exists := m.workflow.GetTaskIDByName(depName)
+		if !exists {
+			continue
+		}
+
+		// 检查依赖任务是否失败
+		var depTask workflow.Task
+		if wfTask, exists := m.workflow.GetTasks()[depTaskID]; exists {
+			depTask = wfTask
+		} else if runtimeTask, ok := m.runtimeTasks.Load(depTaskID); ok {
+			depTask = runtimeTask.(workflow.Task)
+		}
+
+		if depTask != nil && depTask.GetStatus() == "FAILED" {
+			return depName
+		}
+
+		// 也检查 contextData 中的错误信息（用于处理状态未及时更新的情况）
+		errorKey := fmt.Sprintf("%s:error", depTaskID)
+		if _, hasError := m.contextData.Load(errorKey); hasError {
+			return depName
+		}
+	}
+	return ""
+}
+
 // submitBatch 批量提交任务到 Executor
 func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 	for _, task := range batch {
 		taskID := task.GetID()
 		taskName := task.GetName()
+
+		// 检查依赖任务是否有失败的，如果有则跳过当前任务
+		if failedDep := m.checkDependencyFailed(task); failedDep != "" {
+			log.Printf("⚠️ WorkflowInstance %s: 任务 %s (%s) 的依赖任务 %s 已失败，跳过执行并标记为失败",
+				m.instance.ID, taskID, taskName, failedDep)
+
+			// 标记当前任务为失败
+			task.SetStatus("FAILED")
+			m.processedNodes.Store(taskID, true)
+
+			// 保存错误信息
+			errorKey := fmt.Sprintf("%s:error", taskID)
+			m.contextData.Store(errorKey, fmt.Sprintf("依赖任务 %s 执行失败，跳过当前任务", failedDep))
+
+			// 发送任务失败事件
+			select {
+			case m.taskStatusChan <- TaskStatusEvent{
+				TaskID:      taskID,
+				Status:      "Failed",
+				Error:       fmt.Errorf("依赖任务 %s 执行失败", failedDep),
+				IsTemplate:  task.IsTemplate(),
+				IsSubTask:   task.IsSubTask(),
+				IsProcessed: false,
+				Timestamp:   time.Now(),
+			}:
+			default:
+				log.Printf("警告: taskStatusChan 已满，任务失败事件可能丢失: TaskID=%s", taskID)
+			}
+			continue
+		}
 
 		// 检查是否为模板任务（模板任务不执行，仅用于生成子任务）
 		// 参考 instance_manager.go 的实现方式
@@ -1420,6 +1566,30 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 			}
 		}
 
+		// 如果启用了SAGA，记录成功步骤
+		if m.sagaEnabled && m.sagaCoordinator != nil {
+			var workflowTask workflow.Task
+			var exists bool
+			if workflowTask, exists = m.workflow.GetTasks()[taskID]; !exists {
+				if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
+					workflowTask = runtimeTask.(workflow.Task)
+					exists = true
+				}
+			}
+			if exists && workflowTask.GetCompensationFuncName() != "" {
+				step := saga.NewTransactionStep(
+					taskID,
+					workflowTask.GetName(),
+					"Success",
+					workflowTask.GetCompensationFuncName(),
+					workflowTask.GetCompensationFuncID(),
+				)
+				step.ExecutedAt = time.Now().Unix()
+				m.sagaCoordinator.AddStep(step)
+				m.sagaCoordinator.MarkStepSuccess(taskID)
+			}
+		}
+
 		// 发送任务完成事件到taskStatusChan
 		isTemplate := false
 		isSubTask := false
@@ -1448,9 +1618,56 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 	}
 }
 
+// executeTaskFailedHandler 执行任务失败的 Handler（用于达到最大重试次数的场景）
+// 注意：这个方法不会发送 TaskStatusEvent，因为事件已经在 processBatch 中发送过
+func (m *WorkflowInstanceManagerV2) executeTaskFailedHandler(taskID string, workflowTask workflow.Task, errorMsg string) {
+	// 执行 Task 的状态 Handler（Failed 状态）
+	if m.registry != nil {
+		statusHandlers := workflowTask.GetStatusHandlers()
+		taskObj := task.NewTask(workflowTask.GetName(), workflowTask.GetDescription(), workflowTask.GetJobFuncID(), workflowTask.GetParams(), statusHandlers)
+		taskObj.SetID(workflowTask.GetID())
+		taskObj.SetJobFuncName(workflowTask.GetJobFuncName())
+		taskObj.SetTimeoutSeconds(workflowTask.GetTimeoutSeconds())
+		taskObj.SetRetryCount(workflowTask.GetRetryCount())
+		taskObj.SetDependencies(workflowTask.GetDependencies())
+		taskObj.SetStatus("FAILED")
+
+		if handlerErr := task.ExecuteTaskHandlerWithContext(
+			m.registry,
+			taskObj,
+			"FAILED",
+			m.instance.WorkflowID,
+			m.instance.ID,
+			nil,
+			errorMsg,
+		); handlerErr != nil {
+			log.Printf("执行Task Handler失败: Task=%s, Status=Failed, Error=%v", taskID, handlerErr)
+		}
+	}
+
+	// 如果启用了 SAGA，记录失败步骤
+	if m.sagaEnabled && m.sagaCoordinator != nil {
+		step := saga.NewTransactionStep(
+			taskID,
+			workflowTask.GetName(),
+			"Failed",
+			workflowTask.GetCompensationFuncName(),
+			workflowTask.GetCompensationFuncID(),
+		)
+		step.ExecutedAt = time.Now().Unix()
+		m.sagaCoordinator.AddStep(step)
+		m.sagaCoordinator.MarkStepFailed(taskID)
+		log.Printf("🔍 [SAGA] 已记录失败步骤（达到最大重试次数）: TaskID=%s, TaskName=%s", taskID, workflowTask.GetName())
+	}
+}
+
 // createTaskErrorHandler 创建任务错误处理器
 func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(error) {
 	return func(err error) {
+		// 保存错误信息到contextData（用于workflow失败判断）
+		errorKey := fmt.Sprintf("%s:error", taskID)
+		m.contextData.Store(errorKey, err.Error())
+
 		// 更新workflow.Task的状态为Failed
 		if workflowTask, exists := m.workflow.GetTasks()[taskID]; exists {
 			workflowTask.SetStatus("FAILED")
@@ -1491,6 +1708,31 @@ func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(e
 				err.Error(),
 			); handlerErr != nil {
 				log.Printf("执行Task Handler失败: Task=%s, Status=Failed, Error=%v", taskID, handlerErr)
+			}
+		}
+
+		// 如果启用了SAGA，记录失败步骤
+		if m.sagaEnabled && m.sagaCoordinator != nil {
+			var workflowTask workflow.Task
+			var exists bool
+			if workflowTask, exists = m.workflow.GetTasks()[taskID]; !exists {
+				if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
+					workflowTask = runtimeTask.(workflow.Task)
+					exists = true
+				}
+			}
+			if exists {
+				step := saga.NewTransactionStep(
+					taskID,
+					workflowTask.GetName(),
+					"Failed",
+					workflowTask.GetCompensationFuncName(),
+					workflowTask.GetCompensationFuncID(),
+				)
+				step.ExecutedAt = time.Now().Unix()
+				m.sagaCoordinator.AddStep(step)
+				m.sagaCoordinator.MarkStepFailed(taskID)
+				log.Printf("🔍 [SAGA] 已记录失败步骤: TaskID=%s, TaskName=%s", taskID, workflowTask.GetName())
 			}
 		}
 

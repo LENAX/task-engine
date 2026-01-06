@@ -22,26 +22,28 @@ const (
 )
 
 type Task struct {
-	ID             string
-	Name           string
-	Description    string
-	Params         sync.Map // 参数映射（线程安全）
-	CreateTime     time.Time
-	status         string              // 状态（私有字段，通过setter修改）
-	statusMu       sync.Mutex          // 保护status字段
-	isSubTask      bool                // 是否为动态生成的子任务（私有字段）
-	isSubTaskMu    sync.RWMutex        // 保护isSubTask字段
-	isTemplate     bool                // 是否为模板任务（私有字段，模板任务不执行，仅用于生成子任务）
-	isTemplateMu   sync.RWMutex        // 保护isTemplate字段
-	StatusHandlers map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
-	JobFuncID      string              // Job函数ID（通过Registry获取函数实例）
-	JobFuncName    string              // Job函数名称（用于快速查找和依赖构建）
-	TimeoutSeconds int                 // 超时时间（秒，默认30秒）
-	RetryCount     int                 // 重试次数（默认0次，即不重试）
-	Dependencies   []string            // 依赖的前置Task名称列表
-	RequiredParams []string            // 必需参数列表（用于参数校验）
-	ResultMapping  map[string]string   // 上游结果字段到下游参数的映射规则
-	mu             sync.RWMutex        // 保护所有字段
+	ID                   string
+	Name                 string
+	Description          string
+	Params               sync.Map // 参数映射（线程安全）
+	CreateTime           time.Time
+	status               string              // 状态（私有字段，通过setter修改）
+	statusMu             sync.Mutex          // 保护status字段
+	isSubTask            bool                // 是否为动态生成的子任务（私有字段）
+	isSubTaskMu          sync.RWMutex        // 保护isSubTask字段
+	isTemplate           bool                // 是否为模板任务（私有字段，模板任务不执行，仅用于生成子任务）
+	isTemplateMu         sync.RWMutex        // 保护isTemplate字段
+	StatusHandlers       map[string][]string // 状态处理函数映射（status -> handlerID列表，支持多个Handler按顺序执行）
+	JobFuncID            string              // Job函数ID（通过Registry获取函数实例）
+	JobFuncName          string              // Job函数名称（用于快速查找和依赖构建）
+	CompensationFuncName string              // 补偿函数名称（用于SAGA事务补偿）
+	CompensationFuncID   string              // 补偿函数ID（通过Registry获取补偿函数实例）
+	TimeoutSeconds       int                 // 超时时间（秒，默认30秒）
+	RetryCount           int                 // 重试次数（默认0次，即不重试）
+	Dependencies         []string            // 依赖的前置Task名称列表
+	RequiredParams       []string            // 必需参数列表（用于参数校验）
+	ResultMapping        map[string]string   // 上游结果字段到下游参数的映射规则
+	mu                   sync.RWMutex        // 保护所有字段
 }
 
 // NewTask 创建Task实例（对外导出）
@@ -442,4 +444,32 @@ func (t *Task) SetResultMapping(resultMapping map[string]string) {
 			t.ResultMapping[k] = v
 		}
 	}
+}
+
+// GetCompensationFuncName 获取补偿函数名称（对外导出，线程安全）
+func (t *Task) GetCompensationFuncName() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.CompensationFuncName
+}
+
+// SetCompensationFuncName 设置补偿函数名称（对外导出，线程安全）
+func (t *Task) SetCompensationFuncName(funcName string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.CompensationFuncName = funcName
+}
+
+// GetCompensationFuncID 获取补偿函数ID（对外导出，线程安全）
+func (t *Task) GetCompensationFuncID() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.CompensationFuncID
+}
+
+// SetCompensationFuncID 设置补偿函数ID（对外导出，线程安全）
+func (t *Task) SetCompensationFuncID(funcID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.CompensationFuncID = funcID
 }

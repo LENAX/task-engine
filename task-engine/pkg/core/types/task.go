@@ -38,6 +38,10 @@ type Task interface {
 	SetRequiredParams(requiredParams []string)
 	GetResultMapping() map[string]string
 	SetResultMapping(resultMapping map[string]string)
+	GetCompensationFuncName() string
+	SetCompensationFuncName(funcName string)
+	GetCompensationFuncID() string
+	SetCompensationFuncID(funcID string)
 }
 
 // TaskInfo 定义Task信息接口（用于DAG构建，避免循环依赖）
