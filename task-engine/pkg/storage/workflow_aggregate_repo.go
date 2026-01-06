@@ -112,4 +112,3 @@ type TaskDefinition struct {
 	StatusHandlers       map[string][]string // 状态处理器映射
 	IsTemplate           bool                // 是否为模板任务
 }
-

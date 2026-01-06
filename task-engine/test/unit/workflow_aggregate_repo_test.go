@@ -287,3 +287,157 @@ func TestWorkflowAggregateRepo_SaveWorkflow_UpdateExisting(t *testing.T) {
 	assert.Len(t, finalWf.GetTasks(), 2)
 }
 
+// ========== 幂等性测试 ==========
+
+func TestWorkflowAggregateRepo_Idempotency_DeleteWorkflow(t *testing.T) {
+	db := setupAggregateTestDB(t)
+	repo, err := sqlite.NewWorkflowAggregateRepo(db)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// 删除不存在的Workflow应该不报错（幂等）
+	err = repo.DeleteWorkflow(ctx, "non-existent-id")
+	require.NoError(t, err, "删除不存在的Workflow应该不报错")
+
+	// 创建并删除Workflow
+	wf := workflow.NewWorkflow("test-workflow", "测试工作流")
+	task1 := task.NewTask("task1", "任务1", "", nil, nil)
+	err = wf.AddTask(task1)
+	require.NoError(t, err)
+	err = repo.SaveWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	// 第一次删除
+	err = repo.DeleteWorkflow(ctx, wf.GetID())
+	require.NoError(t, err)
+
+	// 第二次删除应该不报错（幂等）
+	err = repo.DeleteWorkflow(ctx, wf.GetID())
+	require.NoError(t, err, "重复删除Workflow应该不报错")
+}
+
+func TestWorkflowAggregateRepo_Idempotency_DeleteWorkflowInstance(t *testing.T) {
+	db := setupAggregateTestDB(t)
+	repo, err := sqlite.NewWorkflowAggregateRepo(db)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// 删除不存在的Instance应该不报错（幂等）
+	err = repo.DeleteWorkflowInstance(ctx, "non-existent-id")
+	require.NoError(t, err, "删除不存在的Instance应该不报错")
+
+	// 创建Workflow和Instance
+	wf := workflow.NewWorkflow("test-workflow", "测试工作流")
+	task1 := task.NewTask("task1", "任务1", "", nil, nil)
+	err = wf.AddTask(task1)
+	require.NoError(t, err)
+	err = repo.SaveWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	instance, err := repo.StartWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	// 第一次删除
+	err = repo.DeleteWorkflowInstance(ctx, instance.ID)
+	require.NoError(t, err)
+
+	// 第二次删除应该不报错（幂等）
+	err = repo.DeleteWorkflowInstance(ctx, instance.ID)
+	require.NoError(t, err, "重复删除Instance应该不报错")
+
+	// 验证Instance已删除
+	loadedInst, err := repo.GetWorkflowInstance(ctx, instance.ID)
+	require.NoError(t, err)
+	assert.Nil(t, loadedInst)
+}
+
+func TestWorkflowAggregateRepo_Idempotency_DeleteTaskInstance(t *testing.T) {
+	db := setupAggregateTestDB(t)
+	repo, err := sqlite.NewWorkflowAggregateRepo(db)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// 删除不存在的TaskInstance应该不报错（幂等）
+	err = repo.DeleteTaskInstance(ctx, "non-existent-id")
+	require.NoError(t, err, "删除不存在的TaskInstance应该不报错")
+
+	// 创建Workflow、Instance和TaskInstance
+	wf := workflow.NewWorkflow("test-workflow", "测试工作流")
+	task1 := task.NewTask("task1", "任务1", "", nil, nil)
+	err = wf.AddTask(task1)
+	require.NoError(t, err)
+	err = repo.SaveWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	instance, err := repo.StartWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	taskInstances, err := repo.GetTaskInstancesByWorkflowInstance(ctx, instance.ID)
+	require.NoError(t, err)
+	require.Len(t, taskInstances, 1)
+
+	taskInstID := taskInstances[0].ID
+
+	// 第一次删除
+	err = repo.DeleteTaskInstance(ctx, taskInstID)
+	require.NoError(t, err)
+
+	// 第二次删除应该不报错（幂等）
+	err = repo.DeleteTaskInstance(ctx, taskInstID)
+	require.NoError(t, err, "重复删除TaskInstance应该不报错")
+
+	// 验证TaskInstance已删除
+	loadedTask, err := repo.GetTaskInstance(ctx, taskInstID)
+	require.NoError(t, err)
+	assert.Nil(t, loadedTask)
+}
+
+func TestWorkflowAggregateRepo_Idempotency_UpdateStatus(t *testing.T) {
+	db := setupAggregateTestDB(t)
+	repo, err := sqlite.NewWorkflowAggregateRepo(db)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// 更新不存在的Instance状态应该不报错（幂等）
+	err = repo.UpdateWorkflowInstanceStatus(ctx, "non-existent-id", "Running")
+	require.NoError(t, err, "更新不存在的Instance状态应该不报错")
+
+	// 更新不存在的TaskInstance状态应该不报错（幂等）
+	err = repo.UpdateTaskInstanceStatus(ctx, "non-existent-id", "Running")
+	require.NoError(t, err, "更新不存在的TaskInstance状态应该不报错")
+
+	err = repo.UpdateTaskInstanceStatusWithError(ctx, "non-existent-id", "Failed", "error")
+	require.NoError(t, err, "更新不存在的TaskInstance状态和错误应该不报错")
+}
+
+func TestWorkflowAggregateRepo_Idempotency_SaveWorkflow(t *testing.T) {
+	db := setupAggregateTestDB(t)
+	repo, err := sqlite.NewWorkflowAggregateRepo(db)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// 创建Workflow
+	wf := workflow.NewWorkflow("test-workflow", "测试工作流")
+	task1 := task.NewTask("task1", "任务1", "", nil, nil)
+	err = wf.AddTask(task1)
+	require.NoError(t, err)
+
+	// 第一次保存
+	err = repo.SaveWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	// 第二次保存相同的Workflow应该不报错（幂等）
+	err = repo.SaveWorkflow(ctx, wf)
+	require.NoError(t, err, "重复保存Workflow应该不报错")
+
+	// 验证数据正确
+	loadedWf, err := repo.GetWorkflowWithTasks(ctx, wf.GetID())
+	require.NoError(t, err)
+	assert.Equal(t, wf.GetName(), loadedWf.GetName())
+	assert.Len(t, loadedWf.GetTasks(), 1)
+}

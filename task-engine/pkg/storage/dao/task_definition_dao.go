@@ -16,14 +16,13 @@ type TaskDefinitionDAO struct {
 	JobFuncName          string         `db:"job_func_name"`
 	CompensationFuncID   sql.NullString `db:"compensation_func_id"`
 	CompensationFuncName string         `db:"compensation_func_name"`
-	Params               string         `db:"params"`           // JSON格式存储
-	TimeoutSeconds       int            `db:"timeout_seconds"`  // 超时时间（秒）
-	RetryCount           int            `db:"retry_count"`      // 重试次数
-	Dependencies         string         `db:"dependencies"`     // JSON数组，存储依赖的Task名称
-	RequiredParams       string         `db:"required_params"`  // JSON数组，必需参数列表
-	ResultMapping        string         `db:"result_mapping"`   // JSON对象，结果映射规则
-	StatusHandlers       string         `db:"status_handlers"`  // JSON对象，状态处理器映射
-	IsTemplate           bool           `db:"is_template"`      // 是否为模板任务
+	Params               string         `db:"params"`          // JSON格式存储
+	TimeoutSeconds       int            `db:"timeout_seconds"` // 超时时间（秒）
+	RetryCount           int            `db:"retry_count"`     // 重试次数
+	Dependencies         string         `db:"dependencies"`    // JSON数组，存储依赖的Task名称
+	RequiredParams       string         `db:"required_params"` // JSON数组，必需参数列表
+	ResultMapping        string         `db:"result_mapping"`  // JSON对象，结果映射规则
+	StatusHandlers       string         `db:"status_handlers"` // JSON对象，状态处理器映射
+	IsTemplate           bool           `db:"is_template"`     // 是否为模板任务
 	CreateTime           time.Time      `db:"create_time"`
 }
-

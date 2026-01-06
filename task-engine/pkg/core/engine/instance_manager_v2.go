@@ -264,6 +264,7 @@ type WorkflowInstanceManagerV2 struct {
 	workflow             *workflow.Workflow
 	dag                  *dag.DAG
 	executor             *executor.Executor
+	aggregateRepo        storage.WorkflowAggregateRepository // 聚合Repository（优先使用）
 	taskRepo             storage.TaskRepository
 	workflowInstanceRepo storage.WorkflowInstanceRepository
 	registry             *task.FunctionRegistry
@@ -385,6 +386,86 @@ func NewWorkflowInstanceManagerV2(
 	return manager, nil
 }
 
+// NewWorkflowInstanceManagerV2WithAggregate 创建WorkflowInstanceManagerV2实例（使用聚合Repository）
+// aggregateRepo: 聚合Repository，优先使用，统一管理事务操作
+// taskRepo, workflowInstanceRepo: 兼容旧版Repository，当aggregateRepo为nil时使用
+func NewWorkflowInstanceManagerV2WithAggregate(
+	instance *workflow.WorkflowInstance,
+	wf *workflow.Workflow,
+	exec *executor.Executor,
+	aggregateRepo storage.WorkflowAggregateRepository,
+	taskRepo storage.TaskRepository,
+	workflowInstanceRepo storage.WorkflowInstanceRepository,
+	registry *task.FunctionRegistry,
+) (*WorkflowInstanceManagerV2, error) {
+	// 构建DAG
+	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())
+	if err != nil {
+		return nil, err
+	}
+
+	// 检测循环依赖
+	if err := dagInstance.DetectCycle(); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// 计算总任务数（用于设置 channel 容量）
+	totalTasks := len(wf.GetTasks())
+	channelCapacity := totalTasks * 2
+	if channelCapacity < 100 {
+		channelCapacity = 100
+	}
+
+	// 检查是否需要启用SAGA
+	sagaEnabled := false
+	for _, t := range wf.GetTasks() {
+		if t.GetCompensationFuncName() != "" {
+			sagaEnabled = true
+			break
+		}
+	}
+
+	// 如果启用SAGA，创建协调器
+	var sagaCoordinator *saga.Coordinator
+	if sagaEnabled && registry != nil {
+		sagaCoordinator = saga.NewCoordinator(instance.ID, registry)
+		log.Printf("WorkflowInstance %s: SAGA事务已启用", instance.ID)
+	}
+
+	manager := &WorkflowInstanceManagerV2{
+		instance:             instance,
+		workflow:             wf,
+		dag:                  dagInstance,
+		executor:             exec,
+		aggregateRepo:        aggregateRepo, // 设置聚合Repository
+		taskRepo:             taskRepo,
+		workflowInstanceRepo: workflowInstanceRepo,
+		registry:             registry,
+		resultCache:          cache.NewMemoryResultCache(),
+		ctx:                  ctx,
+		cancel:               cancel,
+
+		taskStatusChan:     make(chan TaskStatusEvent, channelCapacity),
+		queueUpdateChan:    make(chan TaskStatusEvent, channelCapacity),
+		addSubTaskChan:     make(chan AtomicAddSubTasksEvent, channelCapacity),
+		taskSubmissionChan: make(chan []workflow.Task, channelCapacity),
+		taskStatsChan:      make(chan TaskStatsUpdate, channelCapacity),
+
+		taskStats:         &TaskStatistics{},
+		controlSignalChan: make(chan workflow.ControlSignal, 10),
+		statusUpdateChan:  make(chan string, 10),
+		sagaCoordinator:   sagaCoordinator,
+		sagaEnabled:       sagaEnabled,
+	}
+
+	log.Printf("WorkflowInstance %s: V2初始化完成（聚合Repository模式），总任务数: %d，Channel 容量: %d",
+		instance.ID, totalTasks, channelCapacity)
+
+	return manager, nil
+}
+
 // Start 启动WorkflowInstance执行（公共方法，实现接口）
 func (m *WorkflowInstanceManagerV2) Start() {
 	// 更新状态为Running
@@ -395,10 +476,8 @@ func (m *WorkflowInstanceManagerV2) Start() {
 
 	// 持久化状态
 	ctx := context.Background()
-	if m.workflowInstanceRepo != nil {
-		if err := m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Running"); err != nil {
-			log.Printf("更新WorkflowInstance状态失败: %v", err)
-		}
+	if err := m.updateWorkflowInstanceStatus(ctx, m.instance.ID, "Running", ""); err != nil {
+		log.Printf("更新WorkflowInstance状态失败: %v", err)
 	}
 
 	// 发送状态更新通知
@@ -703,8 +782,8 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 
 					ctx := context.Background()
 					m.saveAllTaskStatuses(ctx)
-					if m.workflowInstanceRepo != nil {
-						m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, finalStatus)
+					if err := m.updateWorkflowInstanceStatus(ctx, m.instance.ID, finalStatus, ""); err != nil {
+						log.Printf("更新WorkflowInstance状态失败: %v", err)
 					}
 
 					// 发送状态更新通知
@@ -1816,7 +1895,9 @@ func (m *WorkflowInstanceManagerV2) handlePause() {
 	}
 	if m.workflowInstanceRepo != nil {
 		m.workflowInstanceRepo.UpdateBreakpoint(ctx, m.instance.ID, breakpoint)
-		m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Paused")
+	}
+	if err := m.updateWorkflowInstanceStatus(ctx, m.instance.ID, "Paused", ""); err != nil {
+		log.Printf("更新WorkflowInstance状态失败: %v", err)
 	}
 
 	select {
@@ -1834,8 +1915,8 @@ func (m *WorkflowInstanceManagerV2) handleResume() {
 	m.mu.Unlock()
 
 	ctx := context.Background()
-	if m.workflowInstanceRepo != nil {
-		m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Running")
+	if err := m.updateWorkflowInstanceStatus(ctx, m.instance.ID, "Running", ""); err != nil {
+		log.Printf("更新WorkflowInstance状态失败: %v", err)
 	}
 
 	// 重新启动任务提交协程（如果已停止）
@@ -1860,8 +1941,8 @@ func (m *WorkflowInstanceManagerV2) handleTerminate() {
 
 	ctx := context.Background()
 	m.saveAllTaskStatuses(ctx)
-	if m.workflowInstanceRepo != nil {
-		m.workflowInstanceRepo.UpdateStatus(ctx, m.instance.ID, "Terminated")
+	if err := m.updateWorkflowInstanceStatus(ctx, m.instance.ID, "Terminated", ""); err != nil {
+		log.Printf("更新WorkflowInstance状态失败: %v", err)
 	}
 
 	select {
@@ -2484,22 +2565,38 @@ func (m *WorkflowInstanceManagerV2) RestoreFromBreakpoint(breakpoint interface{}
 
 // saveAllTaskStatuses 批量保存所有任务状态到数据库（只保存预定义任务，跳过动态任务）
 func (m *WorkflowInstanceManagerV2) saveAllTaskStatuses(ctx context.Context) {
-	if m.taskRepo == nil {
-		return // 如果没有taskRepo，跳过保存
+	// 如果没有任何Repository，跳过保存
+	if m.aggregateRepo == nil && m.taskRepo == nil {
+		log.Printf("⚠️ 警告！WorkflowInstance %s: 没有可用的Repository，跳过保存", m.instance.ID)
+		return
 	}
 
 	allTasks := m.workflow.GetTasks()
 	savedCount := 0
 	skippedCount := 0
 
-	taskInstances, err := m.taskRepo.GetByWorkflowInstanceID(ctx, m.instance.ID)
-	if err != nil {
-		log.Printf("⚠️ WorkflowInstance %s: 查询任务实例失败: %v", m.instance.ID, err)
-		return
-	}
-	taskInstanceMap := make(map[string]*storage.TaskInstance)
-	for _, ti := range taskInstances {
-		taskInstanceMap[ti.ID] = ti
+	// 获取已存在的任务实例（用于比较状态）
+	var taskInstanceMap map[string]*storage.TaskInstance
+	if m.aggregateRepo != nil {
+		_, taskInstances, err := m.aggregateRepo.GetWorkflowInstanceWithTasks(ctx, m.instance.ID)
+		if err != nil {
+			log.Printf("⚠️ WorkflowInstance %s: 查询任务实例失败: %v", m.instance.ID, err)
+			return
+		}
+		taskInstanceMap = make(map[string]*storage.TaskInstance)
+		for _, ti := range taskInstances {
+			taskInstanceMap[ti.ID] = ti
+		}
+	} else if m.taskRepo != nil {
+		taskInstances, err := m.taskRepo.GetByWorkflowInstanceID(ctx, m.instance.ID)
+		if err != nil {
+			log.Printf("⚠️ WorkflowInstance %s: 查询任务实例失败: %v", m.instance.ID, err)
+			return
+		}
+		taskInstanceMap = make(map[string]*storage.TaskInstance)
+		for _, ti := range taskInstances {
+			taskInstanceMap[ti.ID] = ti
+		}
 	}
 
 	for taskID, workflowTask := range allTasks {
@@ -2543,9 +2640,9 @@ func (m *WorkflowInstanceManagerV2) saveAllTaskStatuses(ctx context.Context) {
 					errorMsg = errStr
 				}
 			}
-			updateErr = m.taskRepo.UpdateStatusWithError(ctx, taskID, currentStatus, errorMsg)
+			updateErr = m.updateTaskInstanceStatusWithError(ctx, taskID, currentStatus, errorMsg)
 		} else {
-			updateErr = m.taskRepo.UpdateStatus(ctx, taskID, currentStatus)
+			updateErr = m.updateTaskInstanceStatus(ctx, taskID, currentStatus)
 		}
 
 		if updateErr != nil {
@@ -2560,4 +2657,46 @@ func (m *WorkflowInstanceManagerV2) saveAllTaskStatuses(ctx context.Context) {
 		log.Printf("📊 WorkflowInstance %s: 批量保存任务状态完成 - 已保存: %d, 跳过动态任务: %d",
 			m.instance.ID, savedCount, skippedCount)
 	}
+}
+
+// ==================== Repository抽象方法（支持聚合Repository） ====================
+
+// updateWorkflowInstanceStatus 更新WorkflowInstance状态（优先使用聚合Repository）
+func (m *WorkflowInstanceManagerV2) updateWorkflowInstanceStatus(ctx context.Context, instanceID, status, errorMsg string) error {
+	// 优先使用聚合Repository
+	if m.aggregateRepo != nil {
+		// 聚合Repository不支持单独更新WorkflowInstance状态，使用基础Repository
+		// 注：聚合Repository主要用于事务操作，状态更新仍使用原有Repository
+	}
+	// 使用原有Repository
+	if m.workflowInstanceRepo != nil {
+		return m.workflowInstanceRepo.UpdateStatus(ctx, instanceID, status)
+	}
+	return nil
+}
+
+// updateTaskInstanceStatus 更新TaskInstance状态（优先使用聚合Repository）
+func (m *WorkflowInstanceManagerV2) updateTaskInstanceStatus(ctx context.Context, taskID, status string) error {
+	// 优先使用聚合Repository
+	if m.aggregateRepo != nil {
+		return m.aggregateRepo.UpdateTaskInstanceStatus(ctx, taskID, status)
+	}
+	// 使用原有Repository
+	if m.taskRepo != nil {
+		return m.taskRepo.UpdateStatus(ctx, taskID, status)
+	}
+	return nil
+}
+
+// updateTaskInstanceStatusWithError 更新TaskInstance状态和错误信息（优先使用聚合Repository）
+func (m *WorkflowInstanceManagerV2) updateTaskInstanceStatusWithError(ctx context.Context, taskID, status, errorMsg string) error {
+	// 优先使用聚合Repository
+	if m.aggregateRepo != nil {
+		return m.aggregateRepo.UpdateTaskInstanceStatusWithError(ctx, taskID, status, errorMsg)
+	}
+	// 使用原有Repository
+	if m.taskRepo != nil {
+		return m.taskRepo.UpdateStatusWithError(ctx, taskID, status, errorMsg)
+	}
+	return nil
 }

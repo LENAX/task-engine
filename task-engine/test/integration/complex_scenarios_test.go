@@ -763,8 +763,8 @@ func setupComplexTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *wo
 		t.Fatalf("创建Repository失败: %v", err)
 	}
 
-	// 对于大型workflow，增加并发数
-	eng, err := engine.NewEngine(50, 60, repos.Workflow, repos.WorkflowInstance, repos.Task)
+	// 使用聚合Repository创建Engine
+	eng, err := engine.NewEngineWithAggregateRepo(50, 60, repos.WorkflowAggregate)
 	if err != nil {
 		t.Fatalf("创建Engine失败: %v", err)
 	}

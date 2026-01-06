@@ -830,6 +830,39 @@ func (r *WorkflowAggregateRepo) GetTaskInstancesByWorkflowInstance(ctx context.C
 	return tasks, nil
 }
 
+// DeleteWorkflowInstance 删除WorkflowInstance及其所有TaskInstance（事务，幂等）
+func (r *WorkflowAggregateRepo) DeleteWorkflowInstance(ctx context.Context, instanceID string) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	deleteTaskInstSQL := `DELETE FROM task_instance WHERE workflow_instance_id = $1`
+	if _, err := tx.ExecContext(ctx, deleteTaskInstSQL, instanceID); err != nil {
+		return fmt.Errorf("删除TaskInstance失败: %w", err)
+	}
+
+	deleteInstSQL := `DELETE FROM workflow_instance WHERE id = $1`
+	if _, err := tx.ExecContext(ctx, deleteInstSQL, instanceID); err != nil {
+		return fmt.Errorf("删除WorkflowInstance失败: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteTaskInstance 删除TaskInstance（幂等）
+func (r *WorkflowAggregateRepo) DeleteTaskInstance(ctx context.Context, taskID string) error {
+	query := `DELETE FROM task_instance WHERE id = $1`
+	if _, err := r.db.ExecContext(ctx, query, taskID); err != nil {
+		return fmt.Errorf("删除TaskInstance失败: %w", err)
+	}
+	return nil
+}
+
 // 确保实现接口
 var _ storage.WorkflowAggregateRepository = (*WorkflowAggregateRepo)(nil)
-
