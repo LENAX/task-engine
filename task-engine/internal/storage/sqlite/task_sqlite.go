@@ -32,6 +32,8 @@ func (r *taskRepo) initSchema() error {
 		workflow_instance_id TEXT NOT NULL,
 		job_func_id TEXT,
 		job_func_name TEXT,
+		compensation_func_id TEXT,
+		compensation_func_name TEXT,
 		params TEXT,
 		status TEXT NOT NULL,
 		timeout_seconds INTEGER DEFAULT 30,
@@ -57,20 +59,25 @@ func (r *taskRepo) Save(ctx context.Context, task *storage.TaskInstance) error {
 
 	// 构建DAO对象
 	dao := &dao.TaskDAO{
-		ID:                 task.ID,
-		Name:               task.Name,
-		WorkflowInstanceID: task.WorkflowInstanceID,
-		JobFuncName:        task.JobFuncName,
-		Params:             string(paramsJSON),
-		Status:             task.Status,
-		TimeoutSeconds:     task.TimeoutSeconds,
-		RetryCount:         task.RetryCount,
-		CreateTime:         task.CreateTime,
+		ID:                   task.ID,
+		Name:                 task.Name,
+		WorkflowInstanceID:   task.WorkflowInstanceID,
+		JobFuncName:          task.JobFuncName,
+		CompensationFuncName: task.CompensationFuncName,
+		Params:               string(paramsJSON),
+		Status:               task.Status,
+		TimeoutSeconds:       task.TimeoutSeconds,
+		RetryCount:           task.RetryCount,
+		CreateTime:           task.CreateTime,
 	}
 
 	if task.JobFuncID != "" {
 		dao.JobFuncID.Valid = true
 		dao.JobFuncID.String = task.JobFuncID
+	}
+	if task.CompensationFuncID != "" {
+		dao.CompensationFuncID.Valid = true
+		dao.CompensationFuncID.String = task.CompensationFuncID
 	}
 	if task.StartTime != nil {
 		dao.StartTime.Valid = true
@@ -87,9 +94,9 @@ func (r *taskRepo) Save(ctx context.Context, task *storage.TaskInstance) error {
 
 	query := `
 	INSERT OR REPLACE INTO task_instance 
-	(id, name, workflow_instance_id, job_func_id, job_func_name, params, status, 
+	(id, name, workflow_instance_id, job_func_id, job_func_name, compensation_func_id, compensation_func_name, params, status, 
 	 timeout_seconds, retry_count, start_time, end_time, error_msg, create_time)
-	VALUES (:id, :name, :workflow_instance_id, :job_func_id, :job_func_name, :params, :status, 
+	VALUES (:id, :name, :workflow_instance_id, :job_func_id, :job_func_name, :compensation_func_id, :compensation_func_name, :params, :status, 
 	 :timeout_seconds, :retry_count, :start_time, :end_time, :error_msg, :create_time)
 	`
 	_, err = r.db.NamedExecContext(ctx, query, dao)
@@ -103,7 +110,7 @@ func (r *taskRepo) Save(ctx context.Context, task *storage.TaskInstance) error {
 func (r *taskRepo) GetByID(ctx context.Context, id string) (*storage.TaskInstance, error) {
 	var dao dao.TaskDAO
 	query := `
-	SELECT id, name, workflow_instance_id, job_func_id, job_func_name, params, status,
+	SELECT id, name, workflow_instance_id, job_func_id, job_func_name, compensation_func_id, compensation_func_name, params, status,
 	       timeout_seconds, retry_count, start_time, end_time, error_msg, create_time
 	FROM task_instance WHERE id = ?
 	`
@@ -117,18 +124,22 @@ func (r *taskRepo) GetByID(ctx context.Context, id string) (*storage.TaskInstanc
 
 	// 转换为业务实体
 	task := &storage.TaskInstance{
-		ID:                 dao.ID,
-		Name:               dao.Name,
-		WorkflowInstanceID: dao.WorkflowInstanceID,
-		JobFuncName:        dao.JobFuncName,
-		Status:             dao.Status,
-		TimeoutSeconds:     dao.TimeoutSeconds,
-		RetryCount:         dao.RetryCount,
-		CreateTime:         dao.CreateTime,
+		ID:                   dao.ID,
+		Name:                 dao.Name,
+		WorkflowInstanceID:   dao.WorkflowInstanceID,
+		JobFuncName:          dao.JobFuncName,
+		CompensationFuncName: dao.CompensationFuncName,
+		Status:               dao.Status,
+		TimeoutSeconds:       dao.TimeoutSeconds,
+		RetryCount:           dao.RetryCount,
+		CreateTime:           dao.CreateTime,
 	}
 
 	if dao.JobFuncID.Valid {
 		task.JobFuncID = dao.JobFuncID.String
+	}
+	if dao.CompensationFuncID.Valid {
+		task.CompensationFuncID = dao.CompensationFuncID.String
 	}
 	if dao.StartTime.Valid {
 		task.StartTime = &dao.StartTime.Time
@@ -156,7 +167,7 @@ func (r *taskRepo) GetByID(ctx context.Context, id string) (*storage.TaskInstanc
 func (r *taskRepo) GetByWorkflowInstanceID(ctx context.Context, instanceID string) ([]*storage.TaskInstance, error) {
 	var daos []dao.TaskDAO
 	query := `
-	SELECT id, name, workflow_instance_id, job_func_id, job_func_name, params, status,
+	SELECT id, name, workflow_instance_id, job_func_id, job_func_name, compensation_func_id, compensation_func_name, params, status,
 	       timeout_seconds, retry_count, start_time, end_time, error_msg, create_time
 	FROM task_instance WHERE workflow_instance_id = ?
 	`
@@ -168,18 +179,22 @@ func (r *taskRepo) GetByWorkflowInstanceID(ctx context.Context, instanceID strin
 	tasks := make([]*storage.TaskInstance, 0, len(daos))
 	for _, dao := range daos {
 		task := &storage.TaskInstance{
-			ID:                 dao.ID,
-			Name:               dao.Name,
-			WorkflowInstanceID: dao.WorkflowInstanceID,
-			JobFuncName:        dao.JobFuncName,
-			Status:             dao.Status,
-			TimeoutSeconds:     dao.TimeoutSeconds,
-			RetryCount:         dao.RetryCount,
-			CreateTime:         dao.CreateTime,
+			ID:                   dao.ID,
+			Name:                 dao.Name,
+			WorkflowInstanceID:   dao.WorkflowInstanceID,
+			JobFuncName:          dao.JobFuncName,
+			CompensationFuncName: dao.CompensationFuncName,
+			Status:               dao.Status,
+			TimeoutSeconds:       dao.TimeoutSeconds,
+			RetryCount:           dao.RetryCount,
+			CreateTime:           dao.CreateTime,
 		}
 
 		if dao.JobFuncID.Valid {
 			task.JobFuncID = dao.JobFuncID.String
+		}
+		if dao.CompensationFuncID.Valid {
+			task.CompensationFuncID = dao.CompensationFuncID.String
 		}
 		if dao.StartTime.Valid {
 			task.StartTime = &dao.StartTime.Time

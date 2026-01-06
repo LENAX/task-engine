@@ -128,7 +128,7 @@ func (r *workflowRepo) Save(ctx context.Context, wf *workflow.Workflow) error {
 		SubTaskErrorTolerance: wf.GetSubTaskErrorTolerance(),
 		Transactional:         wf.GetTransactional(),
 		TransactionMode:       wf.GetTransactionMode(),
-		MaxConcurrentTask:      wf.GetMaxConcurrentTask(),
+		MaxConcurrentTask:     wf.GetMaxConcurrentTask(),
 		CronExpr:              wf.GetCronExpr(),
 		CronEnabled:           wf.IsCronEnabled(),
 	}
@@ -185,7 +185,7 @@ func (r *workflowRepo) SaveWithTasks(ctx context.Context, wf *workflow.Workflow,
 		SubTaskErrorTolerance: wf.GetSubTaskErrorTolerance(),
 		Transactional:         wf.GetTransactional(),
 		TransactionMode:       wf.GetTransactionMode(),
-		MaxConcurrentTask:      wf.GetMaxConcurrentTask(),
+		MaxConcurrentTask:     wf.GetMaxConcurrentTask(),
 		CronExpr:              wf.GetCronExpr(),
 		CronEnabled:           wf.IsCronEnabled(),
 	}
@@ -233,30 +233,50 @@ func (r *workflowRepo) SaveWithTasks(ctx context.Context, wf *workflow.Workflow,
 				}
 			}
 
+			// 获取补偿函数ID（如果Task有补偿函数）
+			compensationFuncID := ""
+			if taskObj, ok := t.(*task.Task); ok {
+				if taskObj.GetCompensationFuncName() != "" {
+					// 尝试从registry获取补偿函数ID
+					if registry != nil {
+						if reg, ok := registry.(interface {
+							GetHandlerIDByName(name string) string
+						}); ok {
+							compensationFuncID = reg.GetHandlerIDByName(taskObj.GetCompensationFuncName())
+						}
+					}
+				}
+			}
+
 			// 构建TaskDAO对象
 			taskDAO := &dao.TaskDAO{
-				ID:                 taskID,
-				Name:               t.GetName(),
-				WorkflowInstanceID: workflowInstanceID,
-				JobFuncName:        t.GetJobFuncName(),
-				Params:             string(paramsJSON),
-				Status:             "Pending",
-				TimeoutSeconds:     timeoutSeconds,
-				RetryCount:         0,
-				CreateTime:         time.Now(),
+				ID:                   taskID,
+				Name:                 t.GetName(),
+				WorkflowInstanceID:   workflowInstanceID,
+				JobFuncName:          t.GetJobFuncName(),
+				CompensationFuncName: t.GetCompensationFuncName(),
+				Params:               string(paramsJSON),
+				Status:               "Pending",
+				TimeoutSeconds:       timeoutSeconds,
+				RetryCount:           0,
+				CreateTime:           time.Now(),
 			}
 
 			if jobFuncID != "" {
 				taskDAO.JobFuncID.Valid = true
 				taskDAO.JobFuncID.String = jobFuncID
 			}
+			if compensationFuncID != "" {
+				taskDAO.CompensationFuncID.Valid = true
+				taskDAO.CompensationFuncID.String = compensationFuncID
+			}
 
 			// 保存Task到数据库（在事务中）
 			taskQuery := `
 			INSERT OR REPLACE INTO task_instance 
-			(id, name, workflow_instance_id, job_func_id, job_func_name, params, status, 
+			(id, name, workflow_instance_id, job_func_id, job_func_name, compensation_func_id, compensation_func_name, params, status, 
 			 timeout_seconds, retry_count, start_time, end_time, error_msg, create_time)
-			VALUES (:id, :name, :workflow_instance_id, :job_func_id, :job_func_name, :params, :status, 
+			VALUES (:id, :name, :workflow_instance_id, :job_func_id, :job_func_name, :compensation_func_id, :compensation_func_name, :params, :status, 
 			 :timeout_seconds, :retry_count, :start_time, :end_time, :error_msg, :create_time)
 			`
 			_, err = tx.NamedExecContext(ctx, taskQuery, taskDAO)
