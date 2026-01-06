@@ -26,21 +26,23 @@ type WorkflowDefinition struct {
 
 // Engine 调度引擎核心结构体（对外导出）
 type Engine struct {
-	executor             *executor.Executor
-	workflowRepo         storage.WorkflowRepository
-	workflowInstanceRepo storage.WorkflowInstanceRepository
-	taskRepo             storage.TaskRepository
-	registry             *task.FunctionRegistry
-	cfg                  *config.EngineConfig // 框架配置
-	jobRegistry          sync.Map             // Job函数注册表（funcKey -> function）
-	callbackRegistry     sync.Map             // Callback函数注册表（funcKey -> function）
-	serviceRegistry      sync.Map             // 服务依赖注册表（serviceKey -> service）
-	running              bool
-	MaxConcurrency       int
-	Timeout              int
-	managers             map[string]types.WorkflowInstanceManager // WorkflowInstance ID -> Manager映射
-	controllers          map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
-	mu                   sync.RWMutex
+	executor                *executor.Executor
+	workflowRepo            storage.WorkflowRepository
+	workflowInstanceRepo    storage.WorkflowInstanceRepository
+	taskRepo                storage.TaskRepository
+	registry                *task.FunctionRegistry
+	cfg                     *config.EngineConfig   // 框架配置
+	jobRegistry             sync.Map               // Job函数注册表（funcKey -> function）
+	callbackRegistry        sync.Map               // Callback函数注册表（funcKey -> function）
+	serviceRegistry         sync.Map               // 服务依赖注册表（serviceKey -> service）
+	functionMap             map[string]interface{} // 函数映射表，用于函数恢复
+	restoreFunctionsOnStart bool                   // 是否在启动时自动恢复函数
+	running                 bool
+	MaxConcurrency          int
+	Timeout                 int
+	managers                map[string]types.WorkflowInstanceManager // WorkflowInstance ID -> Manager映射
+	controllers             map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
+	mu                      sync.RWMutex
 }
 
 // NewEngine 创建Engine实例（对外导出的工厂方法）
@@ -78,16 +80,18 @@ func NewEngineWithRepos(
 	registry := task.NewFunctionRegistry(jobFunctionRepo, taskHandlerRepo)
 
 	return &Engine{
-		executor:             exec,
-		workflowRepo:         workflowRepo,
-		workflowInstanceRepo: workflowInstanceRepo,
-		taskRepo:             taskRepo,
-		registry:             registry,
-		MaxConcurrency:       maxConcurrency,
-		Timeout:              timeout,
-		running:              false,
-		managers:             make(map[string]types.WorkflowInstanceManager),
-		controllers:          make(map[string]workflow.WorkflowController),
+		executor:                exec,
+		workflowRepo:            workflowRepo,
+		workflowInstanceRepo:    workflowInstanceRepo,
+		taskRepo:                taskRepo,
+		registry:                registry,
+		functionMap:             make(map[string]interface{}),
+		restoreFunctionsOnStart: false,
+		MaxConcurrency:          maxConcurrency,
+		Timeout:                 timeout,
+		running:                 false,
+		managers:                make(map[string]types.WorkflowInstanceManager),
+		controllers:             make(map[string]workflow.WorkflowController),
 	}, nil
 }
 
@@ -107,6 +111,14 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.running = true
 	log.Println("✅ 异步任务调度引擎已启动")
 
+	// 如果配置了自动恢复函数，执行函数恢复
+	if e.restoreFunctionsOnStart && len(e.functionMap) > 0 {
+		if err := e.restoreFunctions(ctx); err != nil {
+			log.Printf("恢复函数失败: %v", err)
+			// 不阻止启动，仅记录日志
+		}
+	}
+
 	// 恢复未完成的WorkflowInstance（文档1.2节要求）
 	if err := e.restoreUnfinishedInstances(ctx); err != nil {
 		log.Printf("恢复未完成实例失败: %v", err)
@@ -114,6 +126,49 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// restoreFunctions 恢复函数（内部方法）
+func (e *Engine) restoreFunctions(ctx context.Context) error {
+	if e.registry == nil {
+		return fmt.Errorf("函数注册中心未配置")
+	}
+
+	if len(e.functionMap) == 0 {
+		log.Println("⚠️ [函数恢复] 函数映射表为空，跳过恢复")
+		return nil
+	}
+
+	// 使用FunctionRestorer辅助类
+	restorer := task.NewFunctionRestorer(e.registry, e.functionMap)
+	if err := restorer.Restore(ctx); err != nil {
+		return fmt.Errorf("函数恢复失败: %w", err)
+	}
+
+	return nil
+}
+
+// SetFunctionMap 设置函数映射表（对外导出）
+// 用于在Engine创建后设置函数映射表
+func (e *Engine) SetFunctionMap(funcMap map[string]interface{}) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if funcMap == nil {
+		e.functionMap = make(map[string]interface{})
+	} else {
+		// 创建副本
+		e.functionMap = make(map[string]interface{})
+		for k, v := range funcMap {
+			e.functionMap[k] = v
+		}
+	}
+}
+
+// EnableFunctionRestoreOnStart 启用启动时自动恢复函数（对外导出）
+func (e *Engine) EnableFunctionRestoreOnStart() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.restoreFunctionsOnStart = true
 }
 
 // GetRegistry 获取函数注册中心（对外导出，用于测试和函数注册）
