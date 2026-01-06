@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/stevelan1995/task-engine/pkg/core/engine"
 	"github.com/stevelan1995/task-engine/pkg/core/builder"
+	"github.com/stevelan1995/task-engine/pkg/core/engine"
 	"github.com/stevelan1995/task-engine/pkg/plugin"
 )
 
@@ -18,11 +18,11 @@ func main() {
 	// 2. 初始化邮件插件（配置SMTP信息）
 	// 注意：这里使用示例配置，实际使用时请替换为真实的SMTP服务器信息
 	emailParams := map[string]string{
-		"smtp_host": "smtp.example.com", // SMTP服务器地址
-		"smtp_port": "587",              // SMTP端口（587为TLS，465为SSL，25为普通）
-		"username":  "your_username",    // SMTP用户名（如果需要认证）
-		"password":  "your_password",    // SMTP密码（如果需要认证）
-		"from":      "sender@example.com", // 发件人地址
+		"smtp_host": "smtp.example.com",      // SMTP服务器地址
+		"smtp_port": "587",                   // SMTP端口（587为TLS，465为SSL，25为普通）
+		"username":  "your_username",         // SMTP用户名（如果需要认证）
+		"password":  "your_password",         // SMTP密码（如果需要认证）
+		"from":      "sender@example.com",    // 发件人地址
 		"to":        "recipient@example.com", // 收件人地址（多个用逗号分隔）
 	}
 	if err := emailPlugin.Init(emailParams); err != nil {
@@ -105,4 +105,3 @@ func main() {
 
 	fmt.Println("示例完成！邮件插件已触发，请检查收件箱。")
 }
-

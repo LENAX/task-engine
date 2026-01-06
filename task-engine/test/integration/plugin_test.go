@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stevelan1995/task-engine/pkg/core/builder"
 	"github.com/stevelan1995/task-engine/pkg/core/engine"
 	"github.com/stevelan1995/task-engine/pkg/plugin"
 )
@@ -352,4 +351,3 @@ func TestPlugin_BuilderConfiguration(t *testing.T) {
 		t.Fatal("插件应该被WorkflowStarted事件触发")
 	}
 }
-
