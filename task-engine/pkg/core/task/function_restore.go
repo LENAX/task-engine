@@ -9,14 +9,14 @@ import (
 // FunctionRestorer 函数恢复辅助结构体（对外导出）
 // 封装函数恢复逻辑，简化使用方式
 type FunctionRestorer struct {
-	registry *FunctionRegistry
+	registry FunctionRegistry
 	funcMap  map[string]interface{}
 }
 
 // NewFunctionRestorer 创建函数恢复器（对外导出）
 // registry: 函数注册中心
 // funcMap: 函数名称 -> 函数实例的映射
-func NewFunctionRestorer(registry *FunctionRegistry, funcMap map[string]interface{}) *FunctionRestorer {
+func NewFunctionRestorer(registry FunctionRegistry, funcMap map[string]interface{}) *FunctionRestorer {
 	return &FunctionRestorer{
 		registry: registry,
 		funcMap:  funcMap,
@@ -43,10 +43,11 @@ func (fr *FunctionRestorer) Restore(ctx context.Context) error {
 	restoredCount := 0
 	missingCount := 0
 
-	// 从数据库加载所有函数元数据，统计恢复情况
-	metas, err := fr.registry.jobFunctionRepo.ListAll(ctx)
-	if err == nil {
-		for _, meta := range metas {
+	// 通过接口方法获取所有已注册的函数ID，统计恢复情况
+	registeredFuncIDs := fr.registry.ListAll()
+	for _, funcID := range registeredFuncIDs {
+		meta := fr.registry.GetMeta(funcID)
+		if meta != nil {
 			if _, exists := fr.funcMap[meta.Name]; exists {
 				restoredCount++
 			} else {

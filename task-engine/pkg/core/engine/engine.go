@@ -13,6 +13,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/stevelan1995/task-engine/pkg/plugin"
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
 
@@ -36,12 +37,12 @@ const (
 
 // Engine 调度引擎核心结构体（对外导出）
 type Engine struct {
-	executor                *executor.Executor
+	executor                executor.Executor
 	workflowRepo            storage.WorkflowRepository
 	workflowInstanceRepo    storage.WorkflowInstanceRepository
 	taskRepo                storage.TaskRepository
 	aggregateRepo           storage.WorkflowAggregateRepository // 聚合Repository（优先使用）
-	registry                *task.FunctionRegistry
+	registry                task.FunctionRegistry
 	cfg                     *config.EngineConfig   // 框架配置
 	jobRegistry             sync.Map               // Job函数注册表（funcKey -> function）
 	callbackRegistry        sync.Map               // Callback函数注册表（funcKey -> function）
@@ -54,6 +55,7 @@ type Engine struct {
 	managers                map[string]types.WorkflowInstanceManager // WorkflowInstance ID -> Manager映射
 	controllers             map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
 	cronScheduler           *CronScheduler                           // 定时调度器
+	pluginManager           plugin.PluginManager                     // 插件管理器（接口）
 	mu                      sync.RWMutex
 	instanceManagerVersion  InstanceManagerVersion // InstanceManager版本，默认V2
 }
@@ -140,6 +142,7 @@ func NewEngineWithAggregateRepo(
 		managers:                make(map[string]types.WorkflowInstanceManager),
 		controllers:             make(map[string]workflow.WorkflowController),
 		cronScheduler:           NewCronScheduler(nil),
+		pluginManager:           plugin.NewPluginManager(), // 初始化插件管理器
 		instanceManagerVersion:  InstanceManagerV2,
 	}
 	eng.cronScheduler.engine = eng
@@ -251,8 +254,13 @@ func (e *Engine) EnableFunctionRestoreOnStart() {
 }
 
 // GetRegistry 获取函数注册中心（对外导出，用于测试和函数注册）
-func (e *Engine) GetRegistry() *task.FunctionRegistry {
+func (e *Engine) GetRegistry() task.FunctionRegistry {
 	return e.registry
+}
+
+// GetPluginManager 获取插件管理器（对外导出）
+func (e *Engine) GetPluginManager() plugin.PluginManager {
+	return e.pluginManager
 }
 
 // AddSubTaskToInstance 向指定的WorkflowInstance添加子任务（对外导出）
@@ -402,6 +410,7 @@ func (e *Engine) restoreInstance(ctx context.Context, instance *workflow.Workflo
 			e.taskRepo,
 			e.workflowInstanceRepo,
 			e.registry,
+			e.pluginManager,
 		)
 	} else {
 		manager, err = NewWorkflowInstanceManager(
@@ -801,6 +810,7 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 			e.taskRepo,
 			e.workflowInstanceRepo,
 			e.registry,
+			e.pluginManager,
 		)
 	} else {
 		manager, managerErr = NewWorkflowInstanceManager(
@@ -1009,6 +1019,7 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 				e.taskRepo,
 				e.workflowInstanceRepo,
 				e.registry,
+				e.pluginManager,
 			)
 		} else {
 			manager, managerErr = NewWorkflowInstanceManager(

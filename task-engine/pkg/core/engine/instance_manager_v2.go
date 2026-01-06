@@ -16,6 +16,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/stevelan1995/task-engine/pkg/plugin"
 	"github.com/stevelan1995/task-engine/pkg/storage"
 )
 
@@ -262,12 +263,12 @@ type WorkflowInstanceManagerV2 struct {
 	// 原有字段
 	instance             *workflow.WorkflowInstance
 	workflow             *workflow.Workflow
-	dag                  *dag.DAG
-	executor             *executor.Executor
+	dag                  dag.DAG
+	executor             executor.Executor
 	aggregateRepo        storage.WorkflowAggregateRepository // 聚合Repository（优先使用）
 	taskRepo             storage.TaskRepository
 	workflowInstanceRepo storage.WorkflowInstanceRepository
-	registry             *task.FunctionRegistry
+	registry             task.FunctionRegistry
 	resultCache          cache.ResultCache
 	ctx                  context.Context
 	cancel               context.CancelFunc
@@ -303,19 +304,23 @@ type WorkflowInstanceManagerV2 struct {
 	statusUpdateChan  chan string
 	mu                sync.RWMutex // 仅保护 instance 状态
 
-	// SAGA事务协调器（可选）
-	sagaCoordinator *saga.Coordinator
+	// SAGA事务协调器（可选，接口类型）
+	sagaCoordinator saga.Coordinator
 	sagaEnabled     bool // 是否启用SAGA
+
+	// 插件管理器（可选，接口类型）
+	pluginManager plugin.PluginManager
 }
 
 // NewWorkflowInstanceManagerV2 创建WorkflowInstanceManagerV2实例
 func NewWorkflowInstanceManagerV2(
 	instance *workflow.WorkflowInstance,
 	wf *workflow.Workflow,
-	exec *executor.Executor,
+	exec executor.Executor,
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
-	registry *task.FunctionRegistry,
+	registry task.FunctionRegistry,
+	pluginManager plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG
 	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())
@@ -347,7 +352,7 @@ func NewWorkflowInstanceManagerV2(
 	}
 
 	// 如果启用SAGA，创建协调器
-	var sagaCoordinator *saga.Coordinator
+	var sagaCoordinator saga.Coordinator
 	if sagaEnabled && registry != nil {
 		sagaCoordinator = saga.NewCoordinator(instance.ID, registry)
 		log.Printf("WorkflowInstance %s: SAGA事务已启用", instance.ID)
@@ -378,6 +383,7 @@ func NewWorkflowInstanceManagerV2(
 		statusUpdateChan:  make(chan string, 10),
 		sagaCoordinator:   sagaCoordinator,
 		sagaEnabled:       sagaEnabled,
+		pluginManager:     pluginManager,
 	}
 
 	log.Printf("WorkflowInstance %s: V2初始化完成，总任务数: %d，Channel 容量: %d",
@@ -392,11 +398,12 @@ func NewWorkflowInstanceManagerV2(
 func NewWorkflowInstanceManagerV2WithAggregate(
 	instance *workflow.WorkflowInstance,
 	wf *workflow.Workflow,
-	exec *executor.Executor,
+	exec executor.Executor,
 	aggregateRepo storage.WorkflowAggregateRepository,
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
-	registry *task.FunctionRegistry,
+	registry task.FunctionRegistry,
+	pluginManager plugin.PluginManager,
 ) (*WorkflowInstanceManagerV2, error) {
 	// 构建DAG
 	dagInstance, err := dag.BuildDAG(wf.GetTasks(), wf.GetDependencies())
@@ -428,7 +435,7 @@ func NewWorkflowInstanceManagerV2WithAggregate(
 	}
 
 	// 如果启用SAGA，创建协调器
-	var sagaCoordinator *saga.Coordinator
+	var sagaCoordinator saga.Coordinator
 	if sagaEnabled && registry != nil {
 		sagaCoordinator = saga.NewCoordinator(instance.ID, registry)
 		log.Printf("WorkflowInstance %s: SAGA事务已启用", instance.ID)
@@ -458,6 +465,7 @@ func NewWorkflowInstanceManagerV2WithAggregate(
 		statusUpdateChan:  make(chan string, 10),
 		sagaCoordinator:   sagaCoordinator,
 		sagaEnabled:       sagaEnabled,
+		pluginManager:     pluginManager,
 	}
 
 	log.Printf("WorkflowInstance %s: V2初始化完成（聚合Repository模式），总任务数: %d，Channel 容量: %d",
@@ -485,6 +493,25 @@ func (m *WorkflowInstanceManagerV2) Start() {
 	case m.statusUpdateChan <- "Running":
 	default:
 		log.Printf("警告: WorkflowInstance %s 状态更新通道已满", m.instance.ID)
+	}
+
+	// 触发Workflow启动插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowStarted,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Running",
+			Error:      nil,
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowStarted, pluginData); err != nil {
+			log.Printf("触发Workflow启动插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
 	}
 
 	// 启动三个核心goroutine
@@ -791,6 +818,37 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 					case m.statusUpdateChan <- finalStatus:
 					default:
 						log.Printf("警告: WorkflowInstance %s 状态更新通道已满", m.instance.ID)
+					}
+
+					// 触发Workflow完成/失败插件
+					if m.pluginManager != nil {
+						var event plugin.TriggerEvent
+						if finalStatus == "Success" {
+							event = plugin.EventWorkflowCompleted
+						} else {
+							event = plugin.EventWorkflowFailed
+						}
+						pluginData := plugin.PluginData{
+							Event:      event,
+							WorkflowID: m.instance.WorkflowID,
+							InstanceID: m.instance.ID,
+							TaskID:     "",
+							TaskName:   "",
+							Status:     finalStatus,
+							Error:      nil,
+							Data: map[string]interface{}{
+								"workflow_name": m.workflow.Name,
+								"total_tasks":   totalCount,
+								"completed":     completed,
+							},
+						}
+						if finalStatus == "Failed" {
+							pluginData.Error = fmt.Errorf("部分任务执行失败")
+							pluginData.Data["error"] = "部分任务执行失败"
+						}
+						if err := m.pluginManager.Trigger(m.ctx, event, pluginData); err != nil {
+							log.Printf("触发Workflow %s插件失败: InstanceID=%s, Error=%v", finalStatus, m.instance.ID, err)
+						}
 					}
 
 					log.Printf("WorkflowInstance %s: 所有任务已完成，最终状态: %s", m.instance.ID, finalStatus)
@@ -1669,6 +1727,35 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 			}
 		}
 
+		// 触发Task成功插件
+		if m.pluginManager != nil {
+			var workflowTask workflow.Task
+			var exists bool
+			if workflowTask, exists = m.workflow.GetTasks()[taskID]; !exists {
+				if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
+					workflowTask = runtimeTask.(workflow.Task)
+					exists = true
+				}
+			}
+			if exists {
+				pluginData := plugin.PluginData{
+					Event:      plugin.EventTaskSuccess,
+					WorkflowID: m.instance.WorkflowID,
+					InstanceID: m.instance.ID,
+					TaskID:     taskID,
+					TaskName:   workflowTask.GetName(),
+					Status:     "SUCCESS",
+					Error:      nil,
+					Data: map[string]interface{}{
+						"result": result.Data,
+					},
+				}
+				if err := m.pluginManager.Trigger(m.ctx, plugin.EventTaskSuccess, pluginData); err != nil {
+					log.Printf("触发Task成功插件失败: TaskID=%s, Error=%v", taskID, err)
+				}
+			}
+		}
+
 		// 发送任务完成事件到taskStatusChan
 		isTemplate := false
 		isSubTask := false
@@ -1815,6 +1902,35 @@ func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(e
 			}
 		}
 
+		// 触发Task失败插件
+		if m.pluginManager != nil {
+			var workflowTask workflow.Task
+			var exists bool
+			if workflowTask, exists = m.workflow.GetTasks()[taskID]; !exists {
+				if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
+					workflowTask = runtimeTask.(workflow.Task)
+					exists = true
+				}
+			}
+			if exists {
+				pluginData := plugin.PluginData{
+					Event:      plugin.EventTaskFailed,
+					WorkflowID: m.instance.WorkflowID,
+					InstanceID: m.instance.ID,
+					TaskID:     taskID,
+					TaskName:   workflowTask.GetName(),
+					Status:     "FAILED",
+					Error:      err,
+					Data: map[string]interface{}{
+						"error": err.Error(),
+					},
+				}
+				if triggerErr := m.pluginManager.Trigger(m.ctx, plugin.EventTaskFailed, pluginData); triggerErr != nil {
+					log.Printf("触发Task失败插件失败: TaskID=%s, Error=%v", taskID, triggerErr)
+				}
+			}
+		}
+
 		// 发送任务失败事件到taskStatusChan
 		isTemplate := false
 		isSubTask := false
@@ -1900,6 +2016,25 @@ func (m *WorkflowInstanceManagerV2) handlePause() {
 		log.Printf("更新WorkflowInstance状态失败: %v", err)
 	}
 
+	// 触发Workflow暂停插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowPaused,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Paused",
+			Error:      nil,
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowPaused, pluginData); err != nil {
+			log.Printf("触发Workflow暂停插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
+	}
+
 	select {
 	case m.statusUpdateChan <- "Paused":
 	default:
@@ -1927,6 +2062,25 @@ func (m *WorkflowInstanceManagerV2) handleResume() {
 	default:
 	}
 
+	// 触发Workflow恢复插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowResumed,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Running",
+			Error:      nil,
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowResumed, pluginData); err != nil {
+			log.Printf("触发Workflow恢复插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
+	}
+
 	log.Printf("WorkflowInstance %s: 已恢复", m.instance.ID)
 }
 
@@ -1952,6 +2106,26 @@ func (m *WorkflowInstanceManagerV2) handleTerminate() {
 
 	// 取消context，停止所有协程
 	m.cancel()
+
+	// 触发Workflow终止插件
+	if m.pluginManager != nil {
+		pluginData := plugin.PluginData{
+			Event:      plugin.EventWorkflowTerminated,
+			WorkflowID: m.instance.WorkflowID,
+			InstanceID: m.instance.ID,
+			TaskID:     "",
+			TaskName:   "",
+			Status:     "Terminated",
+			Error:      fmt.Errorf("用户终止"),
+			Data: map[string]interface{}{
+				"workflow_name": m.workflow.Name,
+				"reason":        "用户终止",
+			},
+		}
+		if err := m.pluginManager.Trigger(m.ctx, plugin.EventWorkflowTerminated, pluginData); err != nil {
+			log.Printf("触发Workflow终止插件失败: InstanceID=%s, Error=%v", m.instance.ID, err)
+		}
+	}
 
 	log.Printf("WorkflowInstance %s: 已终止", m.instance.ID)
 }

@@ -344,7 +344,7 @@ func DefaultCompensate(ctx *TaskContext) {
 	}
 
 	// 从依赖注入获取FunctionRegistry
-	registry, ok := GetDependencyTyped[*FunctionRegistry](ctx.Context(), "FunctionRegistry")
+	registry, ok := GetDependencyTyped[FunctionRegistry](ctx.Context(), "FunctionRegistry")
 	if !ok {
 		// 尝试通过字符串key获取
 		dep, ok := ctx.GetDependency("FunctionRegistry")
@@ -353,7 +353,7 @@ func DefaultCompensate(ctx *TaskContext) {
 			return
 		}
 		var ok2 bool
-		registry, ok2 = dep.(*FunctionRegistry)
+		registry, ok2 = dep.(FunctionRegistry)
 		if !ok2 {
 			log.Printf("⚠️ [DefaultCompensate] TaskID=%s, FunctionRegistry类型不正确", ctx.TaskID)
 			return

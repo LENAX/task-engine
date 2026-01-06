@@ -21,11 +21,11 @@ type DatabaseFactory interface {
 type Repositories struct {
 	WorkflowAggregate storage.WorkflowAggregateRepository // 聚合根Repository（推荐使用）
 	// 保留旧接口以兼容现有代码
-	Workflow          storage.WorkflowRepository
-	WorkflowInstance  storage.WorkflowInstanceRepository
-	Task              storage.TaskRepository
-	JobFunction       storage.JobFunctionRepository
-	TaskHandler       storage.TaskHandlerRepository
+	Workflow         storage.WorkflowRepository
+	WorkflowInstance storage.WorkflowInstanceRepository
+	Task             storage.TaskRepository
+	JobFunction      storage.JobFunctionRepository
+	TaskHandler      storage.TaskHandlerRepository
 }
 
 // NewDatabaseFactory 创建数据库工厂（内部方法）
@@ -121,4 +121,3 @@ func (f *postgresFactory) Close() error {
 	}
 	return nil
 }
-

@@ -11,8 +11,8 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 )
 
-// Executor 执行器核心结构体（对外导出）
-type Executor struct {
+// executorImpl 执行器实现（内部实现）
+type executorImpl struct {
 	mu          sync.RWMutex
 	maxWorkers  int                    // 全局最大并发数
 	workerPool  chan struct{}          // 全局Worker池
@@ -21,7 +21,7 @@ type Executor struct {
 	wg          sync.WaitGroup
 	running     bool
 	shutdown    chan struct{}
-	registry    *task.FunctionRegistry // Job函数注册中心
+	registry    task.FunctionRegistry // Job函数注册中心（接口）
 }
 
 // domainPool 业务域子池（内部结构）
@@ -38,7 +38,7 @@ const (
 )
 
 // NewExecutor 创建执行器实例（对外导出的工厂方法，engine包会调用）
-func NewExecutor(maxWorkers int) (*Executor, error) {
+func NewExecutor(maxWorkers int) (Executor, error) {
 	if maxWorkers <= 0 {
 		maxWorkers = 10 // 默认值
 	}
@@ -46,7 +46,7 @@ func NewExecutor(maxWorkers int) (*Executor, error) {
 		return nil, fmt.Errorf("最大并发数不能超过 %d", maxGlobalWorkers)
 	}
 
-	exec := &Executor{
+	exec := &executorImpl{
 		maxWorkers:  maxWorkers,
 		workerPool:  make(chan struct{}, maxWorkers),
 		domainPools: make(map[string]*domainPool),
@@ -62,7 +62,7 @@ func NewExecutor(maxWorkers int) (*Executor, error) {
 }
 
 // Start 启动执行器（对外导出）
-func (e *Executor) Start() {
+func (e *executorImpl) Start() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.running {
@@ -73,7 +73,7 @@ func (e *Executor) Start() {
 }
 
 // Shutdown 关闭执行器（对外导出）
-func (e *Executor) Shutdown() error {
+func (e *executorImpl) Shutdown() error {
 	e.mu.Lock()
 	if !e.running {
 		e.mu.Unlock()
@@ -108,7 +108,7 @@ func (e *Executor) Shutdown() error {
 }
 
 // SetPoolSize 动态调整Executor的全局并发池大小（对外导出）
-func (e *Executor) SetPoolSize(maxSize int) error {
+func (e *executorImpl) SetPoolSize(maxSize int) error {
 	if maxSize <= 0 {
 		return fmt.Errorf("并发池大小必须大于0")
 	}
@@ -155,7 +155,7 @@ func (e *Executor) SetPoolSize(maxSize int) error {
 }
 
 // SetDomainPoolSize 动态调整指定业务域的子池大小（对外导出）
-func (e *Executor) SetDomainPoolSize(domain string, size int) error {
+func (e *executorImpl) SetDomainPoolSize(domain string, size int) error {
 	if size <= 0 {
 		return fmt.Errorf("子池大小必须大于0")
 	}
@@ -198,7 +198,7 @@ func (e *Executor) SetDomainPoolSize(domain string, size int) error {
 }
 
 // GetDomainPoolStatus 查询指定业务域子池的状态（对外导出）
-func (e *Executor) GetDomainPoolStatus(domain string) (int, int, error) {
+func (e *executorImpl) GetDomainPoolStatus(domain string) (int, int, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -220,7 +220,7 @@ func (e *Executor) GetDomainPoolStatus(domain string) (int, int, error) {
 }
 
 // SetRegistry 设置Job函数注册中心（对外导出）
-func (e *Executor) SetRegistry(registry *task.FunctionRegistry) {
+func (e *executorImpl) SetRegistry(registry task.FunctionRegistry) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.registry = registry
@@ -228,7 +228,7 @@ func (e *Executor) SetRegistry(registry *task.FunctionRegistry) {
 
 // SubmitTask 将待调度Task提交至Executor的任务队列（对外导出）
 // 如果队列已满，会阻塞等待直到有空间或Executor关闭
-func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
+func (e *executorImpl) SubmitTask(pendingTask *PendingTask) error {
 	if pendingTask == nil {
 		return fmt.Errorf("任务不能为空")
 	}
@@ -258,7 +258,7 @@ func (e *Executor) SubmitTask(pendingTask *PendingTask) error {
 }
 
 // scheduler 任务调度器（内部方法）
-func (e *Executor) scheduler() {
+func (e *executorImpl) scheduler() {
 	for {
 		select {
 		case pendingTask, ok := <-e.taskQueue:
@@ -276,7 +276,7 @@ func (e *Executor) scheduler() {
 }
 
 // dispatchTask 分配任务到Worker（内部方法）
-func (e *Executor) dispatchTask(pendingTask *PendingTask) {
+func (e *executorImpl) dispatchTask(pendingTask *PendingTask) {
 	// agentlog已清理
 	// 如果有业务域，使用业务域子池
 	if pendingTask.Domain != "" {
@@ -350,7 +350,7 @@ func (e *Executor) dispatchTask(pendingTask *PendingTask) {
 }
 
 // executeTask 执行Task（内部方法）
-func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool) {
+func (e *executorImpl) executeTask(pendingTask *PendingTask, domainPool *domainPool) {
 	defer func() {
 		// 释放Worker池token
 		if domainPool != nil {
@@ -523,7 +523,7 @@ func (e *Executor) executeTask(pendingTask *PendingTask, domainPool *domainPool)
 
 // sendStatusEvent 发送任务状态事件到 channel（内部方法）
 // 如果 PendingTask 提供了 StatusChan，则将任务结果转换为事件并发送
-func (e *Executor) sendStatusEvent(pendingTask *PendingTask, result *TaskResult) {
+func (e *executorImpl) sendStatusEvent(pendingTask *PendingTask, result *TaskResult) {
 	if pendingTask.StatusChan == nil {
 		return
 	}

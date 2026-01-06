@@ -18,7 +18,7 @@ type TaskHandlerType func(ctx *TaskContext)
 // status: 当前状态
 // resultData: 任务执行结果数据（可选，用于Success状态）
 // errorMsg: 错误信息（可选，用于Failed/Timeout状态）
-func ExecuteTaskHandler(registry *FunctionRegistry, task workflow.Task, status string, resultData interface{}, errorMsg string) error {
+func ExecuteTaskHandler(registry FunctionRegistry, task workflow.Task, status string, resultData interface{}, errorMsg string) error {
 	if registry == nil {
 		return fmt.Errorf("函数注册中心未配置")
 	}
@@ -110,7 +110,7 @@ func ExecuteTaskHandler(registry *FunctionRegistry, task workflow.Task, status s
 // ExecuteTaskHandlerSync 同步执行Task的状态Handler（对外导出）
 // 与ExecuteTaskHandler的区别是：同步执行，会等待handler完成
 // 适用于需要确保handler执行完成后再继续的场景
-func ExecuteTaskHandlerSync(registry *FunctionRegistry, task workflow.Task, status string, resultData interface{}, errorMsg string) error {
+func ExecuteTaskHandlerSync(registry FunctionRegistry, task workflow.Task, status string, resultData interface{}, errorMsg string) error {
 	if registry == nil {
 		return fmt.Errorf("函数注册中心未配置")
 	}
@@ -198,7 +198,7 @@ func ExecuteTaskHandlerSync(registry *FunctionRegistry, task workflow.Task, stat
 // ExecuteTaskHandlerWithContext 执行Task的状态Handler，并传入完整的上下文信息（对外导出）
 // 与ExecuteTaskHandler的区别是：可以传入WorkflowID和WorkflowInstanceID
 func ExecuteTaskHandlerWithContext(
-	registry *FunctionRegistry,
+	registry FunctionRegistry,
 	task *Task,
 	status string,
 	workflowID string,

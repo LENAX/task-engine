@@ -28,7 +28,7 @@ type parentSubTaskStats struct {
 type WorkflowInstanceManager struct {
 	instance             *workflow.WorkflowInstance
 	workflow             *workflow.Workflow
-	dag                  *dag.DAG
+	dag                  dag.DAG
 	processedNodes       sync.Map     // 已处理的Task ID -> bool
 	readyTasksSet        sync.Map     // 就绪任务集合（taskID -> workflow.Task），O(1)访问
 	readyTasksMu         sync.RWMutex // 保护readyTasksSet的批量操作和复合操作
@@ -39,10 +39,10 @@ type WorkflowInstanceManager struct {
 	mu                   sync.RWMutex
 	ctx                  context.Context
 	cancel               context.CancelFunc
-	executor             *executor.Executor
+	executor             executor.Executor
 	taskRepo             storage.TaskRepository
 	workflowInstanceRepo storage.WorkflowInstanceRepository
-	registry             *task.FunctionRegistry
+	registry             task.FunctionRegistry
 	resultCache          cache.ResultCache // 结果缓存
 	wg                   sync.WaitGroup    // 用于等待所有协程完成
 }
@@ -51,10 +51,10 @@ type WorkflowInstanceManager struct {
 func NewWorkflowInstanceManager(
 	instance *workflow.WorkflowInstance,
 	wf *workflow.Workflow,
-	exec *executor.Executor,
+	exec executor.Executor,
 	taskRepo storage.TaskRepository,
 	workflowInstanceRepo storage.WorkflowInstanceRepository,
-	registry *task.FunctionRegistry,
+	registry task.FunctionRegistry,
 ) (*WorkflowInstanceManager, error) {
 	// 创建默认的内存缓存（如果未提供）
 	resultCache := cache.NewMemoryResultCache()
@@ -1128,7 +1128,8 @@ func (m *WorkflowInstanceManager) CreateBreakpoint() interface{} {
 
 	// DAG快照（简化处理）
 	dagSnapshot := make(map[string]interface{})
-	dagSnapshot["nodes"] = m.dag.GetOrder() // 使用 go-dag 的 GetOrder 方法获取节点数
+	vertices := m.dag.GetVertices()
+	dagSnapshot["nodes"] = len(vertices) // 获取节点数
 
 	// 将 sync.Map 转换为 map[string]interface{} 用于序列化
 	contextDataMap := make(map[string]interface{})

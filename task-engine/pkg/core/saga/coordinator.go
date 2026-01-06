@@ -9,18 +9,36 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 )
 
-// Coordinator SAGA事务协调器（对外导出）
-type Coordinator struct {
+// Coordinator SAGA事务协调器接口（对外导出）
+type Coordinator interface {
+	// AddStep 添加事务步骤
+	AddStep(step *TransactionStep)
+	// GetState 获取当前事务状态
+	GetState() TransactionState
+	// GetSteps 获取所有步骤
+	GetSteps() []*TransactionStep
+	// Commit 提交事务（所有步骤成功）
+	Commit() error
+	// Compensate 执行补偿（按反向顺序）
+	Compensate(ctx context.Context) error
+	// MarkStepSuccess 标记步骤成功
+	MarkStepSuccess(taskID string)
+	// MarkStepFailed 标记步骤失败
+	MarkStepFailed(taskID string)
+}
+
+// coordinatorImpl SAGA事务协调器实现（内部实现）
+type coordinatorImpl struct {
 	transactionID string
 	state         TransactionState
 	steps         []*TransactionStep
-	registry      *task.FunctionRegistry
+	registry      task.FunctionRegistry
 	mu            sync.RWMutex
 }
 
 // NewCoordinator 创建SAGA协调器（对外导出）
-func NewCoordinator(transactionID string, registry *task.FunctionRegistry) *Coordinator {
-	return &Coordinator{
+func NewCoordinator(transactionID string, registry task.FunctionRegistry) Coordinator {
+	return &coordinatorImpl{
 		transactionID: transactionID,
 		state:         TransactionStatePending,
 		steps:         make([]*TransactionStep, 0),
@@ -28,22 +46,22 @@ func NewCoordinator(transactionID string, registry *task.FunctionRegistry) *Coor
 	}
 }
 
-// AddStep 添加事务步骤（对外导出）
-func (c *Coordinator) AddStep(step *TransactionStep) {
+// AddStep 添加事务步骤（实现Coordinator接口）
+func (c *coordinatorImpl) AddStep(step *TransactionStep) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.steps = append(c.steps, step)
 }
 
-// GetState 获取当前事务状态（对外导出）
-func (c *Coordinator) GetState() TransactionState {
+// GetState 获取当前事务状态（实现Coordinator接口）
+func (c *coordinatorImpl) GetState() TransactionState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.state
 }
 
-// GetSteps 获取所有步骤（对外导出）
-func (c *Coordinator) GetSteps() []*TransactionStep {
+// GetSteps 获取所有步骤（实现Coordinator接口）
+func (c *coordinatorImpl) GetSteps() []*TransactionStep {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	result := make([]*TransactionStep, len(c.steps))
@@ -51,8 +69,8 @@ func (c *Coordinator) GetSteps() []*TransactionStep {
 	return result
 }
 
-// Commit 提交事务（所有步骤成功）（对外导出）
-func (c *Coordinator) Commit() error {
+// Commit 提交事务（所有步骤成功）（实现Coordinator接口）
+func (c *coordinatorImpl) Commit() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -65,8 +83,8 @@ func (c *Coordinator) Commit() error {
 	return nil
 }
 
-// Compensate 执行补偿（按反向顺序）（对外导出）
-func (c *Coordinator) Compensate(ctx context.Context) error {
+// Compensate 执行补偿（按反向顺序）（实现Coordinator接口）
+func (c *coordinatorImpl) Compensate(ctx context.Context) error {
 	c.mu.Lock()
 	if !c.state.CanTransitionTo(TransactionStateCompensating) {
 		c.mu.Unlock()
@@ -144,8 +162,8 @@ func (c *Coordinator) Compensate(ctx context.Context) error {
 	return nil
 }
 
-// MarkStepSuccess 标记步骤成功（对外导出）
-func (c *Coordinator) MarkStepSuccess(taskID string) {
+// MarkStepSuccess 标记步骤成功（实现Coordinator接口）
+func (c *coordinatorImpl) MarkStepSuccess(taskID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -157,8 +175,8 @@ func (c *Coordinator) MarkStepSuccess(taskID string) {
 	}
 }
 
-// MarkStepFailed 标记步骤失败（对外导出）
-func (c *Coordinator) MarkStepFailed(taskID string) {
+// MarkStepFailed 标记步骤失败（实现Coordinator接口）
+func (c *coordinatorImpl) MarkStepFailed(taskID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -169,4 +187,3 @@ func (c *Coordinator) MarkStepFailed(taskID string) {
 		}
 	}
 }
-
