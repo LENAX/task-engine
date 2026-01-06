@@ -52,6 +52,7 @@ type Engine struct {
 	Timeout                 int
 	managers                map[string]types.WorkflowInstanceManager // WorkflowInstance ID -> Manager映射
 	controllers             map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
+	cronScheduler           *CronScheduler                           // 定时调度器
 	mu                      sync.RWMutex
 	instanceManagerVersion  InstanceManagerVersion // InstanceManager版本，默认V2
 }
@@ -90,7 +91,7 @@ func NewEngineWithRepos(
 	// 创建FunctionRegistry，传入JobFunction和TaskHandler的Repository以启用默认存储
 	registry := task.NewFunctionRegistry(jobFunctionRepo, taskHandlerRepo)
 
-	return &Engine{
+	eng := &Engine{
 		executor:                exec,
 		workflowRepo:            workflowRepo,
 		workflowInstanceRepo:    workflowInstanceRepo,
@@ -103,8 +104,12 @@ func NewEngineWithRepos(
 		running:                 false,
 		managers:                make(map[string]types.WorkflowInstanceManager),
 		controllers:             make(map[string]workflow.WorkflowController),
-		instanceManagerVersion:  InstanceManagerV2, // 默认使用V2版本
-	}, nil
+		cronScheduler:           NewCronScheduler(nil), // 稍后设置engine引用
+		instanceManagerVersion:  InstanceManagerV2,     // 默认使用V2版本
+	}
+	// 设置CronScheduler的engine引用
+	eng.cronScheduler.engine = eng
+	return eng, nil
 }
 
 // SetInstanceManagerVersion 设置使用的InstanceManager版本（对外导出）
@@ -147,6 +152,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	if err := e.restoreUnfinishedInstances(ctx); err != nil {
 		log.Printf("恢复未完成实例失败: %v", err)
 		// 不阻止启动，仅记录日志
+	}
+
+	// 启动定时调度器
+	if e.cronScheduler != nil {
+		e.cronScheduler.Start()
 	}
 
 	return nil
@@ -375,7 +385,12 @@ func (e *Engine) Stop() {
 	// 1. 设置关闭标志
 	e.running = false
 
-	// 2. 通知所有WorkflowInstance准备关闭（发送Terminate信号）
+	// 2. 停止定时调度器
+	if e.cronScheduler != nil {
+		e.cronScheduler.Stop()
+	}
+
+	// 3. 通知所有WorkflowInstance准备关闭（发送Terminate信号）
 	e.mu.RLock()
 	instances := make([]types.WorkflowInstanceManager, 0, len(e.managers))
 	for _, manager := range e.managers {
@@ -700,6 +715,14 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 
 	// 立即启动WorkflowInstance执行
 	manager.Start()
+
+	// 如果Workflow启用了定时调度，注册到CronScheduler
+	if wf.IsCronEnabled() && e.cronScheduler != nil {
+		if err := e.cronScheduler.RegisterWorkflow(wf); err != nil {
+			log.Printf("⚠️ 注册Workflow到定时调度器失败: WorkflowID=%s, Error=%v", wf.GetID(), err)
+			// 不阻止Workflow提交，仅记录日志
+		}
+	}
 
 	log.Printf("✅ 提交Workflow成功，创建WorkflowInstance: %s，已启动执行", instance.ID)
 	return controller, nil

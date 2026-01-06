@@ -33,7 +33,9 @@ type Workflow struct {
 	Transactional         bool         `json:"transactional"`            // 是否启用事务（预留字段）
 	TransactionMode       string       `json:"transaction_mode"`         // 事务模式（预留字段）
 	MaxConcurrentTask     int          `json:"max_concurrent_task"`      // 最大并发任务数，默认10
-	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode, MaxConcurrentTask 字段
+	CronExpr              string       `json:"cron_expr"`                // Cron表达式（定时调度）
+	CronEnabled           bool         `json:"cron_enabled"`             // 是否启用定时调度
+	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode, MaxConcurrentTask, CronExpr, CronEnabled 字段
 }
 
 // BreakpointData 断点数据（对外导出）
@@ -72,6 +74,8 @@ func NewWorkflow(name, desc string) *Workflow {
 		Transactional:         false, // 默认不启用事务
 		TransactionMode:       "",    // 默认空字符串
 		MaxConcurrentTask:     10,    // 默认最大并发任务数为10
+		CronExpr:              "",    // 默认无Cron表达式
+		CronEnabled:           false, // 默认不启用定时调度
 	}
 	return wf
 }
@@ -652,6 +656,35 @@ func (w *Workflow) SetTransactional(transactional bool) error {
 	}
 	w.Transactional = transactional
 	return nil
+}
+
+// SetCronExpr 设置Cron表达式（对外导出，线程安全）
+func (w *Workflow) SetCronExpr(cronExpr string) error {
+	w.fieldsMu.Lock()
+	defer w.fieldsMu.Unlock()
+	w.CronExpr = cronExpr
+	return nil
+}
+
+// GetCronExpr 获取Cron表达式（对外导出，线程安全）
+func (w *Workflow) GetCronExpr() string {
+	w.fieldsMu.RLock()
+	defer w.fieldsMu.RUnlock()
+	return w.CronExpr
+}
+
+// SetCronEnabled 设置是否启用定时调度（对外导出，线程安全）
+func (w *Workflow) SetCronEnabled(enabled bool) {
+	w.fieldsMu.Lock()
+	defer w.fieldsMu.Unlock()
+	w.CronEnabled = enabled
+}
+
+// IsCronEnabled 检查是否启用定时调度（对外导出，线程安全）
+func (w *Workflow) IsCronEnabled() bool {
+	w.fieldsMu.RLock()
+	defer w.fieldsMu.RUnlock()
+	return w.CronEnabled
 }
 
 // GetTransactionMode 获取事务模式（对外导出，线程安全）
