@@ -108,7 +108,7 @@ func TestDefaultAggregateSubTaskResults(t *testing.T) {
 		"",
 		"",
 		map[string]interface{}{
-			"sub_task_results_key": "_sub_task_results",
+			"sub_task_results_key":   "_sub_task_results",
 			"success_rate_threshold": 80.0,
 			"_sub_task_results": []map[string]interface{}{
 				{"task_id": "sub1", "status": task.TaskStatusSuccess, "data": map[string]interface{}{"data_count": 10}},
@@ -223,8 +223,8 @@ func TestDefaultRetryOnFailure(t *testing.T) {
 		"",
 		"",
 		map[string]interface{}{
-			"max_retries":    3,
-			"retry_delay":   1,
+			"max_retries":      3,
+			"retry_delay":      1,
 			"_current_retries": 1,
 		},
 	)
@@ -260,4 +260,3 @@ func TestDefaultNotifyOnFailure(t *testing.T) {
 	// 执行Handler（应该不会panic）
 	task.DefaultNotifyOnFailure(ctx)
 }
-

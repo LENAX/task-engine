@@ -7,6 +7,7 @@ import (
 	"log"
 	"reflect"
 
+	"github.com/stevelan1995/task-engine/internal/storage"
 	"github.com/stevelan1995/task-engine/internal/storage/sqlite"
 	"github.com/stevelan1995/task-engine/pkg/config"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
@@ -138,19 +139,38 @@ func (b *EngineBuilder) Build() (*Engine, error) {
 	maxConcurrency := cfg.GetWorkerConcurrency()
 	timeoutSeconds := int(cfg.GetDefaultTaskTimeout().Seconds())
 
-	// 5. 创建Engine实例（使用配置的并发数和超时，Engine内部会创建Executor）
-	// 传入JobFunction和TaskHandler的Repository以启用默认存储
-	engine, err := NewEngineWithRepos(
-		maxConcurrency,
-		timeoutSeconds,
-		repos.Workflow,
-		repos.WorkflowInstance,
-		repos.Task,
-		repos.JobFunction,  // 启用JobFunction默认存储
-		repos.TaskHandler,  // 启用TaskHandler默认存储
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create engine failed: %w", err)
+	// 5. 创建Engine实例（优先使用聚合Repository，推荐方式）
+	var engine *Engine
+	if repos.WorkflowAggregate != nil {
+		// 使用聚合Repository创建Engine（推荐方式）
+		engine, err = NewEngineWithAggregateRepo(
+			maxConcurrency,
+			timeoutSeconds,
+			repos.WorkflowAggregate,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create engine with aggregate repo failed: %w", err)
+		}
+		// 如果提供了JobFunction和TaskHandler的Repository，用于FunctionRegistry
+		if repos.JobFunction != nil && repos.TaskHandler != nil {
+			// 创建带持久化的FunctionRegistry
+			registry := task.NewFunctionRegistry(repos.JobFunction, repos.TaskHandler)
+			engine.registry = registry
+		}
+	} else {
+		// 使用旧的Repository接口创建Engine（兼容模式）
+		engine, err = NewEngineWithRepos(
+			maxConcurrency,
+			timeoutSeconds,
+			repos.Workflow,
+			repos.WorkflowInstance,
+			repos.Task,
+			repos.JobFunction,  // 启用JobFunction默认存储
+			repos.TaskHandler,  // 启用TaskHandler默认存储
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create engine failed: %w", err)
+		}
 	}
 
 	// 6. 保存配置到Engine
@@ -253,24 +273,42 @@ func wrapCallbackToTaskHandler(fn interface{}) task.TaskHandlerType {
 }
 
 // initStorage 初始化存储层（根据配置创建Repository）
-func (b *EngineBuilder) initStorage(cfg *config.EngineConfig) (*sqlite.Repositories, error) {
+func (b *EngineBuilder) initStorage(cfg *config.EngineConfig) (*storage.Repositories, error) {
 	dbType := cfg.GetDatabaseType()
 	dsn := cfg.GetDatabaseDSN()
 
-	switch dbType {
-	case "sqlite":
-		repos, err := sqlite.NewRepositories(dsn)
+	// 创建数据库工厂
+	factory, err := storage.NewDatabaseFactory(dbType, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("create database factory failed: %w", err)
+	}
+
+	// 创建聚合Repository
+	aggregateRepo, err := factory.CreateWorkflowAggregateRepo(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("create aggregate repository failed: %w", err)
+	}
+
+	// 构建Repositories结构
+	repos := &storage.Repositories{
+		WorkflowAggregate: aggregateRepo,
+	}
+
+	// 对于SQLite，同时创建旧的Repository接口以兼容JobFunction和TaskHandler的持久化
+	if dbType == "sqlite" {
+		sqliteRepos, err := sqlite.NewRepositories(dsn)
 		if err != nil {
 			return nil, fmt.Errorf("create sqlite repositories failed: %w", err)
 		}
-		return repos, nil
-	case "postgres", "postgresql":
-		// TODO: 实现PostgreSQL支持
-		return nil, fmt.Errorf("postgresql not implemented yet")
-	case "mysql":
-		// TODO: 实现MySQL支持
-		return nil, fmt.Errorf("mysql not implemented yet")
-	default:
-		return nil, fmt.Errorf("unsupported database type: %s", dbType)
+		// 保留旧的Repository接口用于JobFunction和TaskHandler
+		repos.Workflow = sqliteRepos.Workflow
+		repos.WorkflowInstance = sqliteRepos.WorkflowInstance
+		repos.Task = sqliteRepos.Task
+		repos.JobFunction = sqliteRepos.JobFunction
+		repos.TaskHandler = sqliteRepos.TaskHandler
 	}
+	// 对于MySQL和PostgreSQL，JobFunction和TaskHandler的持久化可以通过扩展聚合Repository实现
+	// 目前先不创建，使用nil（FunctionRegistry会使用内存存储）
+
+	return repos, nil
 }

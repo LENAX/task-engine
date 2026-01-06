@@ -40,6 +40,7 @@ type Engine struct {
 	workflowRepo            storage.WorkflowRepository
 	workflowInstanceRepo    storage.WorkflowInstanceRepository
 	taskRepo                storage.TaskRepository
+	aggregateRepo           storage.WorkflowAggregateRepository // 聚合Repository（优先使用）
 	registry                *task.FunctionRegistry
 	cfg                     *config.EngineConfig   // 框架配置
 	jobRegistry             sync.Map               // Job函数注册表（funcKey -> function）
@@ -110,6 +111,50 @@ func NewEngineWithRepos(
 	// 设置CronScheduler的engine引用
 	eng.cronScheduler.engine = eng
 	return eng, nil
+}
+
+// NewEngineWithAggregateRepo 创建Engine实例（使用聚合Repository，推荐方式，对外导出）
+// aggregateRepo: 聚合Repository，统一管理Workflow、WorkflowInstance、TaskInstance的事务操作
+// 使用聚合Repository时，所有持久化操作都通过它进行，保证数据一致性和事务完整性
+func NewEngineWithAggregateRepo(
+	maxConcurrency, timeout int,
+	aggregateRepo storage.WorkflowAggregateRepository,
+) (*Engine, error) {
+	exec, err := executor.NewExecutor(maxConcurrency)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建FunctionRegistry（不使用默认存储，函数通过aggregateRepo管理）
+	registry := task.NewFunctionRegistry(nil, nil)
+
+	eng := &Engine{
+		executor:                exec,
+		aggregateRepo:           aggregateRepo,
+		registry:                registry,
+		functionMap:             make(map[string]interface{}),
+		restoreFunctionsOnStart: false,
+		MaxConcurrency:          maxConcurrency,
+		Timeout:                 timeout,
+		running:                 false,
+		managers:                make(map[string]types.WorkflowInstanceManager),
+		controllers:             make(map[string]workflow.WorkflowController),
+		cronScheduler:           NewCronScheduler(nil),
+		instanceManagerVersion:  InstanceManagerV2,
+	}
+	eng.cronScheduler.engine = eng
+	return eng, nil
+}
+
+// SetAggregateRepo 设置聚合Repository（对外导出）
+// 可以在Engine创建后动态设置聚合Repository
+func (e *Engine) SetAggregateRepo(repo storage.WorkflowAggregateRepository) {
+	e.aggregateRepo = repo
+}
+
+// GetAggregateRepo 获取聚合Repository（对外导出）
+func (e *Engine) GetAggregateRepo() storage.WorkflowAggregateRepository {
+	return e.aggregateRepo
 }
 
 // SetInstanceManagerVersion 设置使用的InstanceManager版本（对外导出）
@@ -264,16 +309,43 @@ func (i *InstanceManagerInterface) AddSubTask(subTask workflow.Task, parentTaskI
 // restoreUnfinishedInstances 恢复未完成的WorkflowInstance（内部方法）
 // 从数据库加载所有状态为Running或Paused的WorkflowInstance，并恢复执行
 func (e *Engine) restoreUnfinishedInstances(ctx context.Context) error {
-	// 查询所有Running状态的实例
-	runningInstances, err := e.workflowInstanceRepo.ListByStatus(ctx, "Running")
-	if err != nil {
-		return fmt.Errorf("查询Running状态的WorkflowInstance失败: %w", err)
-	}
+	var runningInstances, pausedInstances []*workflow.WorkflowInstance
 
-	// 查询所有Paused状态的实例
-	pausedInstances, err := e.workflowInstanceRepo.ListByStatus(ctx, "Paused")
-	if err != nil {
-		return fmt.Errorf("查询Paused状态的WorkflowInstance失败: %w", err)
+	// 优先使用聚合Repository（需要先获取所有Workflow，再获取各Workflow的Instance）
+	if e.aggregateRepo != nil {
+		workflows, err := e.aggregateRepo.ListWorkflows(ctx)
+		if err != nil {
+			return fmt.Errorf("查询Workflow列表失败: %w", err)
+		}
+		for _, wf := range workflows {
+			instances, err := e.aggregateRepo.ListWorkflowInstances(ctx, wf.ID)
+			if err != nil {
+				log.Printf("查询Workflow %s 的Instance失败: %v", wf.ID, err)
+				continue
+			}
+			for _, inst := range instances {
+				if inst.Status == "Running" {
+					runningInstances = append(runningInstances, inst)
+				} else if inst.Status == "Paused" {
+					pausedInstances = append(pausedInstances, inst)
+				}
+			}
+		}
+	} else if e.workflowInstanceRepo != nil {
+		var err error
+		// 查询所有Running状态的实例
+		runningInstances, err = e.workflowInstanceRepo.ListByStatus(ctx, "Running")
+		if err != nil {
+			return fmt.Errorf("查询Running状态的WorkflowInstance失败: %w", err)
+		}
+
+		// 查询所有Paused状态的实例
+		pausedInstances, err = e.workflowInstanceRepo.ListByStatus(ctx, "Paused")
+		if err != nil {
+			return fmt.Errorf("查询Paused状态的WorkflowInstance失败: %w", err)
+		}
+	} else {
+		return fmt.Errorf("未配置Repository")
 	}
 
 	// 恢复Running状态的实例
@@ -301,7 +373,17 @@ func (e *Engine) restoreUnfinishedInstances(ctx context.Context) error {
 // autoStart: 是否自动启动（Running状态为true，Paused状态为false）
 func (e *Engine) restoreInstance(ctx context.Context, instance *workflow.WorkflowInstance, autoStart bool) error {
 	// 从数据库加载Workflow模板
-	wf, err := e.workflowRepo.GetByID(ctx, instance.WorkflowID)
+	var wf *workflow.Workflow
+	var err error
+
+	// 优先使用聚合Repository
+	if e.aggregateRepo != nil {
+		wf, err = e.aggregateRepo.GetWorkflowWithTasks(ctx, instance.WorkflowID)
+	} else if e.workflowRepo != nil {
+		wf, err = e.workflowRepo.GetByID(ctx, instance.WorkflowID)
+	} else {
+		return fmt.Errorf("未配置Repository")
+	}
 	if err != nil {
 		return fmt.Errorf("加载Workflow模板失败: %w", err)
 	}
@@ -312,10 +394,11 @@ func (e *Engine) restoreInstance(ctx context.Context, instance *workflow.Workflo
 	// 根据配置创建对应版本的WorkflowInstanceManager（会自动从断点数据恢复）
 	var manager types.WorkflowInstanceManager
 	if e.instanceManagerVersion == InstanceManagerV2 {
-		manager, err = NewWorkflowInstanceManagerV2(
+		manager, err = NewWorkflowInstanceManagerV2WithAggregate(
 			instance,
 			wf,
 			e.executor,
+			e.aggregateRepo,
 			e.taskRepo,
 			e.workflowInstanceRepo,
 			e.registry,
@@ -459,12 +542,15 @@ func (e *Engine) Stop() {
 				continue
 			}
 			instanceID := manager.GetInstanceID()
-			if err := e.workflowInstanceRepo.UpdateBreakpoint(ctx, instanceID, breakpoint); err != nil {
-				log.Printf("保存WorkflowInstance %s 断点数据失败: %v", instanceID, err)
-			}
-			// 更新状态为Paused（而不是Terminated，便于恢复）
-			if err := e.workflowInstanceRepo.UpdateStatus(ctx, instanceID, "Paused"); err != nil {
-				log.Printf("更新WorkflowInstance %s 状态失败: %v", instanceID, err)
+			// 保存断点和状态（使用可用的Repository）
+			if e.workflowInstanceRepo != nil {
+				if err := e.workflowInstanceRepo.UpdateBreakpoint(ctx, instanceID, breakpoint); err != nil {
+					log.Printf("保存WorkflowInstance %s 断点数据失败: %v", instanceID, err)
+				}
+				// 更新状态为Paused（而不是Terminated，便于恢复）
+				if err := e.workflowInstanceRepo.UpdateStatus(ctx, instanceID, "Paused"); err != nil {
+					log.Printf("更新WorkflowInstance %s 状态失败: %v", instanceID, err)
+				}
 			}
 		}
 	}
@@ -639,9 +725,20 @@ func (e *Engine) RegisterWorkflow(ctx context.Context, wf *workflow.Workflow) er
 	if !e.running {
 		return logError("engine_not_running", "引擎未启动")
 	}
-	if err := e.workflowRepo.Save(ctx, wf); err != nil {
-		return err
+
+	// 优先使用聚合Repository（保存Workflow及其Task定义）
+	if e.aggregateRepo != nil {
+		if err := e.aggregateRepo.SaveWorkflow(ctx, wf); err != nil {
+			return err
+		}
+	} else if e.workflowRepo != nil {
+		if err := e.workflowRepo.Save(ctx, wf); err != nil {
+			return err
+		}
+	} else {
+		return fmt.Errorf("未配置Repository")
 	}
+
 	log.Printf("✅ 注册Workflow成功：%s", wf.ID)
 	return nil
 }
@@ -658,28 +755,49 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 		return nil, fmt.Errorf("Workflow校验失败: %w", err)
 	}
 
-	// 创建WorkflowInstance
-	instance := workflow.NewWorkflowInstance(wf.GetID())
-	instance.Status = "Ready"
+	var instance *workflow.WorkflowInstance
 
-	// 持久化WorkflowInstance
-	if err := e.workflowInstanceRepo.Save(ctx, instance); err != nil {
-		return nil, fmt.Errorf("保存WorkflowInstance失败: %w", err)
-	}
+	// 优先使用聚合Repository（事务性保存Workflow和创建Instance）
+	if e.aggregateRepo != nil {
+		// 先保存Workflow定义
+		if err := e.aggregateRepo.SaveWorkflow(ctx, wf); err != nil {
+			return nil, fmt.Errorf("保存Workflow失败: %w", err)
+		}
+		// 启动Workflow（创建Instance和TaskInstance）
+		var err error
+		instance, err = e.aggregateRepo.StartWorkflow(ctx, wf)
+		if err != nil {
+			return nil, fmt.Errorf("启动Workflow失败: %w", err)
+		}
+	} else {
+		// 使用旧的分离Repository
+		instance = workflow.NewWorkflowInstance(wf.GetID())
+		instance.Status = "Ready"
 
-	// 在事务中同时保存Workflow模板和所有预定义的Task
-	if err := e.workflowRepo.SaveWithTasks(ctx, wf, instance.ID, e.taskRepo, e.registry); err != nil {
-		return nil, fmt.Errorf("保存Workflow和Task失败: %w", err)
+		// 持久化WorkflowInstance
+		if e.workflowInstanceRepo != nil {
+			if err := e.workflowInstanceRepo.Save(ctx, instance); err != nil {
+				return nil, fmt.Errorf("保存WorkflowInstance失败: %w", err)
+			}
+		}
+
+		// 在事务中同时保存Workflow模板和所有预定义的Task
+		if e.workflowRepo != nil {
+			if err := e.workflowRepo.SaveWithTasks(ctx, wf, instance.ID, e.taskRepo, e.registry); err != nil {
+				return nil, fmt.Errorf("保存Workflow和Task失败: %w", err)
+			}
+		}
 	}
 
 	// 根据配置创建对应版本的WorkflowInstanceManager
 	var manager types.WorkflowInstanceManager
 	var managerErr error
 	if e.instanceManagerVersion == InstanceManagerV2 {
-		manager, managerErr = NewWorkflowInstanceManagerV2(
+		manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
 			instance,
 			wf,
 			e.executor,
+			e.aggregateRepo,
 			e.taskRepo,
 			e.workflowInstanceRepo,
 			e.registry,
@@ -844,7 +962,17 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 
 	if !exists {
 		// 如果manager不存在，尝试从数据库恢复
-		instance, err := e.workflowInstanceRepo.GetByID(ctx, instanceID)
+		var instance *workflow.WorkflowInstance
+		var err error
+
+		// 优先使用聚合Repository
+		if e.aggregateRepo != nil {
+			instance, _, err = e.aggregateRepo.GetWorkflowInstanceWithTasks(ctx, instanceID)
+		} else if e.workflowInstanceRepo != nil {
+			instance, err = e.workflowInstanceRepo.GetByID(ctx, instanceID)
+		} else {
+			return fmt.Errorf("未配置Repository")
+		}
 		if err != nil {
 			return fmt.Errorf("查询WorkflowInstance失败: %w", err)
 		}
@@ -857,7 +985,12 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 		}
 
 		// 从数据库加载Workflow模板
-		wf, err := e.workflowRepo.GetByID(ctx, instance.WorkflowID)
+		var wf *workflow.Workflow
+		if e.aggregateRepo != nil {
+			wf, err = e.aggregateRepo.GetWorkflowWithTasks(ctx, instance.WorkflowID)
+		} else if e.workflowRepo != nil {
+			wf, err = e.workflowRepo.GetByID(ctx, instance.WorkflowID)
+		}
 		if err != nil {
 			return fmt.Errorf("加载Workflow模板失败: %w", err)
 		}
@@ -868,10 +1001,11 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 		// 根据配置创建对应版本的Manager并恢复
 		var managerErr error
 		if e.instanceManagerVersion == InstanceManagerV2 {
-			manager, managerErr = NewWorkflowInstanceManagerV2(
+			manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
 				instance,
 				wf,
 				e.executor,
+				e.aggregateRepo,
 				e.taskRepo,
 				e.workflowInstanceRepo,
 				e.registry,
@@ -923,11 +1057,19 @@ func (e *Engine) TerminateWorkflowInstance(ctx context.Context, instanceID strin
 
 	// 先检查当前状态
 	var currentStatus string
+	var instance *workflow.WorkflowInstance
 	if exists {
 		currentStatus = manager.GetStatus()
 	} else {
-		// 从数据库加载
-		instance, err := e.workflowInstanceRepo.GetByID(ctx, instanceID)
+		// 从数据库加载（优先使用聚合Repository）
+		var err error
+		if e.aggregateRepo != nil {
+			instance, _, err = e.aggregateRepo.GetWorkflowInstanceWithTasks(ctx, instanceID)
+		} else if e.workflowInstanceRepo != nil {
+			instance, err = e.workflowInstanceRepo.GetByID(ctx, instanceID)
+		} else {
+			return fmt.Errorf("未配置Repository")
+		}
 		if err != nil {
 			return fmt.Errorf("查询WorkflowInstance失败: %w", err)
 		}
@@ -944,14 +1086,23 @@ func (e *Engine) TerminateWorkflowInstance(ctx context.Context, instanceID strin
 
 	if !exists {
 		// 如果manager不存在，直接从数据库更新状态
-		instance, err := e.workflowInstanceRepo.GetByID(ctx, instanceID)
-		if err != nil {
-			return fmt.Errorf("查询WorkflowInstance失败: %w", err)
+		if instance == nil {
+			var err error
+			if e.aggregateRepo != nil {
+				instance, _, err = e.aggregateRepo.GetWorkflowInstanceWithTasks(ctx, instanceID)
+			} else if e.workflowInstanceRepo != nil {
+				instance, err = e.workflowInstanceRepo.GetByID(ctx, instanceID)
+			}
+			if err != nil {
+				return fmt.Errorf("查询WorkflowInstance失败: %w", err)
+			}
 		}
 		instance.Status = "Terminated"
 		instance.ErrorMessage = reason
-		if err := e.workflowInstanceRepo.UpdateStatus(ctx, instanceID, "Terminated"); err != nil {
-			return fmt.Errorf("更新WorkflowInstance状态失败: %w", err)
+		if e.workflowInstanceRepo != nil {
+			if err := e.workflowInstanceRepo.UpdateStatus(ctx, instanceID, "Terminated"); err != nil {
+				return fmt.Errorf("更新WorkflowInstance状态失败: %w", err)
+			}
 		}
 
 		log.Printf("✅ WorkflowInstance %s 已终止，原因: %s", instanceID, reason)
@@ -989,8 +1140,16 @@ func (e *Engine) GetWorkflowInstanceStatus(ctx context.Context, instanceID strin
 		return manager.GetStatus(), nil
 	}
 
-	// 从数据库加载
-	instance, err := e.workflowInstanceRepo.GetByID(ctx, instanceID)
+	// 从数据库加载（优先使用聚合Repository）
+	var instance *workflow.WorkflowInstance
+	var err error
+	if e.aggregateRepo != nil {
+		instance, _, err = e.aggregateRepo.GetWorkflowInstanceWithTasks(ctx, instanceID)
+	} else if e.workflowInstanceRepo != nil {
+		instance, err = e.workflowInstanceRepo.GetByID(ctx, instanceID)
+	} else {
+		return "", fmt.Errorf("未配置Repository")
+	}
 	if err != nil {
 		return "", fmt.Errorf("查询WorkflowInstance失败: %w", err)
 	}
