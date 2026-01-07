@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/stevelan1995/task-engine/pkg/core/dag"
+	"github.com/stevelan1995/task-engine/pkg/core/realtime"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
@@ -43,6 +44,39 @@ func (b *WorkflowBuilder) WithTask(t *task.Task) *WorkflowBuilder {
 	if t != nil {
 		b.tasks = append(b.tasks, t)
 	}
+	return b
+}
+
+// WithRealtimeTask 向当前Workflow中添加实时任务（链式构建，对外导出）
+// rtTask: RealtimeTask实例（需提前通过RealtimeTaskBuilder构建）
+// 注意：添加实时任务时会自动将执行模式设置为 streaming
+func (b *WorkflowBuilder) WithRealtimeTask(rtTask *realtime.RealtimeTask) *WorkflowBuilder {
+	if rtTask != nil && rtTask.Task != nil {
+		// 将实时任务配置存储到 Task.Params 中
+		rtTask.Task.SetParam("execution_mode", string(rtTask.ExecutionMode))
+		if rtTask.ContinuousConfig != nil {
+			rtTask.Task.SetParam("continuous_config", rtTask.ContinuousConfig)
+		}
+		if len(rtTask.EventSubscriptions) > 0 {
+			rtTask.Task.SetParam("event_subscriptions", rtTask.EventSubscriptions)
+		}
+		b.tasks = append(b.tasks, rtTask.Task)
+	}
+	return b
+}
+
+// WithStreamingMode 设置为流处理模式（链式构建，对外导出）
+// 当调用此方法时，Workflow.ExecutionMode 会被设置为 "streaming"
+// Engine 会根据此字段自动选择 RealtimeInstanceManager
+func (b *WorkflowBuilder) WithStreamingMode() *WorkflowBuilder {
+	b.wf.SetExecutionMode(workflow.ExecutionModeStreaming)
+	return b
+}
+
+// WithBatchMode 设置为批处理模式（链式构建，对外导出）
+// 默认就是批处理模式，但可以显式调用以明确意图
+func (b *WorkflowBuilder) WithBatchMode() *WorkflowBuilder {
+	b.wf.SetExecutionMode(workflow.ExecutionModeBatch)
 	return b
 }
 

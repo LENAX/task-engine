@@ -10,6 +10,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/config"
 	"github.com/stevelan1995/task-engine/pkg/core/builder"
 	"github.com/stevelan1995/task-engine/pkg/core/executor"
+	"github.com/stevelan1995/task-engine/pkg/core/realtime"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
@@ -798,29 +799,42 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 		}
 	}
 
-	// 根据配置创建对应版本的WorkflowInstanceManager
+	// 根据 Workflow.ExecutionMode 选择 Manager
 	var manager types.WorkflowInstanceManager
 	var managerErr error
-	if e.instanceManagerVersion == InstanceManagerV2 {
-		manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
-			instance,
-			wf,
-			e.executor,
-			e.aggregateRepo,
-			e.taskRepo,
-			e.workflowInstanceRepo,
-			e.registry,
-			e.pluginManager,
-		)
-	} else {
-		manager, managerErr = NewWorkflowInstanceManager(
-			instance,
-			wf,
-			e.executor,
-			e.taskRepo,
-			e.workflowInstanceRepo,
-			e.registry,
-		)
+
+	executionMode := wf.GetExecutionMode()
+
+	switch executionMode {
+	case workflow.ExecutionModeStreaming:
+		// 流处理模式：创建 RealtimeInstanceManager
+		manager, managerErr = e.createRealtimeInstanceManager(ctx, instance, wf)
+
+	case workflow.ExecutionModeBatch:
+		fallthrough
+	default:
+		// 批处理模式：根据版本创建对应的 WorkflowInstanceManager
+		if e.instanceManagerVersion == InstanceManagerV2 {
+			manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
+				instance,
+				wf,
+				e.executor,
+				e.aggregateRepo,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+				e.pluginManager,
+			)
+		} else {
+			manager, managerErr = NewWorkflowInstanceManager(
+				instance,
+				wf,
+				e.executor,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+			)
+		}
 	}
 	if managerErr != nil {
 		return nil, fmt.Errorf("创建WorkflowInstanceManager失败: %w", managerErr)
@@ -1189,6 +1203,28 @@ func (e *Engine) forwardStatusUpdates(instanceID string, manager types.WorkflowI
 			return
 		}
 	}
+}
+
+// createRealtimeInstanceManager 创建实时 InstanceManager（内部方法）
+func (e *Engine) createRealtimeInstanceManager(
+	ctx context.Context,
+	instance *workflow.WorkflowInstance,
+	wf *workflow.Workflow,
+) (types.WorkflowInstanceManager, error) {
+	// 校验执行模式
+	if wf.GetExecutionMode() != workflow.ExecutionModeStreaming {
+		return nil, fmt.Errorf("Workflow 执行模式必须为 'streaming'，当前: %s", wf.GetExecutionMode())
+	}
+
+	// 创建 RealtimeInstanceManager
+	return realtime.NewRealtimeInstanceManager(
+		instance,
+		wf,
+		e.workflowInstanceRepo,
+		// 选项配置
+		realtime.WithBufferSize(10000),
+		realtime.WithBackpressureThreshold(0.8),
+	)
 }
 
 // 内部辅助函数（小写，不导出）
