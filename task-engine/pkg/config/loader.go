@@ -50,6 +50,19 @@ func LoadWorkflowConfig(path string) (*WorkflowConfig, error) {
 	return &cfg, nil
 }
 
+// ParseWorkflowConfigFromYAML 从YAML字符串解析WorkflowConfig
+func ParseWorkflowConfigFromYAML(content string) (*WorkflowConfig, error) {
+	// 环境变量替换
+	data := replaceEnvVars([]byte(content))
+
+	var cfg WorkflowConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("解析YAML内容失败: %w", err)
+	}
+
+	return &cfg, nil
+}
+
 // LoadWorkflowConfigs 批量加载业务配置（支持多文件合并）
 func LoadWorkflowConfigs(dir string) ([]*WorkflowConfig, error) {
 	entries, err := os.ReadDir(dir)
