@@ -637,6 +637,62 @@ func (e *Engine) LoadWorkflow(workflowConfigPath string) (*WorkflowDefinition, e
 	}, nil
 }
 
+// LoadWorkflowFromYAML 从YAML字符串加载工作流定义
+func (e *Engine) LoadWorkflowFromYAML(content string) (*WorkflowDefinition, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if !e.running {
+		return nil, fmt.Errorf("engine not started, call Start() first")
+	}
+
+	// 1. 解析YAML内容
+	wfConfig, err := config.ParseWorkflowConfigFromYAML(content)
+	if err != nil {
+		return nil, fmt.Errorf("parse workflow yaml failed: %w", err)
+	}
+
+	// 2. 应用默认值（基于框架配置）
+	defaultTimeout := 30 * time.Second
+	if e.cfg != nil {
+		defaultTimeout = e.cfg.GetDefaultTaskTimeout()
+	}
+	wfConfig.ApplyDefaults(defaultTimeout)
+
+	// 3. 校验配置合法性
+	jobRegistryMap := make(map[string]interface{})
+	for _, jobDef := range wfConfig.Workflows.Jobs {
+		funcID := e.registry.GetIDByName(jobDef.FuncKey)
+		if funcID != "" {
+			if fn := e.registry.GetByName(jobDef.FuncKey); fn != nil {
+				jobRegistryMap[jobDef.FuncKey] = fn
+			}
+		}
+	}
+
+	if err := config.ValidateWorkflowConfig(wfConfig, jobRegistryMap, defaultTimeout); err != nil {
+		return nil, fmt.Errorf("validate workflow config failed: %w", err)
+	}
+
+	// 4. 转换为Workflow对象
+	if len(wfConfig.Workflows.Definitions) == 0 {
+		return nil, fmt.Errorf("workflow config contains no workflow definitions")
+	}
+
+	wfDef := wfConfig.Workflows.Definitions[0]
+	wf, err := e.convertWorkflowConfigToWorkflow(wfConfig, &wfDef)
+	if err != nil {
+		return nil, fmt.Errorf("convert workflow config to workflow failed: %w", err)
+	}
+
+	return &WorkflowDefinition{
+		ID:         wfDef.WorkflowID,
+		Config:     wfConfig,
+		SourcePath: "", // 从YAML字符串加载，没有文件路径
+		Workflow:   wf,
+	}, nil
+}
+
 // convertWorkflowConfigToWorkflow 将WorkflowConfig转换为Workflow对象
 func (e *Engine) convertWorkflowConfigToWorkflow(wfConfig *config.WorkflowConfig, wfDef *config.WorkflowDefinition) (*workflow.Workflow, error) {
 	// 使用WorkflowBuilder构建Workflow
