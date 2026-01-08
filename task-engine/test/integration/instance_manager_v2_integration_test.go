@@ -14,11 +14,12 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/stevelan1995/task-engine/pkg/plugin"
 )
 
 // TestWorkflowInstanceManagerV2_BasicWorkflow 测试基础workflow执行
 func TestWorkflowInstanceManagerV2_BasicWorkflow(t *testing.T) {
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -64,6 +65,7 @@ func TestWorkflowInstanceManagerV2_BasicWorkflow(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		plugin.NewPluginManager(),
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -99,7 +101,7 @@ func TestWorkflowInstanceManagerV2_BasicWorkflow(t *testing.T) {
 
 // TestWorkflowInstanceManagerV2_DynamicSubTasks 测试动态子任务生成
 func TestWorkflowInstanceManagerV2_DynamicSubTasks(t *testing.T) {
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -198,6 +200,7 @@ func TestWorkflowInstanceManagerV2_DynamicSubTasks(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		plugin.NewPluginManager(),
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -228,7 +231,7 @@ func TestWorkflowInstanceManagerV2_DynamicSubTasks(t *testing.T) {
 }
 
 // setupTestForV2 设置V2集成测试环境
-func setupTestForV2(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupTestForV2Integration(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 
@@ -261,7 +264,7 @@ func setupTestForV2(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *work
 
 // TestWorkflowInstanceManagerV2_AtomicAddSubTasks_Concurrent 测试并发场景下的AtomicAddSubTasks
 func TestWorkflowInstanceManagerV2_AtomicAddSubTasks_Concurrent(t *testing.T) {
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -356,6 +359,7 @@ func TestWorkflowInstanceManagerV2_AtomicAddSubTasks_Concurrent(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		plugin.NewPluginManager(),
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)

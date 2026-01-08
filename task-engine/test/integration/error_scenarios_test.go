@@ -210,7 +210,7 @@ func TestErrorScenarios_PartialFailure(t *testing.T) {
 }
 
 // setupErrorScenarioTest 设置错误场景测试环境
-func setupErrorScenarioTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupErrorScenarioTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 

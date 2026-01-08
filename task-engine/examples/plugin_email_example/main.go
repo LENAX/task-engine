@@ -57,13 +57,13 @@ func main() {
 	}
 
 	// 4. 启动Engine
-	if err := eng.Start(); err != nil {
+	ctx := context.Background()
+	if err := eng.Start(ctx); err != nil {
 		log.Fatalf("启动Engine失败: %v", err)
 	}
 	defer eng.Stop()
 
 	// 5. 注册Job函数
-	ctx := context.Background()
 	jobFunc := func(ctx context.Context) error {
 		log.Println("执行任务...")
 		time.Sleep(1 * time.Second)
@@ -77,7 +77,7 @@ func main() {
 	// 6. 创建Workflow
 	wfBuilder := builder.NewWorkflowBuilder("example_workflow", "示例Workflow")
 	taskBuilder := builder.NewTaskBuilder("task1", "任务1", eng.GetRegistry())
-	task1, err := taskBuilder.WithJobFunction("example_job").Build()
+	task1, err := taskBuilder.WithJobFunction("example_job", nil).Build()
 	if err != nil {
 		log.Fatalf("创建Task失败: %v", err)
 	}
@@ -87,21 +87,21 @@ func main() {
 	}
 
 	// 7. 提交Workflow
-	instanceID, err := eng.SubmitWorkflow(ctx, wf)
+	ctrl, err := eng.SubmitWorkflow(ctx, wf)
 	if err != nil {
 		log.Fatalf("提交Workflow失败: %v", err)
 	}
-	fmt.Printf("Workflow已提交，Instance ID: %s\n", instanceID)
+	fmt.Printf("Workflow已提交，Instance ID: %s\n", ctrl.InstanceID())
 
 	// 8. 等待Workflow完成
 	time.Sleep(3 * time.Second)
 
 	// 9. 查询Workflow状态
-	ctrl, err := eng.GetWorkflowController(instanceID)
+	status, err := ctrl.GetStatus()
 	if err != nil {
-		log.Fatalf("获取WorkflowController失败: %v", err)
+		log.Fatalf("获取Workflow状态失败: %v", err)
 	}
-	fmt.Printf("Workflow状态: %s\n", ctrl.Status())
+	fmt.Printf("Workflow状态: %s\n", status)
 
 	fmt.Println("示例完成！邮件插件已触发，请检查收件箱。")
 }

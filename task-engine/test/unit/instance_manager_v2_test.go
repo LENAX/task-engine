@@ -164,6 +164,7 @@ func TestWorkflowInstanceManagerV2_Start(t *testing.T) {
 		nil, // taskRepo
 		nil, // workflowInstanceRepo
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -213,6 +214,7 @@ func TestWorkflowInstanceManagerV2_AddSubTask(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -270,6 +272,7 @@ func TestWorkflowInstanceManagerV2_AtomicAddSubTasks(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -335,6 +338,7 @@ func TestWorkflowInstanceManagerV2_AtomicAddSubTasks_EmptyList(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -378,6 +382,7 @@ func TestWorkflowInstanceManagerV2_AtomicAddSubTasks_InvalidTask(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -443,6 +448,7 @@ func TestWorkflowInstanceManagerV2_AtomicAddSubTasks_Rollback(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -524,6 +530,7 @@ func TestWorkflowInstanceManagerV2_SignalControl(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -593,6 +600,7 @@ func TestWorkflowInstanceManagerV2_CreateBreakpoint(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -646,6 +654,7 @@ func TestWorkflowInstanceManagerV2_TemplateTask(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -694,7 +703,7 @@ func TestWorkflowInstanceManagerV2_TemplateTask(t *testing.T) {
 }
 
 // setupTestForV2 设置V2测试环境
-func setupTestForV2(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupTestForV2(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 
@@ -892,6 +901,7 @@ func TestWorkflowInstanceManagerV2_TemplateTaskCountEdgeCases(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -948,6 +958,7 @@ func TestWorkflowInstanceManagerV2_ChannelBlocking(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -1001,6 +1012,7 @@ func TestWorkflowInstanceManagerV2_ConcurrentSubTaskAddition(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -1096,6 +1108,7 @@ func TestWorkflowInstanceManagerV2_ShutdownGraceful(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -1162,6 +1175,7 @@ func TestWorkflowInstanceManagerV2_TaskRetry(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -1229,6 +1243,7 @@ func TestWorkflowInstanceManagerV2_LevelAdvancement(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -1271,9 +1286,10 @@ func TestWorkflowInstanceManagerV2_EmptyWorkflow(t *testing.T) {
 		instance,
 		wf,
 		exec,
-		nil,
-		nil,
-		nil,
+		nil, // taskRepo
+		nil, // workflowInstanceRepo
+		nil, // registry
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -1369,6 +1385,7 @@ func TestWorkflowInstanceManagerV2_TaskStatisticsValidation(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -1425,6 +1442,7 @@ func TestWorkflowInstanceManagerV2_MultipleTemplateTasks(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)

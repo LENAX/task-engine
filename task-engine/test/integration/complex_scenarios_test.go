@@ -754,7 +754,7 @@ func TestComplexScenarios_RandomFailures(t *testing.T) {
 }
 
 // setupComplexTest 设置复杂场景测试环境
-func setupComplexTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, storage.TaskRepository, func()) {
+func setupComplexTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, storage.TaskRepository, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 

@@ -13,7 +13,7 @@ import (
 )
 
 // setupDAGOptimizationTest 设置DAG优化测试环境
-func setupDAGOptimizationTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupDAGOptimizationTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 

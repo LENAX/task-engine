@@ -217,7 +217,7 @@ func TestErrorHandling_APIRateLimit(t *testing.T) {
 }
 
 // setupErrorHandlingTest 设置错误处理测试环境
-func setupErrorHandlingTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupErrorHandlingTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 

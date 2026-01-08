@@ -35,7 +35,7 @@ func mockJobFunc3(ctx context.Context) (interface{}, error) {
 	return "mockJobFunc3执行成功", nil
 }
 
-func setupLifecycleTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, func()) {
+func setupLifecycleTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, func()) {
 	// 删除旧的测试数据库
 	os.Remove(testLifecycleDBPath)
 

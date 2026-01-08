@@ -11,7 +11,7 @@ import (
 )
 
 // setupSagaTest 设置SAGA测试环境
-func setupSagaTest(t *testing.T) (*task.FunctionRegistry, *saga.Coordinator, func()) {
+func setupSagaTest(t *testing.T) (task.FunctionRegistry, saga.Coordinator, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test_saga.db"
 
@@ -178,4 +178,3 @@ func TestTransactionState_CanTransitionTo(t *testing.T) {
 		t.Error("Compensating应该可以转换到Failed")
 	}
 }
-

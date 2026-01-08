@@ -20,7 +20,7 @@ import (
 const testSubTaskDBPath = "file::memory:?cache=shared&_journal_mode=WAL&_sync=normal"
 
 // setupSubTaskTest 设置子任务测试环境
-func setupSubTaskTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupSubTaskTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	// 删除旧的测试数据库
 	os.Remove(testSubTaskDBPath)
 
@@ -74,7 +74,7 @@ func setupSubTaskTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *wo
 }
 
 // createTestTask 创建测试任务
-func createTestTask(t *testing.T, registry *task.FunctionRegistry, name, desc string, deps []string) *task.Task {
+func createTestTask(t *testing.T, registry task.FunctionRegistry, name, desc string, deps []string) *task.Task {
 	taskBuilder := builder.NewTaskBuilder(name, desc, registry).
 		WithJobFunction("mockFunc", nil)
 
