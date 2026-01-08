@@ -619,26 +619,43 @@ func TestBackpressure_Simulation(t *testing.T) {
 	var dropped int32
 	buffer := make(chan []byte, 10) // 小缓冲区
 
-	// 生产者 - 快速接收
-	go func() {
-		for {
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				continue
-			}
-			select {
-			case buffer <- message:
-				atomic.AddInt32(&received, 1)
-			default:
-				atomic.AddInt32(&dropped, 1) // 缓冲区满，丢弃
-			}
-		}
-	}()
-
 	// 消费者 - 慢速处理
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
+
+	// 生产者 - 快速接收
+	go func() {
+		defer close(buffer)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				_, message, err := conn.ReadMessage()
+				if err != nil {
+					// 检查是否是连接关闭错误，如果是则退出
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+						return
+					}
+					// 检查是否是超时错误，超时继续
+					if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+						continue
+					}
+					// 其他错误也继续（可能是临时错误）
+					continue
+				}
+				select {
+				case buffer <- message:
+					atomic.AddInt32(&received, 1)
+				case <-ctx.Done():
+					return
+				default:
+					atomic.AddInt32(&dropped, 1) // 缓冲区满，丢弃
+				}
+			}
+		}
+	}()
 
 	go func() {
 		for {
