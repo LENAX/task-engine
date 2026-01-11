@@ -17,6 +17,12 @@ type Task = types.Task
 // TaskInfo 使用公共包中的TaskInfo接口（类型别名，保持向后兼容）
 type TaskInfo = types.TaskInfo
 
+// ExecutionMode 执行模式常量
+const (
+	ExecutionModeBatch     = "batch"     // 批处理模式（默认）
+	ExecutionModeStreaming = "streaming" // 流处理模式（实时数据采集）
+)
+
 // Workflow Workflow核心结构体（对外导出）
 type Workflow struct {
 	ID                    string       `json:"id"`
@@ -35,7 +41,8 @@ type Workflow struct {
 	MaxConcurrentTask     int          `json:"max_concurrent_task"`      // 最大并发任务数，默认10
 	CronExpr              string       `json:"cron_expr"`                // Cron表达式（定时调度）
 	CronEnabled           bool         `json:"cron_enabled"`             // 是否启用定时调度
-	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode, MaxConcurrentTask, CronExpr, CronEnabled 字段
+	ExecutionMode         string       `json:"execution_mode"`           // 执行模式（batch/streaming），默认batch
+	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode, MaxConcurrentTask, CronExpr, CronEnabled, ExecutionMode 字段
 }
 
 // BreakpointData 断点数据（对外导出）
@@ -70,12 +77,13 @@ func NewWorkflow(name, desc string) *Workflow {
 		Tasks:                 sync.Map{},
 		TaskNameIndex:         sync.Map{},
 		Dependencies:          sync.Map{},
-		SubTaskErrorTolerance: 0.0,   // 默认值0，不允许子任务失败
-		Transactional:         false, // 默认不启用事务
-		TransactionMode:       "",    // 默认空字符串
-		MaxConcurrentTask:     10,    // 默认最大并发任务数为10
-		CronExpr:              "",    // 默认无Cron表达式
-		CronEnabled:           false, // 默认不启用定时调度
+		SubTaskErrorTolerance: 0.0,                // 默认值0，不允许子任务失败
+		Transactional:         false,              // 默认不启用事务
+		TransactionMode:       "",                 // 默认空字符串
+		MaxConcurrentTask:     10,                 // 默认最大并发任务数为10
+		CronExpr:              "",                 // 默认无Cron表达式
+		CronEnabled:           false,              // 默认不启用定时调度
+		ExecutionMode:         ExecutionModeBatch, // 默认批处理模式
 	}
 	return wf
 }
@@ -718,4 +726,37 @@ func (w *Workflow) SetMaxConcurrentTask(maxConcurrent int) error {
 	defer w.fieldsMu.Unlock()
 	w.MaxConcurrentTask = maxConcurrent
 	return nil
+}
+
+// GetExecutionMode 获取执行模式（对外导出，线程安全）
+// 返回 "batch"（批处理）或 "streaming"（流处理）
+func (w *Workflow) GetExecutionMode() string {
+	w.fieldsMu.RLock()
+	defer w.fieldsMu.RUnlock()
+	if w.ExecutionMode == "" {
+		return ExecutionModeBatch // 默认批处理模式
+	}
+	return w.ExecutionMode
+}
+
+// SetExecutionMode 设置执行模式（对外导出，线程安全）
+// mode: "batch"（批处理）或 "streaming"（流处理）
+func (w *Workflow) SetExecutionMode(mode string) error {
+	if mode != ExecutionModeBatch && mode != ExecutionModeStreaming {
+		return fmt.Errorf("无效的执行模式: %s，必须是 'batch' 或 'streaming'", mode)
+	}
+	w.fieldsMu.Lock()
+	defer w.fieldsMu.Unlock()
+	w.ExecutionMode = mode
+	return nil
+}
+
+// IsStreamingMode 检查是否为流处理模式（对外导出，线程安全）
+func (w *Workflow) IsStreamingMode() bool {
+	return w.GetExecutionMode() == ExecutionModeStreaming
+}
+
+// IsBatchMode 检查是否为批处理模式（对外导出，线程安全）
+func (w *Workflow) IsBatchMode() bool {
+	return w.GetExecutionMode() == ExecutionModeBatch
 }

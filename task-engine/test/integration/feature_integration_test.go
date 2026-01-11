@@ -16,7 +16,7 @@ import (
 )
 
 // setupFeatureIntegrationTest 设置功能集成测试环境
-func setupFeatureIntegrationTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupFeatureIntegrationTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 

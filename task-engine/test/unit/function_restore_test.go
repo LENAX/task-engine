@@ -10,7 +10,7 @@ import (
 )
 
 // setupFunctionRestoreTest 设置函数恢复测试环境
-func setupFunctionRestoreTest(t *testing.T) (*task.FunctionRegistry, *sqlite.Repositories, string, func()) {
+func setupFunctionRestoreTest(t *testing.T) (task.FunctionRegistry, *sqlite.Repositories, string, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test_function_restore.db"
 

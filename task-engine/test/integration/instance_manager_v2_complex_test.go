@@ -21,7 +21,7 @@ func TestInstanceManagerV2_LargeBatchTasks(t *testing.T) {
 		t.Skip("跳过大批量任务测试（使用 -short 标志）")
 	}
 
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -79,6 +79,7 @@ func TestInstanceManagerV2_LargeBatchTasks(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -119,7 +120,7 @@ func TestInstanceManagerV2_LargeBatchTasks(t *testing.T) {
 
 // TestInstanceManagerV2_ComplexDependencies 测试复杂依赖场景
 func TestInstanceManagerV2_ComplexDependencies(t *testing.T) {
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -233,6 +234,7 @@ func TestInstanceManagerV2_ComplexDependencies(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -270,7 +272,7 @@ func TestInstanceManagerV2_ComplexDependencies(t *testing.T) {
 
 // TestInstanceManagerV2_MultipleTemplateTasks 测试多个模板任务场景
 func TestInstanceManagerV2_MultipleTemplateTasks(t *testing.T) {
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -378,6 +380,7 @@ func TestInstanceManagerV2_MultipleTemplateTasks(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -481,7 +484,7 @@ func TestInstanceManagerV2_MultipleTemplateTasks(t *testing.T) {
 
 // TestInstanceManagerV2_TemplateTasksWithDependencies 测试带依赖关系的多个模板任务
 func TestInstanceManagerV2_TemplateTasksWithDependencies(t *testing.T) {
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -590,6 +593,7 @@ func TestInstanceManagerV2_TemplateTasksWithDependencies(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)
@@ -637,7 +641,7 @@ func TestInstanceManagerV2_TemplateTasksWithDependencies(t *testing.T) {
 // TestInstanceManagerV2_DeepLevelDependencies 测试深层级依赖场景
 // 创建一个具有很多层级的依赖链，验证层级推进逻辑在处理深层依赖时的正确性
 func TestInstanceManagerV2_DeepLevelDependencies(t *testing.T) {
-	_, registry, wf, cleanup := setupTestForV2(t)
+	_, registry, wf, cleanup := setupTestForV2Integration(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -732,6 +736,7 @@ func TestInstanceManagerV2_DeepLevelDependencies(t *testing.T) {
 		nil,
 		nil,
 		registry,
+		nil, // pluginManager
 	)
 	if err != nil {
 		t.Fatalf("创建Manager失败: %v", err)

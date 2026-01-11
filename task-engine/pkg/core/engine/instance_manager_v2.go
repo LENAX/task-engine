@@ -51,25 +51,28 @@ type AtomicAddSubTasksEvent struct {
 
 // LeveledTaskQueue 二维任务队列（按拓扑层级组织，使用 map[string]Task）
 type LeveledTaskQueue struct {
-	queues       []map[string]workflow.Task // []map[string]Task，每个层级一个 map
-	currentLevel int32                      // atomic 操作，当前执行层级
-	maxLevel     int                        // 最大层级（初始化时确定）
-	mu           sync.RWMutex               // 仅保护队列结构变更（很少使用）
-	sizes        []int32                    // atomic，每个层级的任务数量
+	queues        []map[string]workflow.Task // []map[string]Task，每个层级一个 map
+	currentLevel  int32                      // atomic 操作，当前执行层级
+	maxLevel      int                        // 最大层级（初始化时确定）
+	mu            sync.RWMutex               // 仅保护队列结构变更（很少使用）
+	sizes         []int32                    // atomic，每个层级的待提交任务数量
+	runningCounts []int32                    // atomic，每个层级正在执行的任务数量
 }
 
 // NewLeveledTaskQueue 创建二维任务队列（使用 map[string]Task）
 func NewLeveledTaskQueue(maxLevel int) *LeveledTaskQueue {
 	queues := make([]map[string]workflow.Task, maxLevel)
 	sizes := make([]int32, maxLevel)
+	runningCounts := make([]int32, maxLevel)
 	for i := 0; i < maxLevel; i++ {
 		queues[i] = make(map[string]workflow.Task)
 	}
 	return &LeveledTaskQueue{
-		queues:       queues,
-		currentLevel: 0,
-		maxLevel:     maxLevel,
-		sizes:        sizes,
+		queues:        queues,
+		currentLevel:  0,
+		maxLevel:      maxLevel,
+		sizes:         sizes,
+		runningCounts: runningCounts,
 	}
 }
 
@@ -114,6 +117,7 @@ func (q *LeveledTaskQueue) AddTasks(level int, tasks []workflow.Task) {
 }
 
 // PopTasks 从指定层级获取并移除任务（批量获取，获取时直接从队列移除）
+// 任务被 Pop 后计入 runningCounts，表示正在执行
 func (q *LeveledTaskQueue) PopTasks(level int, maxCount int) []workflow.Task {
 	if level < 0 || level >= len(q.queues) {
 		return nil
@@ -131,6 +135,7 @@ func (q *LeveledTaskQueue) PopTasks(level int, maxCount int) []workflow.Task {
 		tasks = append(tasks, task)
 		delete(queue, taskID)
 		atomic.AddInt32(&q.sizes[level], -1)
+		atomic.AddInt32(&q.runningCounts[level], 1) // 标记为正在执行
 		count++
 	}
 	return tasks
@@ -150,7 +155,15 @@ func (q *LeveledTaskQueue) RemoveTask(level int, taskID string) {
 	q.mu.Unlock()
 }
 
-// IsEmpty 检查指定层级是否为空
+// TaskCompleted 标记任务完成，减少 runningCounts
+func (q *LeveledTaskQueue) TaskCompleted(level int) {
+	if level < 0 || level >= len(q.runningCounts) {
+		return
+	}
+	atomic.AddInt32(&q.runningCounts[level], -1)
+}
+
+// IsEmpty 检查指定层级是否为空（只检查待提交队列）
 func (q *LeveledTaskQueue) IsEmpty(level int) bool {
 	if level < 0 || level >= len(q.queues) {
 		return true
@@ -158,6 +171,26 @@ func (q *LeveledTaskQueue) IsEmpty(level int) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.queues[level]) == 0
+}
+
+// IsLevelComplete 检查指定层级是否完全完成（队列为空且无执行中任务）
+func (q *LeveledTaskQueue) IsLevelComplete(level int) bool {
+	if level < 0 || level >= len(q.queues) {
+		return true
+	}
+	q.mu.Lock()
+	isEmpty := len(q.queues[level]) == 0
+	q.mu.Unlock()
+	runningCount := atomic.LoadInt32(&q.runningCounts[level])
+	return isEmpty && runningCount == 0
+}
+
+// GetRunningCount 获取指定层级的执行中任务数
+func (q *LeveledTaskQueue) GetRunningCount(level int) int32 {
+	if level < 0 || level >= len(q.runningCounts) {
+		return 0
+	}
+	return atomic.LoadInt32(&q.runningCounts[level])
 }
 
 // GetCurrentLevel 获取当前层级（atomic 读取）
@@ -582,17 +615,16 @@ func (m *WorkflowInstanceManagerV2) taskObserverGoroutine() {
 // processBatch 批量处理事件
 func (m *WorkflowInstanceManagerV2) processBatch(batch []TaskStatusEvent) {
 	for _, event := range batch {
-		// 更新统计（非阻塞，失败不影响主流程）
-		select {
-		case m.taskStatsChan <- TaskStatsUpdate{
-			Type:       getStatsType(event.Status),
-			TaskID:     event.TaskID,
-			Status:     event.Status,
-			IsTemplate: event.IsTemplate,
-			IsSubTask:  event.IsSubTask,
-		}:
-		default:
-			log.Printf("警告: taskStatsChan 已满，统计更新可能丢失: TaskID=%s", event.TaskID)
+		// 直接同步更新统计（避免竞态条件）
+		statsType := getStatsType(event.Status)
+		if statsType != "" {
+			m.taskStats.Update(TaskStatsUpdate{
+				Type:       statsType,
+				TaskID:     event.TaskID,
+				Status:     event.Status,
+				IsTemplate: event.IsTemplate,
+				IsSubTask:  event.IsSubTask,
+			})
 		}
 
 		// 使用阻塞发送或带超时的发送，确保事件不丢失
@@ -643,7 +675,7 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 		}
 	}
 
-	// 处理统计更新
+	// 启动统计更新处理goroutine（异步处理，但会在检查完成前同步）
 	go func() {
 		for {
 			select {
@@ -661,6 +693,11 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 			// 处理剩余事件
 			m.drainQueueUpdateChan()
 			return
+
+		case update := <-m.taskStatsChan:
+			// 同步处理统计更新（优先处理，确保统计准确）
+			m.taskStats.Update(update)
+			continue
 
 		case atomicAddSubTasksEvent := <-m.addSubTaskChan:
 			// 处理原子性子任务添加事件（从专用 channel 接收）
@@ -685,6 +722,9 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 
 			// 先添加新任务，再检查层级推进
 			m.tryAdvanceLevel()
+
+			// 先处理所有待处理的统计更新（确保统计准确）
+			m.drainTaskStatsChan()
 
 			// 使用快速检查：从TaskStatistics获取已完成任务数和总任务数
 			successCount := atomic.LoadInt32(&m.taskStats.SuccessTasks)
@@ -941,6 +981,14 @@ func (m *WorkflowInstanceManagerV2) initTaskQueue() {
 
 // handleTaskCompletion 处理任务完成事件
 func (m *WorkflowInstanceManagerV2) handleTaskCompletion(event TaskStatusEvent) {
+	// 标记任务执行完成，减少 runningCounts（无论成功或失败）
+	levelKey := fmt.Sprintf("%s:original_level", event.TaskID)
+	if levelVal, ok := m.contextData.Load(levelKey); ok {
+		if level, ok := levelVal.(int); ok {
+			m.taskQueue.TaskCompleted(level)
+		}
+	}
+
 	// 处理任务失败重试逻辑
 	if event.Status == "Failed" {
 		m.handleTaskFailure(event)
@@ -973,6 +1021,65 @@ func (m *WorkflowInstanceManagerV2) handleTaskSuccess(event TaskStatusEvent) {
 			ttl := 1 * time.Hour
 			_ = m.resultCache.Set(event.TaskID, event.Result, ttl)
 		}
+	}
+
+	// 如果是模板任务，检查并批量添加等待中的子任务
+	// 这是新设计中的关键步骤：模板任务的 Job Function 执行完毕后，触发等待中的子任务添加
+	if event.IsTemplate {
+		m.processPendingSubTasks(event.TaskID)
+	}
+}
+
+// processPendingSubTasks 处理等待中的子任务（模板任务成功后调用）
+func (m *WorkflowInstanceManagerV2) processPendingSubTasks(parentTaskID string) {
+	subTasksKey := fmt.Sprintf("%s:subtasks", parentTaskID)
+	subTasksValue, exists := m.contextData.Load(subTasksKey)
+	if !exists {
+		return // 没有等待中的子任务
+	}
+
+	// 类型检查
+	subTasksList, ok := subTasksValue.([]workflow.Task)
+	if !ok {
+		log.Printf("警告: WorkflowInstance %s: contextData 中的子任务列表类型错误，ParentTaskID=%s", m.instance.ID, parentTaskID)
+		m.contextData.Delete(subTasksKey)
+		return
+	}
+
+	if len(subTasksList) == 0 {
+		m.contextData.Delete(subTasksKey)
+		return
+	}
+
+	// 获取父任务信息
+	parentTask, exists := m.workflow.GetTasks()[parentTaskID]
+	if !exists {
+		log.Printf("警告: WorkflowInstance %s: 父任务不存在，ParentTaskID=%s", m.instance.ID, parentTaskID)
+		return
+	}
+
+	// 获取目标层级
+	currentLevel := m.taskQueue.GetCurrentLevel()
+	targetLevel := currentLevel
+
+	// 批量添加子任务到队列
+	m.taskQueue.AddTasks(targetLevel, subTasksList)
+
+	// 存储子任务的层级
+	for _, subTask := range subTasksList {
+		levelKey := fmt.Sprintf("%s:original_level", subTask.GetID())
+		m.contextData.Store(levelKey, targetLevel)
+	}
+
+	// 清空已收集的子任务列表
+	m.contextData.Delete(subTasksKey)
+
+	log.Printf("WorkflowInstance %s: 模板任务 %s 成功后，批量添加 %d 个等待中的子任务到 level %d",
+		m.instance.ID, parentTaskID, len(subTasksList), targetLevel)
+
+	// 减少模板任务计数
+	if parentTask.IsTemplate() {
+		m.decrementTemplateTaskCount(parentTaskID, targetLevel, len(subTasksList))
 	}
 }
 
@@ -1092,10 +1199,13 @@ func (m *WorkflowInstanceManagerV2) incrementTaskRetryCount(taskID string) {
 func (m *WorkflowInstanceManagerV2) canAdvanceLevel() bool {
 	currentLevel := m.taskQueue.GetCurrentLevel()
 
-	// 1. 当前 level 队列必须为空
-	// 注意：IsEmpty 使用 atomic 读取 sizes，但 AddTask 和 PopTasks 可能同时修改
-	// 为了确保一致性，我们使用 levelAdvanceMu 锁保护整个检查过程
-	if !m.taskQueue.IsEmpty(currentLevel) {
+	// 1. 当前 level 必须完全完成（队列为空且无执行中任务）
+	// 使用 IsLevelComplete 检查，确保所有任务都已执行完毕
+	if !m.taskQueue.IsLevelComplete(currentLevel) {
+		runningCount := m.taskQueue.GetRunningCount(currentLevel)
+		isEmpty := m.taskQueue.IsEmpty(currentLevel)
+		log.Printf("调试: canAdvanceLevel=false，currentLevel=%d，isEmpty=%v，runningCount=%d",
+			currentLevel, isEmpty, runningCount)
 		return false
 	}
 
@@ -1266,6 +1376,18 @@ func (m *WorkflowInstanceManagerV2) drainQueueUpdateChan() {
 	}
 }
 
+// drainTaskStatsChan 处理所有待处理的统计更新（非阻塞）
+func (m *WorkflowInstanceManagerV2) drainTaskStatsChan() {
+	for {
+		select {
+		case update := <-m.taskStatsChan:
+			m.taskStats.Update(update)
+		default:
+			return
+		}
+	}
+}
+
 // taskSubmissionGoroutine 任务提交器（Goroutine 3）
 func (m *WorkflowInstanceManagerV2) taskSubmissionGoroutine() {
 
@@ -1408,30 +1530,12 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			continue
 		}
 
-		// 检查是否为模板任务（模板任务不执行，仅用于生成子任务）
-		// 参考 instance_manager.go 的实现方式
+		// 模板任务的 Job Function 正常执行（不再跳过）
+		// 根据设计文档要求：用户应该把任务生成函数放在 Job Function 中
+		// Job Function 可以从 context 引用之前任务的结果，并注入给子任务
 		if task.IsTemplate() {
-			log.Printf("📋 WorkflowInstance %s: Task %s (%s) 是模板任务，跳过执行，触发Success handler",
+			log.Printf("📋 WorkflowInstance %s: Task %s (%s) 是模板任务，执行 Job Function 生成子任务",
 				m.instance.ID, taskID, taskName)
-			// 模板任务不执行Job函数，但需要触发Success handler来生成子任务
-			// 注意：先不标记为已处理，让 createTaskCompleteHandler 来处理
-			// 设置状态为Success，表示模板任务已"完成"（虽然不执行，但依赖关系已满足）
-			task.SetStatus("SUCCESS")
-
-			// 直接调用 createTaskCompleteHandler，让它处理模板任务的 Success handler
-			// 这样可以利用现有的逻辑，不需要复制 task 对象
-			// createTaskCompleteHandler 内部会检查并标记为已处理，并执行 handler
-			completeHandler := m.createTaskCompleteHandler(taskID)
-			// 创建一个空的 TaskResult，因为模板任务没有执行结果
-			emptyResult := &executor.TaskResult{
-				Data: nil,
-			}
-			// 在 goroutine 中执行，避免阻塞
-			go completeHandler(emptyResult)
-
-			// 注意：模板任务计数会在 handleAtomicAddSubTasks 或 handleTaskSuccess 中减少
-			// createTaskCompleteHandler 会发送 TaskStatusEvent 到 taskStatusChan，触发后续处理
-			continue
 		}
 
 		// 参数校验和结果映射
@@ -2145,27 +2249,10 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 	}
 
 	// 处理空子任务列表：如果模板任务没有生成子任务，需要减少计数
+	// 注意：在新设计中，模板任务的成功事件由 createTaskCompleteHandler 发送，这里只减少计数
 	if len(subTasks) == 0 {
 		if parentTask.IsTemplate() {
 			log.Printf("WorkflowInstance %s: 模板任务 %s 没有生成子任务", m.instance.ID, parentTaskID)
-			// 标记模板任务为成功
-			if parentTask.GetStatus() != "SUCCESS" && parentTask.GetStatus() != "Success" {
-				parentTask.SetStatus("SUCCESS")
-				// 发送成功事件
-				select {
-				case m.queueUpdateChan <- TaskStatusEvent{
-					TaskID:      parentTaskID,
-					Status:      "Success",
-					IsTemplate:  true,
-					IsProcessed: false,
-					Timestamp:   time.Now(),
-				}:
-				case <-time.After(5 * time.Second):
-					log.Printf("警告: queueUpdateChan 发送超时，模板任务成功事件可能丢失: TaskID=%s", parentTaskID)
-				case <-m.ctx.Done():
-					return
-				}
-			}
 			// 减少模板任务计数（没有子任务）
 			currentLevel := m.taskQueue.GetCurrentLevel()
 			m.decrementTemplateTaskCount(parentTaskID, currentLevel, 0)
@@ -2209,17 +2296,22 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 	// 检查所有子任务的依赖是否已满足
 	allDepsProcessed := true
 
-	// 检查父任务是否已完成（对于模板任务，如果状态是 SUCCESS 就认为已完成）
-	if parentTask.IsTemplate() {
-		parentStatus := parentTask.GetStatus()
-		if parentStatus == "SUCCESS" || parentStatus == "Success" {
-			// 模板任务状态是 SUCCESS，视为已完成（处理竞态条件）
-			m.processedNodes.LoadOrStore(parentTaskID, true)
-		}
-	}
-
+	// 检查父任务是否已完成
+	// 注意：在新设计中，不再在这里将模板任务标记为已处理
+	// 让 createTaskCompleteHandler 来处理，这样 Success Handler 可以正常执行
 	if _, processed := m.processedNodes.Load(parentTaskID); !processed {
-		allDepsProcessed = false
+		// 对于模板任务，检查状态来判断是否已完成（Job Function 正在执行中的竞态情况）
+		if parentTask.IsTemplate() {
+			parentStatus := parentTask.GetStatus()
+			if parentStatus == "SUCCESS" || parentStatus == "Success" {
+				// 模板任务状态是 SUCCESS，依赖已满足（但不标记为已处理，让 createTaskCompleteHandler 处理）
+				// allDepsProcessed = true (保持为 true)
+			} else {
+				allDepsProcessed = false
+			}
+		} else {
+			allDepsProcessed = false
+		}
 	}
 
 	// 检查所有子任务通过GetDependencies()声明的其他依赖
@@ -2272,6 +2364,13 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 	if allDepsProcessed {
 		// 直接批量添加到队列（原子性操作）
 		m.taskQueue.AddTasks(targetLevel, subTasks)
+
+		// 存储子任务的层级（用于 TaskCompleted 时减少 runningCounts）
+		for _, subTask := range subTasks {
+			levelKey := fmt.Sprintf("%s:original_level", subTask.GetID())
+			m.contextData.Store(levelKey, targetLevel)
+		}
+
 		log.Printf("WorkflowInstance %s: 原子性地批量添加 %d 个子任务到 level %d，依赖已满足", m.instance.ID, len(subTasks), targetLevel)
 
 		// 如果父任务是模板任务，减少模板任务计数
@@ -2297,50 +2396,14 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 		subTasksList = append(subTasksList, subTasks...)
 		m.contextData.Store(subTasksKey, subTasksList)
 		log.Printf("WorkflowInstance %s: %d 个子任务已添加，等待依赖满足（父任务: %s）", m.instance.ID, len(subTasks), parentTaskID)
-
-		// 如果父任务是模板任务，标记为成功（即使子任务依赖未满足）
-		// 这样后续依赖满足时，可以正确检查父任务状态
-		if parentTask.IsTemplate() && parentTask.GetStatus() != "SUCCESS" && parentTask.GetStatus() != "Success" {
-			parentTask.SetStatus("SUCCESS")
-			// 发送成功事件
-			select {
-			case m.queueUpdateChan <- TaskStatusEvent{
-				TaskID:      parentTaskID,
-				Status:      "Success",
-				IsTemplate:  true,
-				IsProcessed: false,
-				Timestamp:   time.Now(),
-			}:
-			case <-time.After(5 * time.Second):
-				log.Printf("警告: queueUpdateChan 发送超时，模板任务成功事件可能丢失: TaskID=%s", parentTaskID)
-			case <-m.ctx.Done():
-				return
-			}
-		}
+		// 注意：在新设计中，模板任务的成功事件由 createTaskCompleteHandler 发送
+		// 这里不再设置状态或发送事件
 	}
 
 	// 如果父任务是模板任务，处理模板任务逻辑
+	// 注意：在新设计中，模板任务的 Job Function 会被正常执行，成功事件由 createTaskCompleteHandler 发送
+	// 这里不再发送成功事件，只处理子任务添加后的依赖检查
 	if parentTask.IsTemplate() {
-		// 标记模板任务为成功（如果还没有）
-		if parentTask.GetStatus() != "SUCCESS" && parentTask.GetStatus() != "Success" {
-			parentTask.SetStatus("SUCCESS")
-
-			// 发送成功事件（让 handleTaskSuccess 处理）
-			select {
-			case m.queueUpdateChan <- TaskStatusEvent{
-				TaskID:      parentTaskID,
-				Status:      "Success",
-				IsTemplate:  true,
-				IsProcessed: false,
-				Timestamp:   time.Now(),
-			}:
-			case <-time.After(5 * time.Second):
-				log.Printf("警告: queueUpdateChan 发送超时，模板任务成功事件可能丢失: TaskID=%s", parentTaskID)
-			case <-m.ctx.Done():
-				return
-			}
-		}
-
 		// 如果依赖未满足，尝试批量添加子任务（用于处理后续依赖满足的情况）
 		if !allDepsProcessed {
 			m.tryBatchAddSubTasks(parentTaskID, parentTask, targetLevel)
@@ -2434,6 +2497,12 @@ func (m *WorkflowInstanceManagerV2) tryBatchAddSubTasks(parentTaskID string, par
 	if allDepsProcessed {
 		// 批量添加子任务
 		m.taskQueue.AddTasks(targetLevel, subTasksList)
+
+		// 存储子任务的层级（用于 TaskCompleted 时减少 runningCounts）
+		for _, subTask := range subTasksList {
+			levelKey := fmt.Sprintf("%s:original_level", subTask.GetID())
+			m.contextData.Store(levelKey, targetLevel)
+		}
 
 		// 清空已收集的子任务列表
 		m.contextData.Delete(subTasksKey)

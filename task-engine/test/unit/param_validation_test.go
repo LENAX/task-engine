@@ -13,7 +13,7 @@ import (
 )
 
 // setupParamValidationTest 设置参数校验测试环境
-func setupParamValidationTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *workflow.Workflow, func()) {
+func setupParamValidationTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *workflow.Workflow, func()) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 

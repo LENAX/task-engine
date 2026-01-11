@@ -750,7 +750,7 @@ func validateStockBasicDataFields(t *testing.T, data map[string]interface{}, ind
 
 // ==================== 测试函数 ====================
 
-func setupTushareTest(t *testing.T) (*engine.Engine, *task.FunctionRegistry, *QuantDataRepository, storage.TaskRepository, func()) {
+func setupTushareTest(t *testing.T) (*engine.Engine, task.FunctionRegistry, *QuantDataRepository, storage.TaskRepository, func()) {
 	// 创建临时数据库
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "tushare_test.db")

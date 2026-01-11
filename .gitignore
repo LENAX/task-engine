@@ -8,7 +8,7 @@ Icon?
 .Trashes
 
 # Go build
-/bin/
+**/bin/
 /build/
 /dist/
 /out/
@@ -48,3 +48,4 @@ go.sum
 doc/.DS_Store
 task-engine/server
 task-engine/test/unit/test_repository.db-shm
+tushare-1.4.24.tar.gz

@@ -10,6 +10,7 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/config"
 	"github.com/stevelan1995/task-engine/pkg/core/builder"
 	"github.com/stevelan1995/task-engine/pkg/core/executor"
+	"github.com/stevelan1995/task-engine/pkg/core/realtime"
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/types"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
@@ -636,6 +637,62 @@ func (e *Engine) LoadWorkflow(workflowConfigPath string) (*WorkflowDefinition, e
 	}, nil
 }
 
+// LoadWorkflowFromYAML 从YAML字符串加载工作流定义
+func (e *Engine) LoadWorkflowFromYAML(content string) (*WorkflowDefinition, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if !e.running {
+		return nil, fmt.Errorf("engine not started, call Start() first")
+	}
+
+	// 1. 解析YAML内容
+	wfConfig, err := config.ParseWorkflowConfigFromYAML(content)
+	if err != nil {
+		return nil, fmt.Errorf("parse workflow yaml failed: %w", err)
+	}
+
+	// 2. 应用默认值（基于框架配置）
+	defaultTimeout := 30 * time.Second
+	if e.cfg != nil {
+		defaultTimeout = e.cfg.GetDefaultTaskTimeout()
+	}
+	wfConfig.ApplyDefaults(defaultTimeout)
+
+	// 3. 校验配置合法性
+	jobRegistryMap := make(map[string]interface{})
+	for _, jobDef := range wfConfig.Workflows.Jobs {
+		funcID := e.registry.GetIDByName(jobDef.FuncKey)
+		if funcID != "" {
+			if fn := e.registry.GetByName(jobDef.FuncKey); fn != nil {
+				jobRegistryMap[jobDef.FuncKey] = fn
+			}
+		}
+	}
+
+	if err := config.ValidateWorkflowConfig(wfConfig, jobRegistryMap, defaultTimeout); err != nil {
+		return nil, fmt.Errorf("validate workflow config failed: %w", err)
+	}
+
+	// 4. 转换为Workflow对象
+	if len(wfConfig.Workflows.Definitions) == 0 {
+		return nil, fmt.Errorf("workflow config contains no workflow definitions")
+	}
+
+	wfDef := wfConfig.Workflows.Definitions[0]
+	wf, err := e.convertWorkflowConfigToWorkflow(wfConfig, &wfDef)
+	if err != nil {
+		return nil, fmt.Errorf("convert workflow config to workflow failed: %w", err)
+	}
+
+	return &WorkflowDefinition{
+		ID:         wfDef.WorkflowID,
+		Config:     wfConfig,
+		SourcePath: "", // 从YAML字符串加载，没有文件路径
+		Workflow:   wf,
+	}, nil
+}
+
 // convertWorkflowConfigToWorkflow 将WorkflowConfig转换为Workflow对象
 func (e *Engine) convertWorkflowConfigToWorkflow(wfConfig *config.WorkflowConfig, wfDef *config.WorkflowDefinition) (*workflow.Workflow, error) {
 	// 使用WorkflowBuilder构建Workflow
@@ -798,29 +855,42 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 		}
 	}
 
-	// 根据配置创建对应版本的WorkflowInstanceManager
+	// 根据 Workflow.ExecutionMode 选择 Manager
 	var manager types.WorkflowInstanceManager
 	var managerErr error
-	if e.instanceManagerVersion == InstanceManagerV2 {
-		manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
-			instance,
-			wf,
-			e.executor,
-			e.aggregateRepo,
-			e.taskRepo,
-			e.workflowInstanceRepo,
-			e.registry,
-			e.pluginManager,
-		)
-	} else {
-		manager, managerErr = NewWorkflowInstanceManager(
-			instance,
-			wf,
-			e.executor,
-			e.taskRepo,
-			e.workflowInstanceRepo,
-			e.registry,
-		)
+
+	executionMode := wf.GetExecutionMode()
+
+	switch executionMode {
+	case workflow.ExecutionModeStreaming:
+		// 流处理模式：创建 RealtimeInstanceManager
+		manager, managerErr = e.createRealtimeInstanceManager(ctx, instance, wf)
+
+	case workflow.ExecutionModeBatch:
+		fallthrough
+	default:
+		// 批处理模式：根据版本创建对应的 WorkflowInstanceManager
+		if e.instanceManagerVersion == InstanceManagerV2 {
+			manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
+				instance,
+				wf,
+				e.executor,
+				e.aggregateRepo,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+				e.pluginManager,
+			)
+		} else {
+			manager, managerErr = NewWorkflowInstanceManager(
+				instance,
+				wf,
+				e.executor,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+			)
+		}
 	}
 	if managerErr != nil {
 		return nil, fmt.Errorf("创建WorkflowInstanceManager失败: %w", managerErr)
@@ -1189,6 +1259,28 @@ func (e *Engine) forwardStatusUpdates(instanceID string, manager types.WorkflowI
 			return
 		}
 	}
+}
+
+// createRealtimeInstanceManager 创建实时 InstanceManager（内部方法）
+func (e *Engine) createRealtimeInstanceManager(
+	ctx context.Context,
+	instance *workflow.WorkflowInstance,
+	wf *workflow.Workflow,
+) (types.WorkflowInstanceManager, error) {
+	// 校验执行模式
+	if wf.GetExecutionMode() != workflow.ExecutionModeStreaming {
+		return nil, fmt.Errorf("Workflow 执行模式必须为 'streaming'，当前: %s", wf.GetExecutionMode())
+	}
+
+	// 创建 RealtimeInstanceManager
+	return realtime.NewRealtimeInstanceManager(
+		instance,
+		wf,
+		e.workflowInstanceRepo,
+		// 选项配置
+		realtime.WithBufferSize(10000),
+		realtime.WithBackpressureThreshold(0.8),
+	)
 }
 
 // 内部辅助函数（小写，不导出）

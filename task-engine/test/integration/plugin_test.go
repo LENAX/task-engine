@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stevelan1995/task-engine/pkg/core/builder"
 	"github.com/stevelan1995/task-engine/pkg/core/engine"
 	"github.com/stevelan1995/task-engine/pkg/plugin"
 )
@@ -60,8 +61,8 @@ func (t *testPlugin) GetTriggeredData() []plugin.PluginData {
 	return result
 }
 
-// createTestConfig 创建测试配置
-func createTestConfig(t *testing.T) string {
+// createPluginTestConfig 创建插件测试配置
+func createPluginTestConfig(t *testing.T) string {
 	configContent := `
 database:
   type: "sqlite"
@@ -81,14 +82,14 @@ worker:
 
 // TestPlugin_WorkflowEvents 测试Workflow事件的插件触发
 func TestPlugin_WorkflowEvents(t *testing.T) {
-	configFile := createTestConfig(t)
+	configFile := createPluginTestConfig(t)
 	defer os.Remove(configFile)
 
 	// 创建测试插件
 	testPlugin := newTestPlugin("test_plugin")
 
 	// 创建Engine并注册插件
-	builder := engine.NewEngineBuilder(configFile).
+	engineBuilder := engine.NewEngineBuilder(configFile).
 		WithPlugin(testPlugin).
 		WithPluginBinding(plugin.PluginBinding{
 			PluginName: "test_plugin",
@@ -103,19 +104,19 @@ func TestPlugin_WorkflowEvents(t *testing.T) {
 			Event:      plugin.EventWorkflowFailed,
 		})
 
-	eng, err := builder.Build()
+	eng, err := engineBuilder.Build()
 	if err != nil {
 		t.Fatalf("构建Engine失败: %v", err)
 	}
 
 	// 启动Engine
-	if err := eng.Start(); err != nil {
+	ctx := context.Background()
+	if err := eng.Start(ctx); err != nil {
 		t.Fatalf("启动Engine失败: %v", err)
 	}
 	defer eng.Stop()
 
 	// 注册Job函数
-	ctx := context.Background()
 	jobFunc := func(ctx context.Context) error {
 		return nil
 	}
@@ -127,7 +128,7 @@ func TestPlugin_WorkflowEvents(t *testing.T) {
 	// 创建Workflow
 	wfBuilder := builder.NewWorkflowBuilder("test_workflow", "测试Workflow")
 	taskBuilder := builder.NewTaskBuilder("task1", "任务1", eng.GetRegistry())
-	task1, err := taskBuilder.WithJobFunction("test_job").Build()
+	task1, err := taskBuilder.WithJobFunction("test_job", nil).Build()
 	if err != nil {
 		t.Fatalf("创建Task失败: %v", err)
 	}
@@ -181,7 +182,7 @@ func TestPlugin_WorkflowEvents(t *testing.T) {
 		t.Fatalf("插件数据应该至少有2条，实际: %d", len(data))
 	}
 	for _, d := range data {
-		if d.InstanceID != instanceID {
+		if d.InstanceID != instanceID.InstanceID() {
 			t.Fatalf("插件数据中的InstanceID不正确: %s", d.InstanceID)
 		}
 	}
@@ -189,14 +190,14 @@ func TestPlugin_WorkflowEvents(t *testing.T) {
 
 // TestPlugin_TaskEvents 测试Task事件的插件触发
 func TestPlugin_TaskEvents(t *testing.T) {
-	configFile := createTestConfig(t)
+	configFile := createPluginTestConfig(t)
 	defer os.Remove(configFile)
 
 	// 创建测试插件
 	testPlugin := newTestPlugin("test_plugin")
 
 	// 创建Engine并注册插件
-	builder := engine.NewEngineBuilder(configFile).
+	engineBuilder := engine.NewEngineBuilder(configFile).
 		WithPlugin(testPlugin).
 		WithPluginBinding(plugin.PluginBinding{
 			PluginName: "test_plugin",
@@ -207,19 +208,19 @@ func TestPlugin_TaskEvents(t *testing.T) {
 			Event:      plugin.EventTaskFailed,
 		})
 
-	eng, err := builder.Build()
+	eng, err := engineBuilder.Build()
 	if err != nil {
 		t.Fatalf("构建Engine失败: %v", err)
 	}
 
 	// 启动Engine
-	if err := eng.Start(); err != nil {
+	ctx := context.Background()
+	if err := eng.Start(ctx); err != nil {
 		t.Fatalf("启动Engine失败: %v", err)
 	}
 	defer eng.Stop()
 
 	// 注册Job函数
-	ctx := context.Background()
 	jobFunc := func(ctx context.Context) error {
 		return nil
 	}
@@ -231,7 +232,7 @@ func TestPlugin_TaskEvents(t *testing.T) {
 	// 创建Workflow
 	wfBuilder := builder.NewWorkflowBuilder("test_workflow", "测试Workflow")
 	taskBuilder := builder.NewTaskBuilder("task1", "任务1", eng.GetRegistry())
-	task1, err := taskBuilder.WithJobFunction("test_job").Build()
+	task1, err := taskBuilder.WithJobFunction("test_job", nil).Build()
 	if err != nil {
 		t.Fatalf("创建Task失败: %v", err)
 	}
@@ -278,21 +279,21 @@ func TestPlugin_TaskEvents(t *testing.T) {
 
 // TestPlugin_BuilderConfiguration 测试通过Builder配置插件
 func TestPlugin_BuilderConfiguration(t *testing.T) {
-	configFile := createTestConfig(t)
+	configFile := createPluginTestConfig(t)
 	defer os.Remove(configFile)
 
 	// 创建测试插件
 	testPlugin := newTestPlugin("test_plugin")
 
 	// 通过Builder注册插件和绑定
-	builder := engine.NewEngineBuilder(configFile).
+	engineBuilder := engine.NewEngineBuilder(configFile).
 		WithPlugin(testPlugin).
 		WithPluginBinding(plugin.PluginBinding{
 			PluginName: "test_plugin",
 			Event:      plugin.EventWorkflowStarted,
 		})
 
-	eng, err := builder.Build()
+	eng, err := engineBuilder.Build()
 	if err != nil {
 		t.Fatalf("构建Engine失败: %v", err)
 	}
@@ -305,13 +306,13 @@ func TestPlugin_BuilderConfiguration(t *testing.T) {
 	}
 
 	// 启动Engine
-	if err := eng.Start(); err != nil {
+	ctx := context.Background()
+	if err := eng.Start(ctx); err != nil {
 		t.Fatalf("启动Engine失败: %v", err)
 	}
 	defer eng.Stop()
 
 	// 注册Job函数
-	ctx := context.Background()
 	jobFunc := func(ctx context.Context) error {
 		return nil
 	}
@@ -321,10 +322,14 @@ func TestPlugin_BuilderConfiguration(t *testing.T) {
 	}
 
 	// 创建并提交Workflow
+	task1, err := builder.NewTaskBuilder("task1", "任务1", eng.GetRegistry()).
+		WithJobFunction("test_job", nil).
+		Build()
+	if err != nil {
+		t.Fatalf("创建Task失败: %v", err)
+	}
 	wf, err := builder.NewWorkflowBuilder("test_workflow", "测试Workflow").
-		WithTask(builder.NewTaskBuilder("task1", "任务1", eng.GetRegistry()).
-			WithJobFunction("test_job").
-			Build()).
+		WithTask(task1).
 		Build()
 	if err != nil {
 		t.Fatalf("创建Workflow失败: %v", err)
