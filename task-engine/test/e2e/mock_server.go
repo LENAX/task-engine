@@ -314,10 +314,16 @@ func (s *MockTushareAPIServer) getMockIncome(params map[string]interface{}) *Tus
 	fields := []string{"ts_code", "ann_date", "end_date", "total_revenue", "revenue", "n_income", "total_cogs", "operate_profit"}
 	items := [][]interface{}{}
 
+	// 从参数中获取 period，默认为 20240930
+	period := "20240930"
+	if p, ok := params["period"].(string); ok && p != "" {
+		period = p
+	}
+
 	codes := []string{"000001.SZ", "000002.SZ", "600000.SH"}
 	for _, code := range codes {
 		items = append(items, []interface{}{
-			code, "20251215", "20251231",
+			code, "20240915", period,
 			float64(rand.Intn(1000000000)),
 			float64(rand.Intn(900000000)),
 			float64(rand.Intn(100000000)),
@@ -334,12 +340,18 @@ func (s *MockTushareAPIServer) getMockBalanceSheet(params map[string]interface{}
 	fields := []string{"ts_code", "ann_date", "end_date", "total_assets", "total_liab", "total_hldr_eqy_exc_min_int"}
 	items := [][]interface{}{}
 
+	// 从参数中获取 period，默认为 20240930
+	period := "20240930"
+	if p, ok := params["period"].(string); ok && p != "" {
+		period = p
+	}
+
 	codes := []string{"000001.SZ", "000002.SZ", "600000.SH"}
 	for _, code := range codes {
 		totalAssets := float64(rand.Intn(10000000000))
 		totalLiab := totalAssets * (0.5 + rand.Float64()*0.3)
 		items = append(items, []interface{}{
-			code, "20251215", "20251231",
+			code, "20240915", period,
 			totalAssets,
 			totalLiab,
 			totalAssets - totalLiab,
@@ -354,10 +366,16 @@ func (s *MockTushareAPIServer) getMockCashFlow(params map[string]interface{}) *T
 	fields := []string{"ts_code", "ann_date", "end_date", "n_cashflow_act", "n_cashflow_inv_act", "n_cash_flows_fnc_act"}
 	items := [][]interface{}{}
 
+	// 从参数中获取 period，默认为 20240930
+	period := "20240930"
+	if p, ok := params["period"].(string); ok && p != "" {
+		period = p
+	}
+
 	codes := []string{"000001.SZ", "000002.SZ", "600000.SH"}
 	for _, code := range codes {
 		items = append(items, []interface{}{
-			code, "20251215", "20251231",
+			code, "20240915", period,
 			float64(rand.Intn(500000000) - 100000000),
 			float64(rand.Intn(300000000) - 200000000),
 			float64(rand.Intn(400000000) - 200000000),

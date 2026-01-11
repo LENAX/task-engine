@@ -24,6 +24,7 @@ type TaskBuilder struct {
 	requiredParams       []string            // 必需参数列表
 	resultMapping        map[string]string   // 上游结果字段到下游参数的映射规则
 	registry             task.FunctionRegistry
+	isTemplate           bool // 是否为模板任务
 }
 
 // NewTaskBuilder 创建Task构建器（对外导出，必须包含registry）
@@ -43,6 +44,7 @@ func NewTaskBuilder(name, description string, registry task.FunctionRegistry) *T
 		requiredParams: make([]string, 0),
 		resultMapping:  make(map[string]string),
 		registry:       registry,
+		isTemplate:     false, // 默认不是模板任务
 	}
 }
 
@@ -213,6 +215,13 @@ func (b *TaskBuilder) WithCompensationFunction(fnName string) *TaskBuilder {
 	return b
 }
 
+// WithTemplate 设置是否为模板任务（链式构建，对外导出）
+// isTemplate: 是否为模板任务
+func (b *TaskBuilder) WithTemplate(isTemplate bool) *TaskBuilder {
+	b.isTemplate = isTemplate
+	return b
+}
+
 // Build 完成Task构建（对外导出）
 // 自动生成Task UUID作为唯一标识，校验Task名称唯一性
 // 会验证所有引用的JobFunction和TaskHandler是否存在
@@ -350,6 +359,9 @@ func (b *TaskBuilder) Build() (*task.Task, error) {
 		t.SetCompensationFuncName(b.compensationFuncName)
 		t.SetCompensationFuncID(b.compensationFuncID)
 	}
+
+	// 设置是否为模板任务
+	t.SetTemplate(b.isTemplate) // 设置是否为模板任务
 
 	return t, nil
 }

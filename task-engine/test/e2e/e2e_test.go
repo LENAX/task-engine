@@ -16,9 +16,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stevelan1995/task-engine/internal/storage/sqlite"
 	"github.com/stevelan1995/task-engine/pkg/core/builder"
@@ -26,6 +28,22 @@ import (
 	"github.com/stevelan1995/task-engine/pkg/core/task"
 	"github.com/stevelan1995/task-engine/pkg/core/workflow"
 )
+
+// 高并发 HTTP 客户端（支持 50+ 并发连接）
+// 基于 DefaultTransport 修改，保留代理和 DNS 配置
+var httpClient = func() *http.Client {
+	// 复制默认 Transport 的配置
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// 增加并发连接数
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 100
+	transport.MaxConnsPerHost = 100
+	transport.IdleConnTimeout = 90 * time.Second
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+}()
 
 // ==================== 测试配置 ====================
 
@@ -39,6 +57,7 @@ type E2EConfig struct {
 	StockDBPath    string // 股票数据数据库路径
 	StartDate      string // 数据开始日期
 	EndDate        string // 数据结束日期
+	MaxAPICrawl    int    // 最大爬取API数量（0表示不限制）
 }
 
 // getE2EConfig 获取E2E测试配置
@@ -55,12 +74,20 @@ func getE2EConfig(t *testing.T) *E2EConfig {
 	}
 
 	if mode == "real" {
-		cfg.TushareToken = os.Getenv("TUSHARE_TOKEN")
+		// 优先使用 QDHUB_TUSHARE_TOKEN，其次 TUSHARE_TOKEN
+		cfg.TushareToken = os.Getenv("QDHUB_TUSHARE_TOKEN")
 		if cfg.TushareToken == "" {
-			t.Skip("真实模式需要设置 TUSHARE_TOKEN 环境变量")
+			cfg.TushareToken = os.Getenv("TUSHARE_TOKEN")
 		}
+		if cfg.TushareToken == "" {
+			t.Skip("真实模式需要设置 QDHUB_TUSHARE_TOKEN 或 TUSHARE_TOKEN 环境变量")
+		}
+		fmt.Println("cfg.TushareToken", cfg.TushareToken)
+		// 清理token中可能的换行符
+		cfg.TushareToken = strings.TrimSpace(cfg.TushareToken)
 		cfg.DocServerURL = "https://tushare.pro"
 		cfg.APIServerURL = "http://api.tushare.pro"
+		cfg.MaxAPICrawl = 0 // 0 表示不限制，全量爬取
 	}
 
 	// 设置数据库路径
@@ -85,6 +112,18 @@ type E2EContext struct {
 	StockDB     *sql.DB
 	CrawlResult *CrawlResult
 	cleanup     func()
+	// 用于并发收集子任务结果的互斥锁和收集器
+	crawlResultMu  sync.Mutex
+	crawlCollector *CrawlResultCollector
+}
+
+// CrawlResultCollector 用于收集并发爬取的API详情结果
+type CrawlResultCollector struct {
+	Provider   DataProvider
+	Catalogs   []APICatalog
+	Params     []APIParam
+	DataFields []APIDataField
+	mu         sync.Mutex
 }
 
 // setupE2E 设置E2E测试环境
@@ -105,8 +144,12 @@ func setupE2E(t *testing.T) *E2EContext {
 		t.Fatalf("创建Repository失败: %v", err)
 	}
 
-	// 创建Engine
-	eng, err := engine.NewEngine(10, 60, repos.Workflow, repos.WorkflowInstance, repos.Task)
+	// 创建Engine（真实模式使用50并发，mock模式使用10）
+	workerCount := 10
+	if cfg.Mode == "real" {
+		workerCount = 50
+	}
+	eng, err := engine.NewEngine(workerCount, 60, repos.Workflow, repos.WorkflowInstance, repos.Task)
 	if err != nil {
 		t.Fatalf("创建Engine失败: %v", err)
 	}
@@ -203,12 +246,16 @@ func registerE2EFunctions(t *testing.T, ctx *E2EContext) {
 
 	// 注册依赖
 	registry.RegisterDependencyWithKey("E2EContext", ctx)
+	registry.RegisterDependencyWithKey("Engine", ctx.Engine)
 
 	// 注册爬取文档目录函数
 	registry.Register(bgCtx, "CrawlDocCatalog", CrawlDocCatalog, "爬取Tushare文档目录")
 
-	// 注册爬取API详情函数
-	registry.Register(bgCtx, "CrawlAPIDetail", CrawlAPIDetail, "爬取API详情")
+	// 注册爬取API详情函数（模板任务版本）
+	registry.Register(bgCtx, "CrawlAPIDetail", CrawlAPIDetail, "爬取API详情（模板任务）")
+
+	// 注册爬取单个API详情函数（子任务使用）
+	registry.Register(bgCtx, "CrawlSingleAPIDetail", CrawlSingleAPIDetail, "爬取单个API详情（子任务）")
 
 	// 注册保存元数据函数
 	registry.Register(bgCtx, "SaveMetadata", SaveMetadata, "保存元数据到SQLite")
@@ -216,15 +263,24 @@ func registerE2EFunctions(t *testing.T, ctx *E2EContext) {
 	// 注册建表函数
 	registry.Register(bgCtx, "CreateTables", CreateTables, "基于元数据创建数据表")
 
-	// 注册数据获取函数
+	// 注册数据获取函数（用于普通任务）
 	registry.Register(bgCtx, "FetchTradeCal", FetchTradeCal, "获取交易日历")
 	registry.Register(bgCtx, "FetchStockBasic", FetchStockBasic, "获取股票基本信息")
-	registry.Register(bgCtx, "FetchDaily", FetchDaily, "获取日线行情")
-	registry.Register(bgCtx, "FetchAdjFactor", FetchAdjFactor, "获取复权因子")
-	registry.Register(bgCtx, "FetchIncome", FetchIncome, "获取利润表")
-	registry.Register(bgCtx, "FetchBalanceSheet", FetchBalanceSheet, "获取资产负债表")
-	registry.Register(bgCtx, "FetchCashFlow", FetchCashFlow, "获取现金流量表")
 	registry.Register(bgCtx, "FetchTopList", FetchTopList, "获取龙虎榜")
+
+	// 注册模板任务占位函数（模板任务需要 JobFunction，但实际逻辑在 Success Handler 中）
+	registry.Register(bgCtx, "TemplateNoOp", func(tc *task.TaskContext) (interface{}, error) {
+		log.Printf("📋 [模板任务] %s - 准备生成子任务", tc.TaskName)
+		return map[string]string{"status": "template_ready"}, nil
+	}, "模板任务占位函数")
+
+	// 注册子任务的 Job Functions（由模板任务的 Handler 生成的子任务使用）
+	// 这些函数从参数中获取 ts_code 并执行实际的数据获取
+	registry.Register(bgCtx, "FetchDailySub", FetchDaily, "获取日线行情(子任务)")
+	registry.Register(bgCtx, "FetchAdjFactorSub", FetchAdjFactor, "获取复权因子(子任务)")
+	registry.Register(bgCtx, "FetchIncomeSub", FetchIncome, "获取利润表(子任务)")
+	registry.Register(bgCtx, "FetchBalanceSheetSub", FetchBalanceSheet, "获取资产负债表(子任务)")
+	registry.Register(bgCtx, "FetchCashFlowSub", FetchCashFlow, "获取现金流量表(子任务)")
 
 	// 注册通用Handler
 	registry.RegisterTaskHandler(bgCtx, "LogSuccess", func(tc *task.TaskContext) {
@@ -235,6 +291,15 @@ func registerE2EFunctions(t *testing.T, ctx *E2EContext) {
 		errMsg := tc.GetParamString("_error_message")
 		log.Printf("❌ [任务失败] %s: %s", tc.TaskName, errMsg)
 	}, "记录错误")
+
+	// 注册生成子任务的 Handlers（用于模板任务模式）
+	registry.RegisterTaskHandler(bgCtx, "GenerateDailySubTasks", GenerateDailySubTasks, "生成日线数据子任务")
+	registry.RegisterTaskHandler(bgCtx, "GenerateAdjFactorSubTasks", GenerateAdjFactorSubTasks, "生成复权因子子任务")
+	registry.RegisterTaskHandler(bgCtx, "GenerateIncomeSubTasks", GenerateIncomeSubTasks, "生成利润表子任务")
+	registry.RegisterTaskHandler(bgCtx, "GenerateBalanceSheetSubTasks", GenerateBalanceSheetSubTasks, "生成资产负债表子任务")
+	registry.RegisterTaskHandler(bgCtx, "GenerateCashFlowSubTasks", GenerateCashFlowSubTasks, "生成现金流量表子任务")
+	registry.RegisterTaskHandler(bgCtx, "GenerateAPIDetailSubTasks", GenerateAPIDetailSubTasks, "生成API详情子任务")
+	registry.RegisterTaskHandler(bgCtx, "AggregateAPIDetailResults", AggregateAPIDetailResults, "聚合API详情子任务结果")
 }
 
 // ==================== Workflow 1: 文档爬取和元数据保存 ====================
@@ -250,7 +315,7 @@ func CrawlDocCatalog(tc *task.TaskContext) (interface{}, error) {
 	url := ctx.Config.DocServerURL + "/document/2"
 	log.Printf("📡 [CrawlDocCatalog] 开始爬取: %s", url)
 
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
@@ -268,123 +333,187 @@ func CrawlDocCatalog(tc *task.TaskContext) (interface{}, error) {
 	return catalogs, nil
 }
 
-// parseDocCatalog 解析文档目录HTML
+// parseDocCatalog 解析文档目录HTML（使用goquery）
+// 支持两种URL格式：
+// - Mock格式: /document/2/数字
+// - 真实格式: /document/2?doc_id=数字
+// 区分叶子节点和目录节点：
+// - 真实网站：父目录的 <li> 有 class="in"，叶子节点没有
+// - Mock服务器：所有节点都是叶子节点
 func parseDocCatalog(html, baseURL string) []APICatalog {
 	var catalogs []APICatalog
 
-	// 使用正则表达式解析（简化实现）
-	// 匹配 <li> 中的链接
-	linkPattern := regexp.MustCompile(`<a href="(/document/2/\d+)"[^>]*>([^<]+)</a>`)
-	matches := linkPattern.FindAllStringSubmatch(html, -1)
-
-	for i, match := range matches {
-		if len(match) >= 3 {
-			catalogs = append(catalogs, APICatalog{
-				ID:        i + 1,
-				Name:      strings.TrimSpace(match[2]),
-				Link:      baseURL + match[1],
-				IsLeaf:    true,
-				Level:     3,
-				SortOrder: i + 1,
-				CreatedAt: time.Now(),
-			})
-		}
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		log.Printf("解析HTML失败: %v", err)
+		return catalogs
 	}
+
+	// 需要屏蔽的目录项（非 API 数据）
+	excludedNames := map[string]bool{
+		"数据索引": true,
+		"社区捐助": true,
+	}
+
+	i := 0
+	// 查找所有指向 /document/2 的链接（支持两种格式）
+	doc.Find("a[href^='/document/2']").Each(func(_ int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
+		if !exists {
+			return
+		}
+
+		name := strings.TrimSpace(s.Text())
+
+		// 跳过需要屏蔽的目录项
+		if excludedNames[name] {
+			return
+		}
+
+		var docID string
+		var fullLink string
+
+		// 格式1: /document/2?doc_id=数字 (真实网站)
+		if strings.Contains(href, "?doc_id=") {
+			parts := strings.Split(href, "?doc_id=")
+			if len(parts) == 2 && parts[1] != "" {
+				docID = parts[1]
+				fullLink = baseURL + href
+			}
+		} else if strings.HasPrefix(href, "/document/2/") {
+			// 格式2: /document/2/数字 (mock服务器)
+			parts := strings.Split(href, "/")
+			if len(parts) >= 4 {
+				lastPart := parts[len(parts)-1]
+				if lastPart != "" && lastPart != "2" {
+					docID = lastPart
+					fullLink = baseURL + href
+				}
+			}
+		}
+
+		// 跳过无效链接
+		if docID == "" || fullLink == "" {
+			return
+		}
+
+		// 判断是否为叶子节点：检查父元素 <li> 的 class 是否包含 "in"
+		// 真实网站：父目录的 <li class="  in"> 表示展开的目录，不是叶子节点
+		// Mock服务器：所有节点都是叶子节点
+		isLeaf := true
+		parentLi := s.Parent()
+		if parentLi.Is("li") {
+			class, _ := parentLi.Attr("class")
+			// 如果 class 包含 "in"，说明是展开的目录（非叶子节点）
+			if strings.Contains(class, "in") {
+				isLeaf = false
+			}
+		}
+
+		i++
+		catalogs = append(catalogs, APICatalog{
+			ID:        i,
+			Name:      name,
+			Link:      fullLink,
+			IsLeaf:    isLeaf,
+			Level:     3,
+			SortOrder: i,
+			CreatedAt: time.Now(),
+		})
+	})
 
 	return catalogs
 }
 
-// CrawlAPIDetail 爬取API详情
+// CrawlAPIDetail 爬取API详情（模板任务版本，用于生成子任务）
+// 这个函数现在作为模板任务的占位函数，实际爬取逻辑在子任务中
 func CrawlAPIDetail(tc *task.TaskContext) (interface{}, error) {
+	log.Printf("📋 [CrawlAPIDetail] 模板任务准备生成子任务")
+	return map[string]string{"status": "template_ready"}, nil
+}
+
+// CrawlSingleAPIDetail 爬取单个API详情（子任务使用）
+func CrawlSingleAPIDetail(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
 		return nil, fmt.Errorf("未找到E2EContext依赖")
 	}
 	ctx := e2eCtx.(*E2EContext)
 
-	// 从上游任务获取目录列表（数据通过 _cached_{taskID} 参数传递）
-	var catalogsRaw interface{}
-	for key, val := range tc.Params {
-		if strings.HasPrefix(key, "_cached_") {
-			catalogsRaw = val
-			break
+	// 从参数中获取 catalog 信息
+	catalogID, err := tc.GetParamInt("catalog_id")
+	if err != nil || catalogID == 0 {
+		return nil, fmt.Errorf("未找到 catalog_id 参数")
+	}
+
+	catalogName := tc.GetParamString("catalog_name")
+	catalogLink := tc.GetParamString("catalog_link")
+
+	if catalogLink == "" {
+		return nil, fmt.Errorf("catalog_link 为空")
+	}
+
+	log.Printf("📡 [CrawlSingleAPIDetail] 爬取: %s (ID=%d)", catalogName, catalogID)
+
+	// 爬取API详情（使用高并发 HTTP 客户端）
+	resp, err := httpClient.Get(catalogLink)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	// 解析API详情
+	detail := parseAPIDetail(string(body), catalogID)
+
+	// 更新catalog信息
+	catalog := APICatalog{
+		ID:          catalogID,
+		Name:        catalogName,
+		Link:        catalogLink,
+		APIName:     detail.apiName,
+		Description: detail.description,
+		Permission:  detail.permission,
+		IsLeaf:      true,
+		Level:       3,
+		CreatedAt:   time.Now(),
+	}
+
+	// 线程安全地收集结果
+	ctx.crawlResultMu.Lock()
+	if ctx.crawlCollector == nil {
+		ctx.crawlCollector = &CrawlResultCollector{
+			Provider: DataProvider{
+				ID:          1,
+				Name:        "Tushare",
+				BaseURL:     ctx.Config.APIServerURL,
+				Description: "Tushare金融大数据平台",
+				CreatedAt:   time.Now(),
+			},
+			Catalogs:   []APICatalog{},
+			Params:     []APIParam{},
+			DataFields: []APIDataField{},
 		}
 	}
-	if catalogsRaw == nil {
-		// 也尝试 _result_data
-		catalogsRaw = tc.GetParam("_result_data")
-	}
-	if catalogsRaw == nil {
-		return nil, fmt.Errorf("未找到目录数据")
-	}
+	ctx.crawlCollector.mu.Lock()
+	ctx.crawlCollector.Catalogs = append(ctx.crawlCollector.Catalogs, catalog)
+	ctx.crawlCollector.Params = append(ctx.crawlCollector.Params, detail.params...)
+	ctx.crawlCollector.DataFields = append(ctx.crawlCollector.DataFields, detail.fields...)
+	ctx.crawlCollector.mu.Unlock()
+	ctx.crawlResultMu.Unlock()
 
-	var catalogs []APICatalog
-	// 类型断言
-	switch v := catalogsRaw.(type) {
-	case []APICatalog:
-		catalogs = v
-	case []interface{}:
-		// 需要转换
-		data, _ := json.Marshal(v)
-		json.Unmarshal(data, &catalogs)
-	default:
-		data, _ := json.Marshal(catalogsRaw)
-		json.Unmarshal(data, &catalogs)
-	}
+	log.Printf("✅ [CrawlSingleAPIDetail] 完成: %s, 参数=%d, 字段=%d", catalogName, len(detail.params), len(detail.fields))
 
-	log.Printf("📡 [CrawlAPIDetail] 开始爬取 %d 个API详情", len(catalogs))
-
-	var params []APIParam
-	var fields []APIDataField
-
-	for _, catalog := range catalogs {
-		if catalog.Link == "" {
-			continue
-		}
-
-		log.Printf("  - 爬取: %s", catalog.Name)
-
-		resp, err := http.Get(catalog.Link)
-		if err != nil {
-			log.Printf("    ⚠️ 请求失败: %v", err)
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		// 解析API详情
-		detail := parseAPIDetail(string(body), catalog.ID)
-		params = append(params, detail.params...)
-		fields = append(fields, detail.fields...)
-
-		// 更新catalog的API信息
-		catalog.APIName = detail.apiName
-		catalog.Description = detail.description
-		catalog.Permission = detail.permission
-	}
-
-	// 构建完整结果
-	result := &CrawlResult{
-		Provider: DataProvider{
-			ID:          1,
-			Name:        "Tushare",
-			BaseURL:     ctx.Config.APIServerURL,
-			Description: "Tushare金融大数据平台",
-			CreatedAt:   time.Now(),
-		},
-		Catalogs:   catalogs,
-		Params:     params,
-		DataFields: fields,
-	}
-
-	ctx.CrawlResult = result
-
-	log.Printf("✅ [CrawlAPIDetail] 完成，共获取 %d 个参数，%d 个字段", len(params), len(fields))
-	return result, nil
+	return map[string]interface{}{
+		"catalog_id":   catalogID,
+		"catalog_name": catalogName,
+		"params_count": len(detail.params),
+		"fields_count": len(detail.fields),
+	}, nil
 }
 
 // apiDetailResult API详情解析结果
@@ -396,86 +525,235 @@ type apiDetailResult struct {
 	fields      []APIDataField
 }
 
-// parseAPIDetail 解析API详情HTML
+// parseAPIDetail 解析API详情HTML（使用goquery）
+// 支持两种格式：mock服务器格式和真实Tushare网站格式
 func parseAPIDetail(html string, catalogID int) *apiDetailResult {
 	result := &apiDetailResult{}
 
-	// 提取接口名称
-	apiNamePattern := regexp.MustCompile(`<strong>接口：</strong>(\w+)`)
-	if match := apiNamePattern.FindStringSubmatch(html); len(match) >= 2 {
-		result.apiName = match[1]
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		log.Printf("解析API详情HTML失败: %v", err)
+		return result
 	}
 
-	// 提取描述
-	descPattern := regexp.MustCompile(`<strong>描述：</strong>([^<]+)`)
-	if match := descPattern.FindStringSubmatch(html); len(match) >= 2 {
-		result.description = strings.TrimSpace(match[1])
-	}
+	// 格式1: Mock服务器 - 在 .api-info 区域内的 p 标签
+	doc.Find(".api-info p").Each(func(_ int, s *goquery.Selection) {
+		text := s.Text()
+		if strings.Contains(text, "接口：") {
+			result.apiName = strings.TrimSpace(strings.TrimPrefix(text, "接口："))
+		} else if strings.Contains(text, "描述：") {
+			result.description = strings.TrimSpace(strings.TrimPrefix(text, "描述："))
+		} else if strings.Contains(text, "权限：") {
+			result.permission = strings.TrimSpace(strings.TrimPrefix(text, "权限："))
+		}
+	})
 
-	// 提取权限
-	permPattern := regexp.MustCompile(`<strong>权限：</strong>([^<]+)`)
-	if match := permPattern.FindStringSubmatch(html); len(match) >= 2 {
-		result.permission = strings.TrimSpace(match[1])
+	// 格式2: 真实网站 - 在 .content 区域内的 p 标签
+	// HTML结构: <p>接口：stk_premarket<br>描述：...<br>限量：...<br>权限：...</p>
+	// 或者: <p>接口：stock_basic，可以通过<a>数据工具</a>调试<br>描述：...</p>
+	// goquery的Text()会忽略<br>，需要用Html()获取原始内容再解析
+	if result.apiName == "" {
+		doc.Find(".content p").Each(func(_ int, s *goquery.Selection) {
+			// 获取HTML内容，保留<br>标签
+			html, _ := s.Html()
+			text := s.Text()
+
+			// 检查是否包含接口信息
+			if strings.Contains(text, "接口：") && result.apiName == "" {
+				// 按<br>分割HTML内容
+				parts := strings.Split(html, "<br")
+				for _, part := range parts {
+					// 清理HTML标签残留（如 ">描述：..."）
+					part = strings.TrimPrefix(part, ">")
+					part = strings.TrimPrefix(part, "/>")
+					part = strings.TrimSpace(part)
+
+					if strings.HasPrefix(part, "接口：") {
+						apiName := strings.TrimPrefix(part, "接口：")
+						// 移除HTML标签
+						apiName = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(apiName, "")
+						// 截取到第一个中文逗号或中文句号或空格
+						if idx := strings.IndexAny(apiName, "，。, "); idx > 0 {
+							apiName = apiName[:idx]
+						}
+						result.apiName = strings.TrimSpace(apiName)
+					} else if strings.HasPrefix(part, "描述：") {
+						desc := strings.TrimPrefix(part, "描述：")
+						// 移除HTML标签
+						desc = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(desc, "")
+						result.description = strings.TrimSpace(desc)
+					} else if strings.HasPrefix(part, "权限：") {
+						permPart := strings.TrimPrefix(part, "权限：")
+						// 移除HTML标签
+						permPart = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(permPart, "")
+						result.permission = strings.TrimSpace(permPart)
+					}
+				}
+			}
+		})
 	}
 
 	// 提取输入参数表格
-	inputPattern := regexp.MustCompile(`<table class="params-table">.*?<tbody>(.*?)</tbody>`)
-	if match := inputPattern.FindStringSubmatch(html); len(match) >= 2 {
-		result.params = parseParamsTable(match[1], catalogID)
-	}
+	result.params = parseParamsTableWithGoquery(doc, catalogID)
 
 	// 提取输出字段表格
-	outputPattern := regexp.MustCompile(`<table class="fields-table">.*?<tbody>(.*?)</tbody>`)
-	if match := outputPattern.FindStringSubmatch(html); len(match) >= 2 {
-		result.fields = parseFieldsTable(match[1], catalogID)
-	}
+	result.fields = parseFieldsTableWithGoquery(doc, catalogID)
 
 	return result
 }
 
-// parseParamsTable 解析参数表格
-func parseParamsTable(tbody string, catalogID int) []APIParam {
+// parseParamsTableWithGoquery 使用goquery解析参数表格
+// 支持两种格式：mock服务器（table.params-table）和真实网站（输入参数后的table）
+func parseParamsTableWithGoquery(doc *goquery.Document, catalogID int) []APIParam {
 	var params []APIParam
-	rowPattern := regexp.MustCompile(`<tr><td>(\w+)</td><td>(\w+)</td><td>([YN])</td><td>([^<]*)</td></tr>`)
-	matches := rowPattern.FindAllStringSubmatch(tbody, -1)
 
-	for i, match := range matches {
-		if len(match) >= 5 {
-			params = append(params, APIParam{
-				ID:          catalogID*100 + i + 1,
-				CatalogID:   catalogID,
-				Name:        match[1],
-				Type:        match[2],
-				Required:    match[3] == "Y",
-				Description: match[4],
-				SortOrder:   i + 1,
-				CreatedAt:   time.Now(),
-			})
+	// 格式1: Mock服务器 - table.params-table
+	doc.Find("table.params-table tbody tr").Each(func(i int, s *goquery.Selection) {
+		tds := s.Find("td")
+		if tds.Length() >= 4 {
+			name := strings.TrimSpace(tds.Eq(0).Text())
+			paramType := strings.TrimSpace(tds.Eq(1).Text())
+			required := strings.TrimSpace(tds.Eq(2).Text()) == "Y"
+			desc := strings.TrimSpace(tds.Eq(3).Text())
+
+			if name != "" {
+				params = append(params, APIParam{
+					ID:          catalogID*100 + i + 1,
+					CatalogID:   catalogID,
+					Name:        name,
+					Type:        paramType,
+					Required:    required,
+					Description: desc,
+					SortOrder:   i + 1,
+					CreatedAt:   time.Now(),
+				})
+			}
 		}
+	})
+
+	// 格式2: 真实网站 - "输入参数"后的第一个table
+	if len(params) == 0 {
+		foundInputParams := false
+		doc.Find("p, table").Each(func(_ int, s *goquery.Selection) {
+			if foundInputParams && s.Is("table") {
+				// 找到输入参数后的第一个表格
+				s.Find("tbody tr").Each(func(i int, row *goquery.Selection) {
+					tds := row.Find("td")
+					if tds.Length() >= 4 {
+						name := strings.TrimSpace(tds.Eq(0).Text())
+						paramType := strings.TrimSpace(tds.Eq(1).Text())
+						requiredText := strings.TrimSpace(tds.Eq(2).Text())
+						required := requiredText == "Y" || requiredText == "是"
+						desc := strings.TrimSpace(tds.Eq(3).Text())
+
+						if name != "" {
+							params = append(params, APIParam{
+								ID:          catalogID*100 + i + 1,
+								CatalogID:   catalogID,
+								Name:        name,
+								Type:        paramType,
+								Required:    required,
+								Description: desc,
+								SortOrder:   i + 1,
+								CreatedAt:   time.Now(),
+							})
+						}
+					}
+				})
+				foundInputParams = false // 只处理第一个表格
+				return
+			}
+			if s.Is("p") && strings.Contains(s.Text(), "输入参数") {
+				foundInputParams = true
+			}
+		})
 	}
 
 	return params
 }
 
-// parseFieldsTable 解析字段表格
-func parseFieldsTable(tbody string, catalogID int) []APIDataField {
+// parseFieldsTableWithGoquery 使用goquery解析字段表格
+// 支持两种格式：mock服务器（table.fields-table）和真实网站（输出参数后的table）
+func parseFieldsTableWithGoquery(doc *goquery.Document, catalogID int) []APIDataField {
 	var fields []APIDataField
-	rowPattern := regexp.MustCompile(`<tr><td>(\w+)</td><td>(\w+)</td><td>([YN])</td><td>([^<]*)</td></tr>`)
-	matches := rowPattern.FindAllStringSubmatch(tbody, -1)
 
-	for i, match := range matches {
-		if len(match) >= 5 {
-			fields = append(fields, APIDataField{
-				ID:          catalogID*100 + i + 1,
-				CatalogID:   catalogID,
-				Name:        match[1],
-				Type:        match[2],
-				Default:     match[3] == "Y",
-				Description: match[4],
-				SortOrder:   i + 1,
-				CreatedAt:   time.Now(),
-			})
+	// 格式1: Mock服务器 - table.fields-table
+	doc.Find("table.fields-table tbody tr").Each(func(i int, s *goquery.Selection) {
+		tds := s.Find("td")
+		if tds.Length() >= 4 {
+			name := strings.TrimSpace(tds.Eq(0).Text())
+			fieldType := strings.TrimSpace(tds.Eq(1).Text())
+			isDefault := strings.TrimSpace(tds.Eq(2).Text()) == "Y"
+			desc := strings.TrimSpace(tds.Eq(3).Text())
+
+			if name != "" {
+				fields = append(fields, APIDataField{
+					ID:          catalogID*100 + i + 1,
+					CatalogID:   catalogID,
+					Name:        name,
+					Type:        fieldType,
+					Default:     isDefault,
+					Description: desc,
+					SortOrder:   i + 1,
+					CreatedAt:   time.Now(),
+				})
+			}
 		}
+	})
+
+	// 格式2: 真实网站 - "输出参数"后的第一个table
+	// 支持两种列格式：
+	// - 4列: 名称、类型、默认值、描述
+	// - 3列: 名称、类型、描述（无默认值列）
+	if len(fields) == 0 {
+		foundOutputParams := false
+		doc.Find("p, table").Each(func(_ int, s *goquery.Selection) {
+			if foundOutputParams && s.Is("table") {
+				// 找到输出参数后的第一个表格
+				s.Find("tbody tr").Each(func(i int, row *goquery.Selection) {
+					tds := row.Find("td")
+					colCount := tds.Length()
+
+					var name, fieldType, desc string
+					var isDefault bool
+
+					if colCount >= 4 {
+						// 4列格式: 名称、类型、默认值、描述
+						name = strings.TrimSpace(tds.Eq(0).Text())
+						fieldType = strings.TrimSpace(tds.Eq(1).Text())
+						defaultText := strings.TrimSpace(tds.Eq(2).Text())
+						isDefault = defaultText == "Y" || defaultText == "是"
+						desc = strings.TrimSpace(tds.Eq(3).Text())
+					} else if colCount >= 3 {
+						// 3列格式: 名称、类型、描述（无默认值列）
+						name = strings.TrimSpace(tds.Eq(0).Text())
+						fieldType = strings.TrimSpace(tds.Eq(1).Text())
+						desc = strings.TrimSpace(tds.Eq(2).Text())
+						isDefault = false
+					} else {
+						return // 列数不足，跳过
+					}
+
+					if name != "" {
+						fields = append(fields, APIDataField{
+							ID:          catalogID*100 + i + 1,
+							CatalogID:   catalogID,
+							Name:        name,
+							Type:        fieldType,
+							Default:     isDefault,
+							Description: desc,
+							SortOrder:   i + 1,
+							CreatedAt:   time.Now(),
+						})
+					}
+				})
+				foundOutputParams = false // 只处理第一个表格
+				return
+			}
+			if s.Is("p") && strings.Contains(s.Text(), "输出参数") {
+				foundOutputParams = true
+			}
+		})
 	}
 
 	return fields
@@ -488,6 +766,20 @@ func SaveMetadata(tc *task.TaskContext) (interface{}, error) {
 		return nil, fmt.Errorf("未找到E2EContext依赖")
 	}
 	ctx := e2eCtx.(*E2EContext)
+
+	// 从 crawlCollector 聚合结果（如果存在）
+	ctx.crawlResultMu.Lock()
+	if ctx.crawlCollector != nil && ctx.CrawlResult == nil {
+		ctx.CrawlResult = &CrawlResult{
+			Provider:   ctx.crawlCollector.Provider,
+			Catalogs:   ctx.crawlCollector.Catalogs,
+			Params:     ctx.crawlCollector.Params,
+			DataFields: ctx.crawlCollector.DataFields,
+		}
+		log.Printf("📊 [SaveMetadata] 从子任务聚合结果: Catalogs=%d, Params=%d, Fields=%d",
+			len(ctx.CrawlResult.Catalogs), len(ctx.CrawlResult.Params), len(ctx.CrawlResult.DataFields))
+	}
+	ctx.crawlResultMu.Unlock()
 
 	if ctx.CrawlResult == nil {
 		return nil, fmt.Errorf("未找到爬取结果")
@@ -635,7 +927,7 @@ func createMetadataTables(db *sql.DB) error {
 
 // ==================== Workflow 2: 基于元数据建表 ====================
 
-// CreateTables 基于元数据创建数据表
+// CreateTables 基于爬取的API元数据动态创建数据表
 func CreateTables(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -644,6 +936,11 @@ func CreateTables(tc *task.TaskContext) (interface{}, error) {
 	ctx := e2eCtx.(*E2EContext)
 
 	log.Printf("🔨 [CreateTables] 开始在 %s 创建数据表", ctx.Config.StockDBPath)
+
+	// 检查是否有爬取结果
+	if ctx.CrawlResult == nil || len(ctx.CrawlResult.Catalogs) == 0 {
+		return nil, fmt.Errorf("未找到爬取结果，无法创建表")
+	}
 
 	// 创建股票数据数据库
 	db, err := sql.Open("sqlite3", ctx.Config.StockDBPath)
@@ -659,14 +956,27 @@ func CreateTables(tc *task.TaskContext) (interface{}, error) {
 	}
 	defer tx.Rollback()
 
-	// 创建各数据表
-	tables := getStockDataTableDDLs()
+	// 根据爬取的API元数据动态生成建表语句
 	createdTables := 0
+	for _, catalog := range ctx.CrawlResult.Catalogs {
+		if catalog.APIName == "" {
+			continue
+		}
 
-	for name, ddl := range tables {
-		log.Printf("  - 创建表: %s", name)
+		// 获取该API的所有字段
+		fields := getFieldsForCatalog(ctx.CrawlResult.DataFields, catalog.ID)
+		if len(fields) == 0 {
+			log.Printf("  ⚠️ API %s (%s) 没有字段定义，跳过", catalog.Name, catalog.APIName)
+			continue
+		}
+
+		// 生成DDL
+		ddl := generateTableDDL(catalog.APIName, fields)
+		log.Printf("  - 创建表: %s (%d个字段)", catalog.APIName, len(fields))
+
 		if _, err := tx.Exec(ddl); err != nil {
-			return nil, fmt.Errorf("创建表 %s 失败: %w", name, err)
+			log.Printf("  ⚠️ 创建表 %s 失败: %v", catalog.APIName, err)
+			continue
 		}
 		createdTables++
 	}
@@ -679,103 +989,66 @@ func CreateTables(tc *task.TaskContext) (interface{}, error) {
 	return map[string]int{"tables_created": createdTables}, nil
 }
 
-// getStockDataTableDDLs 获取股票数据表DDL
-func getStockDataTableDDLs() map[string]string {
-	return map[string]string{
-		"trade_cal": `CREATE TABLE IF NOT EXISTS trade_cal (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			exchange TEXT,
-			cal_date TEXT NOT NULL,
-			is_open INTEGER,
-			pre_date TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(exchange, cal_date)
-		)`,
-		"stock_basic": `CREATE TABLE IF NOT EXISTS stock_basic (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts_code TEXT NOT NULL UNIQUE,
-			symbol TEXT,
-			name TEXT,
-			area TEXT,
-			industry TEXT,
-			market TEXT,
-			list_date TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)`,
-		"daily": `CREATE TABLE IF NOT EXISTS daily (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts_code TEXT NOT NULL,
-			trade_date TEXT NOT NULL,
-			open REAL,
-			high REAL,
-			low REAL,
-			close REAL,
-			pre_close REAL,
-			change REAL,
-			pct_chg REAL,
-			vol REAL,
-			amount REAL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(ts_code, trade_date)
-		)`,
-		"adj_factor": `CREATE TABLE IF NOT EXISTS adj_factor (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts_code TEXT NOT NULL,
-			trade_date TEXT NOT NULL,
-			adj_factor REAL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(ts_code, trade_date)
-		)`,
-		"income": `CREATE TABLE IF NOT EXISTS income (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts_code TEXT NOT NULL,
-			ann_date TEXT,
-			end_date TEXT,
-			total_revenue REAL,
-			revenue REAL,
-			n_income REAL,
-			total_cogs REAL,
-			operate_profit REAL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(ts_code, end_date)
-		)`,
-		"balancesheet": `CREATE TABLE IF NOT EXISTS balancesheet (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts_code TEXT NOT NULL,
-			ann_date TEXT,
-			end_date TEXT,
-			total_assets REAL,
-			total_liab REAL,
-			total_hldr_eqy_exc_min_int REAL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(ts_code, end_date)
-		)`,
-		"cashflow": `CREATE TABLE IF NOT EXISTS cashflow (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts_code TEXT NOT NULL,
-			ann_date TEXT,
-			end_date TEXT,
-			n_cashflow_act REAL,
-			n_cashflow_inv_act REAL,
-			n_cash_flows_fnc_act REAL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(ts_code, end_date)
-		)`,
-		"top_list": `CREATE TABLE IF NOT EXISTS top_list (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			trade_date TEXT NOT NULL,
-			ts_code TEXT NOT NULL,
-			name TEXT,
-			close REAL,
-			pct_change REAL,
-			turnover_rate REAL,
-			amount REAL,
-			l_sell REAL,
-			net_amount REAL,
-			reason TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(trade_date, ts_code)
-		)`,
+// getFieldsForCatalog 获取指定Catalog的所有字段
+func getFieldsForCatalog(allFields []APIDataField, catalogID int) []APIDataField {
+	var fields []APIDataField
+	for _, f := range allFields {
+		if f.CatalogID == catalogID {
+			fields = append(fields, f)
+		}
+	}
+	return fields
+}
+
+// generateTableDDL 根据API字段动态生成建表DDL
+// 使用双引号转义表名和字段名（避免 SQLite 保留字冲突，如 on, limit, order 等）
+func generateTableDDL(tableName string, fields []APIDataField) string {
+	var sb strings.Builder
+	// 表名用双引号包裹
+	sb.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS \"%s\" (\n", tableName))
+	sb.WriteString("    \"id\" INTEGER PRIMARY KEY AUTOINCREMENT,\n")
+
+	// 去重字段名（某些 API 可能有重复字段定义）
+	seenFields := make(map[string]bool)
+	uniqueFields := []APIDataField{}
+	for _, f := range fields {
+		fieldName := strings.TrimSpace(f.Name)
+		if fieldName == "" || fieldName == "id" || seenFields[fieldName] {
+			continue
+		}
+		seenFields[fieldName] = true
+		uniqueFields = append(uniqueFields, f)
+	}
+
+	for i, f := range uniqueFields {
+		sqlType := mapTushareTypeToSQLite(f.Type)
+		// 字段名用双引号包裹
+		sb.WriteString(fmt.Sprintf("    \"%s\" %s", f.Name, sqlType))
+		if i < len(uniqueFields)-1 {
+			sb.WriteString(",\n")
+		} else {
+			sb.WriteString(",\n")
+		}
+	}
+
+	sb.WriteString("    \"created_at\" DATETIME DEFAULT CURRENT_TIMESTAMP\n")
+	sb.WriteString(")")
+
+	return sb.String()
+}
+
+// mapTushareTypeToSQLite 将Tushare字段类型映射为SQLite类型
+func mapTushareTypeToSQLite(tushareType string) string {
+	tushareType = strings.ToLower(strings.TrimSpace(tushareType))
+	switch tushareType {
+	case "int", "integer":
+		return "INTEGER"
+	case "float", "number", "double":
+		return "REAL"
+	case "str", "string", "text", "date", "datetime":
+		return "TEXT"
+	default:
+		return "TEXT" // 默认使用TEXT
 	}
 }
 
@@ -790,7 +1063,7 @@ func callTushareAPI(ctx *E2EContext, apiName string, params map[string]interface
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
-	resp, err := http.Post(ctx.Config.APIServerURL, "application/json", strings.NewReader(string(jsonData)))
+	resp, err := httpClient.Post(ctx.Config.APIServerURL, "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
 		return nil, err
 	}
@@ -816,6 +1089,7 @@ func callTushareAPI(ctx *E2EContext, apiName string, params map[string]interface
 }
 
 // FetchTradeCal 获取交易日历
+// 返回值包含交易日期列表，用于下游任务生成子任务
 func FetchTradeCal(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -840,11 +1114,45 @@ func FetchTradeCal(tc *task.TaskContext) (interface{}, error) {
 		return nil, err
 	}
 
-	log.Printf("✅ [FetchTradeCal] 保存 %d 条记录", count)
-	return map[string]int{"count": count}, nil
+	// 提取交易日期列表（用于生成子任务）
+	var tradeDates []string
+	calDateIdx := -1
+	isOpenIdx := -1
+	for i, field := range df.Fields {
+		if field == "cal_date" {
+			calDateIdx = i
+		} else if field == "is_open" {
+			isOpenIdx = i
+		}
+	}
+	if calDateIdx >= 0 {
+		for _, item := range df.Items {
+			if len(item) > calDateIdx {
+				// 只取开盘日（is_open=1）
+				if isOpenIdx >= 0 && len(item) > isOpenIdx {
+					if isOpen, ok := item[isOpenIdx].(float64); ok && isOpen == 1 {
+						if date, ok := item[calDateIdx].(string); ok {
+							tradeDates = append(tradeDates, date)
+						}
+					}
+				} else {
+					if date, ok := item[calDateIdx].(string); ok {
+						tradeDates = append(tradeDates, date)
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("✅ [FetchTradeCal] 保存 %d 条记录，提取 %d 个交易日", count, len(tradeDates))
+	return map[string]interface{}{
+		"count":       count,
+		"trade_dates": tradeDates,
+	}, nil
 }
 
 // FetchStockBasic 获取股票基本信息
+// 返回值包含股票代码列表，用于下游任务生成子任务
 func FetchStockBasic(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -866,11 +1174,38 @@ func FetchStockBasic(tc *task.TaskContext) (interface{}, error) {
 		return nil, err
 	}
 
-	log.Printf("✅ [FetchStockBasic] 保存 %d 条记录", count)
-	return map[string]int{"count": count}, nil
+	// 提取股票代码列表（用于生成子任务，限制数量避免生成太多子任务）
+	var tsCodes []string
+	tsCodeIdx := -1
+	for i, field := range df.Fields {
+		if field == "ts_code" {
+			tsCodeIdx = i
+			break
+		}
+	}
+	maxStocks := 3 // 限制子任务数量，用于测试
+	if tsCodeIdx >= 0 {
+		for _, item := range df.Items {
+			if len(item) > tsCodeIdx {
+				if code, ok := item[tsCodeIdx].(string); ok {
+					tsCodes = append(tsCodes, code)
+					if len(tsCodes) >= maxStocks {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("✅ [FetchStockBasic] 保存 %d 条记录，提取 %d 个股票代码用于子任务", count, len(tsCodes))
+	return map[string]interface{}{
+		"count":    count,
+		"ts_codes": tsCodes,
+	}, nil
 }
 
 // FetchDaily 获取日线行情
+// 从任务参数中获取 ts_code（由 GenerateSubTasks 动态注入）
 func FetchDaily(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -878,9 +1213,16 @@ func FetchDaily(tc *task.TaskContext) (interface{}, error) {
 	}
 	ctx := e2eCtx.(*E2EContext)
 
-	log.Printf("📡 [FetchDaily] 获取日线行情: %s - %s", ctx.Config.StartDate, ctx.Config.EndDate)
+	// 从参数中获取 ts_code（由父任务通过 GenerateSubTasks 注入）
+	tsCode := tc.GetParamString("ts_code")
+	if tsCode == "" {
+		tsCode = "000001.SZ" // 默认值（用于模拟模式或未注入参数时）
+	}
+
+	log.Printf("📡 [FetchDaily] 获取日线行情: ts_code=%s, %s - %s", tsCode, ctx.Config.StartDate, ctx.Config.EndDate)
 
 	df, err := callTushareAPI(ctx, "daily", map[string]interface{}{
+		"ts_code":    tsCode,
 		"start_date": ctx.Config.StartDate,
 		"end_date":   ctx.Config.EndDate,
 	})
@@ -893,11 +1235,12 @@ func FetchDaily(tc *task.TaskContext) (interface{}, error) {
 		return nil, err
 	}
 
-	log.Printf("✅ [FetchDaily] 保存 %d 条记录", count)
+	log.Printf("✅ [FetchDaily] 保存 %d 条记录 (ts_code=%s)", count, tsCode)
 	return map[string]int{"count": count}, nil
 }
 
 // FetchAdjFactor 获取复权因子
+// 从任务参数中获取 ts_code（由 GenerateSubTasks 动态注入）
 func FetchAdjFactor(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -905,9 +1248,16 @@ func FetchAdjFactor(tc *task.TaskContext) (interface{}, error) {
 	}
 	ctx := e2eCtx.(*E2EContext)
 
-	log.Printf("📡 [FetchAdjFactor] 获取复权因子")
+	// 从参数中获取 ts_code（由父任务通过 GenerateSubTasks 注入）
+	tsCode := tc.GetParamString("ts_code")
+	if tsCode == "" {
+		tsCode = "000001.SZ" // 默认值
+	}
+
+	log.Printf("📡 [FetchAdjFactor] 获取复权因子: ts_code=%s", tsCode)
 
 	df, err := callTushareAPI(ctx, "adj_factor", map[string]interface{}{
+		"ts_code":    tsCode,
 		"start_date": ctx.Config.StartDate,
 		"end_date":   ctx.Config.EndDate,
 	})
@@ -920,11 +1270,12 @@ func FetchAdjFactor(tc *task.TaskContext) (interface{}, error) {
 		return nil, err
 	}
 
-	log.Printf("✅ [FetchAdjFactor] 保存 %d 条记录", count)
+	log.Printf("✅ [FetchAdjFactor] 保存 %d 条记录 (ts_code=%s)", count, tsCode)
 	return map[string]int{"count": count}, nil
 }
 
 // FetchIncome 获取利润表
+// 从任务参数中获取 ts_code（由 GenerateSubTasks 动态注入）
 func FetchIncome(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -932,10 +1283,17 @@ func FetchIncome(tc *task.TaskContext) (interface{}, error) {
 	}
 	ctx := e2eCtx.(*E2EContext)
 
-	log.Printf("📡 [FetchIncome] 获取利润表")
+	// 从参数中获取 ts_code（由父任务通过 GenerateSubTasks 注入）
+	tsCode := tc.GetParamString("ts_code")
+	if tsCode == "" {
+		tsCode = "000001.SZ" // 默认值
+	}
+
+	log.Printf("📡 [FetchIncome] 获取利润表: ts_code=%s", tsCode)
 
 	df, err := callTushareAPI(ctx, "income", map[string]interface{}{
-		"period": "20251231",
+		"ts_code": tsCode,
+		"period":  "20240930",
 	})
 	if err != nil {
 		return nil, err
@@ -946,11 +1304,12 @@ func FetchIncome(tc *task.TaskContext) (interface{}, error) {
 		return nil, err
 	}
 
-	log.Printf("✅ [FetchIncome] 保存 %d 条记录", count)
+	log.Printf("✅ [FetchIncome] 保存 %d 条记录 (ts_code=%s)", count, tsCode)
 	return map[string]int{"count": count}, nil
 }
 
 // FetchBalanceSheet 获取资产负债表
+// 从任务参数中获取 ts_code（由 GenerateSubTasks 动态注入）
 func FetchBalanceSheet(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -958,10 +1317,17 @@ func FetchBalanceSheet(tc *task.TaskContext) (interface{}, error) {
 	}
 	ctx := e2eCtx.(*E2EContext)
 
-	log.Printf("📡 [FetchBalanceSheet] 获取资产负债表")
+	// 从参数中获取 ts_code（由父任务通过 GenerateSubTasks 注入）
+	tsCode := tc.GetParamString("ts_code")
+	if tsCode == "" {
+		tsCode = "000001.SZ" // 默认值
+	}
+
+	log.Printf("📡 [FetchBalanceSheet] 获取资产负债表: ts_code=%s", tsCode)
 
 	df, err := callTushareAPI(ctx, "balancesheet", map[string]interface{}{
-		"period": "20251231",
+		"ts_code": tsCode,
+		"period":  "20240930",
 	})
 	if err != nil {
 		return nil, err
@@ -972,11 +1338,12 @@ func FetchBalanceSheet(tc *task.TaskContext) (interface{}, error) {
 		return nil, err
 	}
 
-	log.Printf("✅ [FetchBalanceSheet] 保存 %d 条记录", count)
+	log.Printf("✅ [FetchBalanceSheet] 保存 %d 条记录 (ts_code=%s)", count, tsCode)
 	return map[string]int{"count": count}, nil
 }
 
 // FetchCashFlow 获取现金流量表
+// 从任务参数中获取 ts_code（由 GenerateSubTasks 动态注入）
 func FetchCashFlow(tc *task.TaskContext) (interface{}, error) {
 	e2eCtx, ok := tc.GetDependency("E2EContext")
 	if !ok {
@@ -984,10 +1351,17 @@ func FetchCashFlow(tc *task.TaskContext) (interface{}, error) {
 	}
 	ctx := e2eCtx.(*E2EContext)
 
-	log.Printf("📡 [FetchCashFlow] 获取现金流量表")
+	// 从参数中获取 ts_code（由父任务通过 GenerateSubTasks 注入）
+	tsCode := tc.GetParamString("ts_code")
+	if tsCode == "" {
+		tsCode = "000001.SZ" // 默认值
+	}
+
+	log.Printf("📡 [FetchCashFlow] 获取现金流量表: ts_code=%s", tsCode)
 
 	df, err := callTushareAPI(ctx, "cashflow", map[string]interface{}{
-		"period": "20251231",
+		"ts_code": tsCode,
+		"period":  "20240930",
 	})
 	if err != nil {
 		return nil, err
@@ -998,8 +1372,322 @@ func FetchCashFlow(tc *task.TaskContext) (interface{}, error) {
 		return nil, err
 	}
 
-	log.Printf("✅ [FetchCashFlow] 保存 %d 条记录", count)
+	log.Printf("✅ [FetchCashFlow] 保存 %d 条记录 (ts_code=%s)", count, tsCode)
 	return map[string]int{"count": count}, nil
+}
+
+// getParamKeys 获取参数的所有 key（调试用）
+func getParamKeys(params map[string]interface{}) []string {
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// extractTsCodesFromUpstream 从上游任务结果中提取 ts_codes
+func extractTsCodesFromUpstream(tc *task.TaskContext) []string {
+	var tsCodes []string
+
+	// 从 _cached_ 参数中查找上游任务结果
+	for key, val := range tc.Params {
+		if strings.HasPrefix(key, "_cached_") {
+			if resultMap, ok := val.(map[string]interface{}); ok {
+				if tsCodesRaw, ok := resultMap["ts_codes"]; ok {
+					switch v := tsCodesRaw.(type) {
+					case []string:
+						return v
+					case []interface{}:
+						for _, item := range v {
+							if s, ok := item.(string); ok {
+								tsCodes = append(tsCodes, s)
+							}
+						}
+						return tsCodes
+					}
+				}
+			}
+		}
+	}
+	return tsCodes
+}
+
+// extractCatalogsFromUpstream 从上游任务结果中提取 catalogs
+func extractCatalogsFromUpstream(tc *task.TaskContext) []APICatalog {
+	var catalogs []APICatalog
+
+	// 从 _cached_ 参数中查找上游任务结果
+	for key, val := range tc.Params {
+		if strings.HasPrefix(key, "_cached_") {
+			catalogsRaw := val
+			// 类型断言
+			switch v := catalogsRaw.(type) {
+			case []APICatalog:
+				return v
+			case []interface{}:
+				data, _ := json.Marshal(v)
+				json.Unmarshal(data, &catalogs)
+				return catalogs
+			default:
+				data, _ := json.Marshal(catalogsRaw)
+				json.Unmarshal(data, &catalogs)
+				return catalogs
+			}
+		}
+	}
+
+	// 也尝试 _result_data
+	catalogsRaw := tc.GetParam("_result_data")
+	if catalogsRaw != nil {
+		switch v := catalogsRaw.(type) {
+		case []APICatalog:
+			return v
+		case []interface{}:
+			data, _ := json.Marshal(v)
+			json.Unmarshal(data, &catalogs)
+			return catalogs
+		default:
+			data, _ := json.Marshal(catalogsRaw)
+			json.Unmarshal(data, &catalogs)
+			return catalogs
+		}
+	}
+
+	return catalogs
+}
+
+// generateSubTasksForType 通用的子任务生成函数
+func generateSubTasksForType(tc *task.TaskContext, taskTypeName, jobFuncName string) {
+	// 调试：打印所有参数
+	log.Printf("🔍 [%s] Params 内容: %+v", taskTypeName, tc.Params)
+
+	// 获取Engine
+	engineInterface, ok := tc.GetDependency("Engine")
+	if !ok {
+		log.Printf("⚠️ [%s] 未找到Engine依赖", taskTypeName)
+		return
+	}
+	eng, ok := engineInterface.(*engine.Engine)
+	if !ok {
+		log.Printf("⚠️ [%s] Engine类型转换失败", taskTypeName)
+		return
+	}
+
+	registry := eng.GetRegistry()
+	if registry == nil {
+		log.Printf("⚠️ [%s] 无法获取Registry", taskTypeName)
+		return
+	}
+
+	// 从上游任务结果中提取 ts_codes
+	tsCodes := extractTsCodesFromUpstream(tc)
+	if len(tsCodes) == 0 {
+		log.Printf("⚠️ [%s] 未找到 ts_codes，Params keys: %v", taskTypeName, getParamKeys(tc.Params))
+		return
+	}
+
+	log.Printf("📡 [%s] 从上游任务获取到 %d 个股票代码: %v", taskTypeName, len(tsCodes), tsCodes)
+
+	parentTaskID := tc.TaskID
+	workflowInstanceID := tc.WorkflowInstanceID
+	generatedCount := 0
+
+	for _, tsCode := range tsCodes {
+		subTaskName := fmt.Sprintf("%s_%s", taskTypeName, tsCode)
+		subTask, err := builder.NewTaskBuilder(subTaskName, fmt.Sprintf("获取%s的%s", tsCode, taskTypeName), registry).
+			WithJobFunction(jobFuncName, map[string]interface{}{
+				"ts_code": tsCode,
+			}).
+			WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+			WithTaskHandler(task.TaskStatusFailed, "LogError").
+			Build()
+		if err != nil {
+			log.Printf("❌ [%s] 创建子任务失败: %s, error=%v", taskTypeName, subTaskName, err)
+			continue
+		}
+
+		bgCtx := context.Background()
+		if err := eng.AddSubTaskToInstance(bgCtx, workflowInstanceID, subTask, parentTaskID); err != nil {
+			log.Printf("❌ [%s] 添加子任务失败: %s, error=%v", taskTypeName, subTaskName, err)
+			continue
+		}
+
+		generatedCount++
+		log.Printf("✅ [%s] 子任务已添加: %s (ts_code=%s)", taskTypeName, subTaskName, tsCode)
+	}
+
+	log.Printf("✅ [%s] 共生成 %d 个子任务", taskTypeName, generatedCount)
+}
+
+// GenerateDailySubTasks 日线数据模板任务的 Success Handler
+func GenerateDailySubTasks(tc *task.TaskContext) {
+	generateSubTasksForType(tc, "获取日线数据", "FetchDailySub")
+}
+
+// GenerateAdjFactorSubTasks 复权因子模板任务的 Success Handler
+func GenerateAdjFactorSubTasks(tc *task.TaskContext) {
+	generateSubTasksForType(tc, "获取复权因子", "FetchAdjFactorSub")
+}
+
+// GenerateIncomeSubTasks 利润表模板任务的 Success Handler
+func GenerateIncomeSubTasks(tc *task.TaskContext) {
+	generateSubTasksForType(tc, "获取利润表", "FetchIncomeSub")
+}
+
+// GenerateBalanceSheetSubTasks 资产负债表模板任务的 Success Handler
+func GenerateBalanceSheetSubTasks(tc *task.TaskContext) {
+	generateSubTasksForType(tc, "获取资产负债表", "FetchBalanceSheetSub")
+}
+
+// GenerateCashFlowSubTasks 现金流量表模板任务的 Success Handler
+func GenerateCashFlowSubTasks(tc *task.TaskContext) {
+	generateSubTasksForType(tc, "获取现金流量表", "FetchCashFlowSub")
+}
+
+// GenerateAPIDetailSubTasks 爬取API详情模板任务的 Success Handler
+func GenerateAPIDetailSubTasks(tc *task.TaskContext) {
+	e2eCtx, ok := tc.GetDependency("E2EContext")
+	if !ok {
+		log.Printf("⚠️ [GenerateAPIDetailSubTasks] 未找到E2EContext依赖")
+		return
+	}
+	ctx := e2eCtx.(*E2EContext)
+
+	// 从上游任务获取目录列表
+	catalogs := extractCatalogsFromUpstream(tc)
+	if len(catalogs) == 0 {
+		log.Printf("⚠️ [GenerateAPIDetailSubTasks] 未找到目录数据，Params keys: %v", getParamKeys(tc.Params))
+		return
+	}
+
+	// 真实模式下限制爬取数量
+	if ctx.Config.MaxAPICrawl > 0 && len(catalogs) > ctx.Config.MaxAPICrawl {
+		log.Printf("📡 [GenerateAPIDetailSubTasks] 真实模式：限制爬取数量从 %d 到 %d", len(catalogs), ctx.Config.MaxAPICrawl)
+		catalogs = catalogs[:ctx.Config.MaxAPICrawl]
+	}
+
+	log.Printf("📡 [GenerateAPIDetailSubTasks] 从上游任务获取到 %d 个目录，开始生成子任务", len(catalogs))
+
+	// 获取Engine
+	engineInterface, ok := tc.GetDependency("Engine")
+	if !ok {
+		log.Printf("⚠️ [GenerateAPIDetailSubTasks] 未找到Engine依赖")
+		return
+	}
+	eng, ok := engineInterface.(*engine.Engine)
+	if !ok {
+		log.Printf("⚠️ [GenerateAPIDetailSubTasks] Engine类型转换失败")
+		return
+	}
+
+	registry := eng.GetRegistry()
+	if registry == nil {
+		log.Printf("⚠️ [GenerateAPIDetailSubTasks] 无法获取Registry")
+		return
+	}
+
+	parentTaskID := tc.TaskID
+	workflowInstanceID := tc.WorkflowInstanceID
+	generatedCount := 0
+
+	// 初始化结果收集器
+	ctx.crawlResultMu.Lock()
+	if ctx.crawlCollector == nil {
+		ctx.crawlCollector = &CrawlResultCollector{
+			Provider: DataProvider{
+				ID:          1,
+				Name:        "Tushare",
+				BaseURL:     ctx.Config.APIServerURL,
+				Description: "Tushare金融大数据平台",
+				CreatedAt:   time.Now(),
+			},
+			Catalogs:   []APICatalog{},
+			Params:     []APIParam{},
+			DataFields: []APIDataField{},
+		}
+	}
+	ctx.crawlResultMu.Unlock()
+
+	// 统计叶子节点和目录节点数量
+	leafCount := 0
+	dirCount := 0
+	for _, c := range catalogs {
+		if c.IsLeaf {
+			leafCount++
+		} else {
+			dirCount++
+		}
+	}
+	log.Printf("📊 [GenerateAPIDetailSubTasks] 目录结构: 叶子节点=%d, 目录节点=%d", leafCount, dirCount)
+
+	for _, catalog := range catalogs {
+		// 只为叶子节点生成子任务（跳过目录节点）
+		if !catalog.IsLeaf {
+			log.Printf("📁 [GenerateAPIDetailSubTasks] 跳过目录节点: %s", catalog.Name)
+			continue
+		}
+
+		if catalog.Link == "" {
+			continue
+		}
+
+		subTaskName := fmt.Sprintf("爬取API详情_%s", catalog.Name)
+		subTask, err := builder.NewTaskBuilder(subTaskName, fmt.Sprintf("爬取%s的API详情", catalog.Name), registry).
+			WithJobFunction("CrawlSingleAPIDetail", map[string]interface{}{
+				"catalog_id":   catalog.ID,
+				"catalog_name": catalog.Name,
+				"catalog_link": catalog.Link,
+			}).
+			WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+			WithTaskHandler(task.TaskStatusFailed, "LogError").
+			Build()
+		if err != nil {
+			log.Printf("❌ [GenerateAPIDetailSubTasks] 创建子任务失败: %s, error=%v", subTaskName, err)
+			continue
+		}
+
+		bgCtx := context.Background()
+		if err := eng.AddSubTaskToInstance(bgCtx, workflowInstanceID, subTask, parentTaskID); err != nil {
+			log.Printf("❌ [GenerateAPIDetailSubTasks] 添加子任务失败: %s, error=%v", subTaskName, err)
+			continue
+		}
+
+		generatedCount++
+		log.Printf("✅ [GenerateAPIDetailSubTasks] 子任务已添加: %s (catalog=%s)", subTaskName, catalog.Name)
+	}
+
+	log.Printf("✅ [GenerateAPIDetailSubTasks] 共生成 %d 个子任务", generatedCount)
+}
+
+// AggregateAPIDetailResults 聚合所有API详情子任务的结果
+func AggregateAPIDetailResults(tc *task.TaskContext) {
+	e2eCtx, ok := tc.GetDependency("E2EContext")
+	if !ok {
+		log.Printf("⚠️ [AggregateAPIDetailResults] 未找到E2EContext依赖")
+		return
+	}
+	ctx := e2eCtx.(*E2EContext)
+
+	ctx.crawlResultMu.Lock()
+	defer ctx.crawlResultMu.Unlock()
+
+	if ctx.crawlCollector == nil {
+		log.Printf("⚠️ [AggregateAPIDetailResults] 结果收集器为空")
+		return
+	}
+
+	// 构建完整结果
+	result := &CrawlResult{
+		Provider:   ctx.crawlCollector.Provider,
+		Catalogs:   ctx.crawlCollector.Catalogs,
+		Params:     ctx.crawlCollector.Params,
+		DataFields: ctx.crawlCollector.DataFields,
+	}
+
+	ctx.CrawlResult = result
+
+	log.Printf("✅ [AggregateAPIDetailResults] 聚合完成: Catalogs=%d, Params=%d, Fields=%d",
+		len(result.Catalogs), len(result.Params), len(result.DataFields))
 }
 
 // FetchTopList 获取龙虎榜
@@ -1090,12 +1778,17 @@ func TestE2E_Workflow1_MetadataCrawl(t *testing.T) {
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		Build()
 
-	task2, _ := builder.NewTaskBuilder("爬取API详情", "爬取每个API的详细信息", ctx.Registry).
-		WithJobFunction("CrawlAPIDetail", nil).
+	task2, err := builder.NewTaskBuilder("爬取API详情", "爬取每个API的详细信息", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
 		WithDependency("爬取文档目录").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateAPIDetailSubTasks").
 		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
+		WithTemplate(true).
 		Build()
+	if err != nil {
+		t.Fatalf("创建爬取API详情模板任务失败: %v", err)
+	}
 
 	task3, _ := builder.NewTaskBuilder("保存元数据", "保存元数据到SQLite", ctx.Registry).
 		WithJobFunction("SaveMetadata", nil).
@@ -1202,10 +1895,17 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 	runMetadataCrawlWorkflow(t, ctx)
 	runCreateTablesWorkflow(t, ctx)
 
-	// 构建Workflow 3: 数据获取
+	// 构建Workflow 3: 数据获取（使用模板任务模式）
+	//
+	// 任务结构：
+	// Level 0: 获取交易日历, 获取股票信息（并行执行）
+	// Level 1: 5个模板任务（日线、复权因子、利润表、资产负债表、现金流量表），获取龙虎榜
+	//          每个模板任务依赖获取股票信息，在 Success Handler 中生成子任务
+	// Level 2: 动态生成的子任务（获取日线数据_000001.SZ, 获取复权因子_000001.SZ, ...）
+	//
 	tasks := []*task.Task{}
 
-	// 交易日历和股票基础信息（无依赖）
+	// 交易日历（普通任务，无依赖）
 	t1, _ := builder.NewTaskBuilder("获取交易日历", "获取2025年12月交易日历", ctx.Registry).
 		WithJobFunction("FetchTradeCal", nil).
 		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
@@ -1213,6 +1913,7 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 		Build()
 	tasks = append(tasks, t1)
 
+	// 股票基础信息（普通任务，返回 ts_codes 供下游模板任务使用）
 	t2, _ := builder.NewTaskBuilder("获取股票信息", "获取股票基本信息", ctx.Registry).
 		WithJobFunction("FetchStockBasic", nil).
 		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
@@ -1220,49 +1921,72 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 		Build()
 	tasks = append(tasks, t2)
 
-	// 依赖交易日历的任务
-	t3, _ := builder.NewTaskBuilder("获取日线数据", "获取历史日线行情", ctx.Registry).
-		WithJobFunction("FetchDaily", nil).
-		WithDependency("获取交易日历").
+	// 日线数据模板任务（依赖获取股票信息，Success Handler 生成子任务）
+	t3, err := builder.NewTaskBuilder("获取日线数据", "获取日线行情数据", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateDailySubTasks").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
+		WithTemplate(true).
 		Build()
+	if err != nil {
+		t.Fatalf("创建日线数据模板任务失败: %v", err)
+	}
 	tasks = append(tasks, t3)
 
-	t4, _ := builder.NewTaskBuilder("获取复权因子", "获取复权因子数据", ctx.Registry).
-		WithJobFunction("FetchAdjFactor", nil).
+	// 复权因子模板任务
+	t4, err := builder.NewTaskBuilder("获取复权因子", "获取复权因子数据", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateAdjFactorSubTasks").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
+		WithTemplate(true).
 		Build()
+	if err != nil {
+		t.Fatalf("创建复权因子模板任务失败: %v", err)
+	}
 	tasks = append(tasks, t4)
 
-	// 财务数据
-	t5, _ := builder.NewTaskBuilder("获取利润表", "获取利润表数据", ctx.Registry).
-		WithJobFunction("FetchIncome", nil).
+	// 利润表模板任务
+	t5, err := builder.NewTaskBuilder("获取利润表", "获取利润表数据", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateIncomeSubTasks").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
+		WithTemplate(true).
 		Build()
+	if err != nil {
+		t.Fatalf("创建利润表模板任务失败: %v", err)
+	}
 	tasks = append(tasks, t5)
 
-	t6, _ := builder.NewTaskBuilder("获取资产负债表", "获取资产负债表数据", ctx.Registry).
-		WithJobFunction("FetchBalanceSheet", nil).
+	// 资产负债表模板任务
+	t6, err := builder.NewTaskBuilder("获取资产负债表", "获取资产负债表数据", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateBalanceSheetSubTasks").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
+		WithTemplate(true).
 		Build()
+	if err != nil {
+		t.Fatalf("创建资产负债表模板任务失败: %v", err)
+	}
 	tasks = append(tasks, t6)
 
-	t7, _ := builder.NewTaskBuilder("获取现金流量表", "获取现金流量表数据", ctx.Registry).
-		WithJobFunction("FetchCashFlow", nil).
+	// 现金流量表模板任务
+	t7, err := builder.NewTaskBuilder("获取现金流量表", "获取现金流量表数据", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateCashFlowSubTasks").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
+		WithTemplate(true).
 		Build()
+	if err != nil {
+		t.Fatalf("创建现金流量表模板任务失败: %v", err)
+	}
 	tasks = append(tasks, t7)
 
+	// 龙虎榜（普通任务，依赖交易日历）
 	t8, _ := builder.NewTaskBuilder("获取龙虎榜", "获取龙虎榜数据", ctx.Registry).
 		WithJobFunction("FetchTopList", nil).
 		WithDependency("获取交易日历").
@@ -1297,6 +2021,9 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 
 	// 验证数据已保存
 	printDataSummary(t, ctx.StockDB)
+
+	// 校验核心数据表有数据（模板任务生成的子任务应该成功执行）
+	validateDataCounts(t, ctx.StockDB, ctx.Config.Mode)
 }
 
 // TestE2E_FullPipeline 完整流程测试
@@ -1325,6 +2052,9 @@ func TestE2E_FullPipeline(t *testing.T) {
 	t.Log("\n========== 测试结果汇总 ==========")
 	printMetadataSummary(t, ctx.MetadataDB)
 	printDataSummary(t, ctx.StockDB)
+
+	// 校验核心数据表有数据
+	validateDataCounts(t, ctx.StockDB, ctx.Config.Mode)
 
 	t.Log("========== E2E完整流程测试完成 ==========")
 }
@@ -1359,10 +2089,15 @@ func runMetadataCrawlWorkflow(t *testing.T, ctx *E2EContext) {
 		WithJobFunction("CrawlDocCatalog", nil).
 		Build()
 
-	task2, _ := builder.NewTaskBuilder("爬取API详情", "爬取每个API的详细信息", ctx.Registry).
-		WithJobFunction("CrawlAPIDetail", nil).
+	task2, err := builder.NewTaskBuilder("爬取API详情", "爬取每个API的详细信息", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
 		WithDependency("爬取文档目录").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateAPIDetailSubTasks").
+		WithTemplate(true).
 		Build()
+	if err != nil {
+		t.Fatalf("创建爬取API详情模板任务失败: %v", err)
+	}
 
 	task3, _ := builder.NewTaskBuilder("保存元数据", "保存元数据到SQLite", ctx.Registry).
 		WithJobFunction("SaveMetadata", nil).
@@ -1391,16 +2126,64 @@ func runCreateTablesWorkflow(t *testing.T, ctx *E2EContext) {
 func runDataAcquisitionWorkflow(t *testing.T, ctx *E2EContext) {
 	bgCtx := context.Background()
 
-	t1, _ := builder.NewTaskBuilder("获取交易日历", "", ctx.Registry).WithJobFunction("FetchTradeCal", nil).Build()
-	t2, _ := builder.NewTaskBuilder("获取股票信息", "", ctx.Registry).WithJobFunction("FetchStockBasic", nil).Build()
-	t3, _ := builder.NewTaskBuilder("获取日线数据", "", ctx.Registry).WithJobFunction("FetchDaily", nil).WithDependency("获取交易日历").WithDependency("获取股票信息").Build()
-	t4, _ := builder.NewTaskBuilder("获取复权因子", "", ctx.Registry).WithJobFunction("FetchAdjFactor", nil).WithDependency("获取股票信息").Build()
-	t5, _ := builder.NewTaskBuilder("获取利润表", "", ctx.Registry).WithJobFunction("FetchIncome", nil).WithDependency("获取股票信息").Build()
-	t6, _ := builder.NewTaskBuilder("获取资产负债表", "", ctx.Registry).WithJobFunction("FetchBalanceSheet", nil).WithDependency("获取股票信息").Build()
-	t7, _ := builder.NewTaskBuilder("获取现金流量表", "", ctx.Registry).WithJobFunction("FetchCashFlow", nil).WithDependency("获取股票信息").Build()
-	t8, _ := builder.NewTaskBuilder("获取龙虎榜", "", ctx.Registry).WithJobFunction("FetchTopList", nil).WithDependency("获取交易日历").Build()
+	// 使用模板任务模式：模板任务的 Success Handler 会根据上游结果动态生成子任务
+	// Level 0: 获取交易日历, 获取股票信息
+	// Level 1: 5个模板任务（日线、复权因子、利润表、资产负债表、现金流量表），获取龙虎榜
+	// Level 2: 动态生成的子任务
 
-	wf, _ := builder.NewWorkflowBuilder("数据获取", "").
+	t1, _ := builder.NewTaskBuilder("获取交易日历", "获取交易日历", ctx.Registry).
+		WithJobFunction("FetchTradeCal", nil).
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		Build()
+
+	t2, _ := builder.NewTaskBuilder("获取股票信息", "获取股票信息", ctx.Registry).
+		WithJobFunction("FetchStockBasic", nil).
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		Build()
+
+	// 5个模板任务，使用 TemplateNoOp 占位函数，Success Handler 生成子任务
+	t3, _ := builder.NewTaskBuilder("获取日线数据", "获取日线数据", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
+		WithDependency("获取股票信息").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateDailySubTasks").
+		WithTemplate(true).
+		Build()
+
+	t4, _ := builder.NewTaskBuilder("获取复权因子", "获取复权因子", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
+		WithDependency("获取股票信息").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateAdjFactorSubTasks").
+		WithTemplate(true).
+		Build()
+
+	t5, _ := builder.NewTaskBuilder("获取利润表", "获取利润表", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
+		WithDependency("获取股票信息").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateIncomeSubTasks").
+		WithTemplate(true).
+		Build()
+
+	t6, _ := builder.NewTaskBuilder("获取资产负债表", "获取资产负债表", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
+		WithDependency("获取股票信息").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateBalanceSheetSubTasks").
+		WithTemplate(true).
+		Build()
+
+	t7, _ := builder.NewTaskBuilder("获取现金流量表", "获取现金流量表", ctx.Registry).
+		WithJobFunction("TemplateNoOp", nil).
+		WithDependency("获取股票信息").
+		WithTaskHandler(task.TaskStatusSuccess, "GenerateCashFlowSubTasks").
+		WithTemplate(true).
+		Build()
+
+	t8, _ := builder.NewTaskBuilder("获取龙虎榜", "获取龙虎榜", ctx.Registry).
+		WithJobFunction("FetchTopList", nil).
+		WithDependency("获取交易日历").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+		Build()
+
+	wf, _ := builder.NewWorkflowBuilder("数据获取", "获取股票数据").
 		WithTask(t1).WithTask(t2).WithTask(t3).WithTask(t4).
 		WithTask(t5).WithTask(t6).WithTask(t7).WithTask(t8).Build()
 
@@ -1427,11 +2210,242 @@ func printDataSummary(t *testing.T, db *sql.DB) {
 		return
 	}
 
+	// 获取所有表名（排除sqlite内部表和created_at时间戳）
+	tables := getTableNames(db)
+	if len(tables) == 0 {
+		t.Log("\n📊 股票数据库中没有表")
+		return
+	}
+
 	t.Log("\n📊 股票数据统计:")
-	tables := []string{"trade_cal", "stock_basic", "daily", "adj_factor", "income", "balancesheet", "cashflow", "top_list"}
 	for _, table := range tables {
 		var count int
 		db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
 		t.Logf("  - %s: %d 条", table, count)
 	}
+
+	// 打印各表的数据样本（表格形式）
+	t.Log("\n📋 数据样本（每表最多5条）:")
+	for _, table := range tables {
+		printTableSample(t, db, table, 5)
+	}
+}
+
+// getTableNames 获取数据库中所有用户表名
+func getTableNames(db *sql.DB) []string {
+	var tables []string
+	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	if err != nil {
+		return tables
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil {
+			tables = append(tables, name)
+		}
+	}
+	return tables
+}
+
+// printTableSample 以表格形式打印表的数据样本
+func printTableSample(t *testing.T, db *sql.DB, tableName string, limit int) {
+	// 获取列名（不包括id和created_at）
+	columns, err := getTableColumns(db, tableName)
+	if err != nil || len(columns) == 0 {
+		return
+	}
+
+	// 只查询需要的列
+	columnList := strings.Join(columns, ", ")
+	query := fmt.Sprintf("SELECT %s FROM %s LIMIT %d", columnList, tableName, limit)
+	rows, err := db.Query(query)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	// 读取所有行
+	var dataRows [][]string
+	for rows.Next() {
+		// 创建动态扫描目标
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+
+		row := make([]string, len(columns))
+		for i, val := range values {
+			row[i] = formatValue(val)
+		}
+		dataRows = append(dataRows, row)
+	}
+
+	if len(dataRows) == 0 {
+		t.Logf("\n  📄 %s: (空表)", tableName)
+		return
+	}
+
+	// 计算每列宽度（基于表头和数据）
+	colWidths := make([]int, len(columns))
+	for i, col := range columns {
+		colWidths[i] = len(col)
+	}
+	for _, row := range dataRows {
+		for i, cell := range row {
+			if len(cell) > colWidths[i] {
+				colWidths[i] = len(cell)
+			}
+		}
+	}
+
+	// 限制列宽避免过长
+	maxColWidth := 20
+	for i := range colWidths {
+		if colWidths[i] > maxColWidth {
+			colWidths[i] = maxColWidth
+		}
+	}
+
+	// 打印表名
+	t.Logf("\n  📄 %s (%d条):", tableName, len(dataRows))
+
+	// 打印表头
+	header := "    │"
+	separator := "    ├"
+	for i, col := range columns {
+		header += fmt.Sprintf(" %-*s │", colWidths[i], truncateString(col, colWidths[i]))
+		separator += strings.Repeat("─", colWidths[i]+2) + "┼"
+	}
+	separator = separator[:len(separator)-3] + "┤"
+	t.Log(header)
+	t.Log(separator)
+
+	// 打印数据行
+	for _, row := range dataRows {
+		line := "    │"
+		for i, cell := range row {
+			line += fmt.Sprintf(" %-*s │", colWidths[i], truncateString(cell, colWidths[i]))
+		}
+		t.Log(line)
+	}
+}
+
+// getTableColumns 获取表的列名
+func getTableColumns(db *sql.DB, tableName string) ([]string, error) {
+	query := fmt.Sprintf("PRAGMA table_info(%s)", tableName)
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			continue
+		}
+		// 跳过 id 和 created_at 字段
+		if name != "id" && name != "created_at" {
+			columns = append(columns, name)
+		}
+	}
+	return columns, nil
+}
+
+// formatValue 格式化数据库值为字符串
+func formatValue(val interface{}) string {
+	if val == nil {
+		return "NULL"
+	}
+	switch v := val.(type) {
+	case []byte:
+		return string(v)
+	case float64:
+		if v == float64(int64(v)) {
+			return fmt.Sprintf("%.0f", v)
+		}
+		return fmt.Sprintf("%.4f", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// truncateString 截断字符串并添加省略号
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-2] + ".."
+}
+
+// validateDataCounts 校验数据表有数据
+func validateDataCounts(t *testing.T, db *sql.DB, mode string) {
+	if db == nil {
+		return
+	}
+
+	// 获取所有动态创建的表
+	tables := getTableNames(db)
+	if len(tables) == 0 {
+		t.Errorf("❌ 数据校验失败: 没有创建任何数据表")
+		return
+	}
+
+	// 核心表必须有数据（这些表名与Tushare API名称对应）
+	requiredTables := map[string]int{
+		"trade_cal":   1, // 交易日历
+		"stock_basic": 1, // 股票基础信息
+		"daily":       1, // 日线数据
+		"adj_factor":  1, // 复权因子
+		"top_list":    1, // 龙虎榜
+	}
+
+	// 校验核心表
+	for table, minCount := range requiredTables {
+		var count int
+		err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
+		if err != nil {
+			// 表可能不存在（动态建表时该API未爬取到）
+			t.Logf("⚠️ 表 %s 不存在或查询失败: %v", table, err)
+			continue
+		}
+
+		if count < minCount {
+			t.Errorf("❌ 数据校验失败: %s 表应至少有 %d 条数据，实际只有 %d 条", table, minCount, count)
+		} else {
+			t.Logf("✅ 数据校验通过: %s 表有 %d 条数据", table, count)
+		}
+	}
+
+	// 统计所有表的数据情况
+	t.Log("\n📈 所有表数据统计:")
+	totalRows := 0
+	for _, table := range tables {
+		var count int
+		if err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count); err == nil {
+			totalRows += count
+			status := "✅"
+			if count == 0 {
+				status = "⚪"
+			}
+			t.Logf("  %s %s: %d 条", status, table, count)
+		}
+	}
+	t.Logf("  📊 总计: %d 个表, %d 条数据", len(tables), totalRows)
 }
