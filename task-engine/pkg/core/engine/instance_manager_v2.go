@@ -1022,6 +1022,65 @@ func (m *WorkflowInstanceManagerV2) handleTaskSuccess(event TaskStatusEvent) {
 			_ = m.resultCache.Set(event.TaskID, event.Result, ttl)
 		}
 	}
+
+	// 如果是模板任务，检查并批量添加等待中的子任务
+	// 这是新设计中的关键步骤：模板任务的 Job Function 执行完毕后，触发等待中的子任务添加
+	if event.IsTemplate {
+		m.processPendingSubTasks(event.TaskID)
+	}
+}
+
+// processPendingSubTasks 处理等待中的子任务（模板任务成功后调用）
+func (m *WorkflowInstanceManagerV2) processPendingSubTasks(parentTaskID string) {
+	subTasksKey := fmt.Sprintf("%s:subtasks", parentTaskID)
+	subTasksValue, exists := m.contextData.Load(subTasksKey)
+	if !exists {
+		return // 没有等待中的子任务
+	}
+
+	// 类型检查
+	subTasksList, ok := subTasksValue.([]workflow.Task)
+	if !ok {
+		log.Printf("警告: WorkflowInstance %s: contextData 中的子任务列表类型错误，ParentTaskID=%s", m.instance.ID, parentTaskID)
+		m.contextData.Delete(subTasksKey)
+		return
+	}
+
+	if len(subTasksList) == 0 {
+		m.contextData.Delete(subTasksKey)
+		return
+	}
+
+	// 获取父任务信息
+	parentTask, exists := m.workflow.GetTasks()[parentTaskID]
+	if !exists {
+		log.Printf("警告: WorkflowInstance %s: 父任务不存在，ParentTaskID=%s", m.instance.ID, parentTaskID)
+		return
+	}
+
+	// 获取目标层级
+	currentLevel := m.taskQueue.GetCurrentLevel()
+	targetLevel := currentLevel
+
+	// 批量添加子任务到队列
+	m.taskQueue.AddTasks(targetLevel, subTasksList)
+
+	// 存储子任务的层级
+	for _, subTask := range subTasksList {
+		levelKey := fmt.Sprintf("%s:original_level", subTask.GetID())
+		m.contextData.Store(levelKey, targetLevel)
+	}
+
+	// 清空已收集的子任务列表
+	m.contextData.Delete(subTasksKey)
+
+	log.Printf("WorkflowInstance %s: 模板任务 %s 成功后，批量添加 %d 个等待中的子任务到 level %d",
+		m.instance.ID, parentTaskID, len(subTasksList), targetLevel)
+
+	// 减少模板任务计数
+	if parentTask.IsTemplate() {
+		m.decrementTemplateTaskCount(parentTaskID, targetLevel, len(subTasksList))
+	}
 }
 
 // handleTaskFailure 处理任务失败事件（支持重试）
@@ -1471,36 +1530,12 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			continue
 		}
 
-		// 检查是否为模板任务（模板任务不执行，仅用于生成子任务）
-		// 参考 instance_manager.go 的实现方式
+		// 模板任务的 Job Function 正常执行（不再跳过）
+		// 根据设计文档要求：用户应该把任务生成函数放在 Job Function 中
+		// Job Function 可以从 context 引用之前任务的结果，并注入给子任务
 		if task.IsTemplate() {
-			log.Printf("📋 WorkflowInstance %s: Task %s (%s) 是模板任务，跳过执行，触发Success handler",
+			log.Printf("📋 WorkflowInstance %s: Task %s (%s) 是模板任务，执行 Job Function 生成子任务",
 				m.instance.ID, taskID, taskName)
-
-			// 模板任务也需要注入上游任务结果，以便 Success Handler 可以读取
-			if m.resultCache != nil {
-				m.injectCachedResults(task, taskID)
-			}
-
-			// 模板任务不执行Job函数，但需要触发Success handler来生成子任务
-			// 注意：先不标记为已处理，让 createTaskCompleteHandler 来处理
-			// 设置状态为Success，表示模板任务已"完成"（虽然不执行，但依赖关系已满足）
-			task.SetStatus("SUCCESS")
-
-			// 直接调用 createTaskCompleteHandler，让它处理模板任务的 Success handler
-			// 这样可以利用现有的逻辑，不需要复制 task 对象
-			// createTaskCompleteHandler 内部会检查并标记为已处理，并执行 handler
-			completeHandler := m.createTaskCompleteHandler(taskID)
-			// 创建一个空的 TaskResult，因为模板任务没有执行结果
-			emptyResult := &executor.TaskResult{
-				Data: nil,
-			}
-			// 在 goroutine 中执行，避免阻塞
-			go completeHandler(emptyResult)
-
-			// 注意：模板任务计数会在 handleAtomicAddSubTasks 或 handleTaskSuccess 中减少
-			// createTaskCompleteHandler 会发送 TaskStatusEvent 到 taskStatusChan，触发后续处理
-			continue
 		}
 
 		// 参数校验和结果映射
@@ -2214,27 +2249,10 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 	}
 
 	// 处理空子任务列表：如果模板任务没有生成子任务，需要减少计数
+	// 注意：在新设计中，模板任务的成功事件由 createTaskCompleteHandler 发送，这里只减少计数
 	if len(subTasks) == 0 {
 		if parentTask.IsTemplate() {
 			log.Printf("WorkflowInstance %s: 模板任务 %s 没有生成子任务", m.instance.ID, parentTaskID)
-			// 标记模板任务为成功
-			if parentTask.GetStatus() != "SUCCESS" && parentTask.GetStatus() != "Success" {
-				parentTask.SetStatus("SUCCESS")
-				// 发送成功事件
-				select {
-				case m.queueUpdateChan <- TaskStatusEvent{
-					TaskID:      parentTaskID,
-					Status:      "Success",
-					IsTemplate:  true,
-					IsProcessed: false,
-					Timestamp:   time.Now(),
-				}:
-				case <-time.After(5 * time.Second):
-					log.Printf("警告: queueUpdateChan 发送超时，模板任务成功事件可能丢失: TaskID=%s", parentTaskID)
-				case <-m.ctx.Done():
-					return
-				}
-			}
 			// 减少模板任务计数（没有子任务）
 			currentLevel := m.taskQueue.GetCurrentLevel()
 			m.decrementTemplateTaskCount(parentTaskID, currentLevel, 0)
@@ -2278,17 +2296,22 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 	// 检查所有子任务的依赖是否已满足
 	allDepsProcessed := true
 
-	// 检查父任务是否已完成（对于模板任务，如果状态是 SUCCESS 就认为已完成）
-	if parentTask.IsTemplate() {
-		parentStatus := parentTask.GetStatus()
-		if parentStatus == "SUCCESS" || parentStatus == "Success" {
-			// 模板任务状态是 SUCCESS，视为已完成（处理竞态条件）
-			m.processedNodes.LoadOrStore(parentTaskID, true)
-		}
-	}
-
+	// 检查父任务是否已完成
+	// 注意：在新设计中，不再在这里将模板任务标记为已处理
+	// 让 createTaskCompleteHandler 来处理，这样 Success Handler 可以正常执行
 	if _, processed := m.processedNodes.Load(parentTaskID); !processed {
-		allDepsProcessed = false
+		// 对于模板任务，检查状态来判断是否已完成（Job Function 正在执行中的竞态情况）
+		if parentTask.IsTemplate() {
+			parentStatus := parentTask.GetStatus()
+			if parentStatus == "SUCCESS" || parentStatus == "Success" {
+				// 模板任务状态是 SUCCESS，依赖已满足（但不标记为已处理，让 createTaskCompleteHandler 处理）
+				// allDepsProcessed = true (保持为 true)
+			} else {
+				allDepsProcessed = false
+			}
+		} else {
+			allDepsProcessed = false
+		}
 	}
 
 	// 检查所有子任务通过GetDependencies()声明的其他依赖
@@ -2373,50 +2396,14 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 		subTasksList = append(subTasksList, subTasks...)
 		m.contextData.Store(subTasksKey, subTasksList)
 		log.Printf("WorkflowInstance %s: %d 个子任务已添加，等待依赖满足（父任务: %s）", m.instance.ID, len(subTasks), parentTaskID)
-
-		// 如果父任务是模板任务，标记为成功（即使子任务依赖未满足）
-		// 这样后续依赖满足时，可以正确检查父任务状态
-		if parentTask.IsTemplate() && parentTask.GetStatus() != "SUCCESS" && parentTask.GetStatus() != "Success" {
-			parentTask.SetStatus("SUCCESS")
-			// 发送成功事件
-			select {
-			case m.queueUpdateChan <- TaskStatusEvent{
-				TaskID:      parentTaskID,
-				Status:      "Success",
-				IsTemplate:  true,
-				IsProcessed: false,
-				Timestamp:   time.Now(),
-			}:
-			case <-time.After(5 * time.Second):
-				log.Printf("警告: queueUpdateChan 发送超时，模板任务成功事件可能丢失: TaskID=%s", parentTaskID)
-			case <-m.ctx.Done():
-				return
-			}
-		}
+		// 注意：在新设计中，模板任务的成功事件由 createTaskCompleteHandler 发送
+		// 这里不再设置状态或发送事件
 	}
 
 	// 如果父任务是模板任务，处理模板任务逻辑
+	// 注意：在新设计中，模板任务的 Job Function 会被正常执行，成功事件由 createTaskCompleteHandler 发送
+	// 这里不再发送成功事件，只处理子任务添加后的依赖检查
 	if parentTask.IsTemplate() {
-		// 标记模板任务为成功（如果还没有）
-		if parentTask.GetStatus() != "SUCCESS" && parentTask.GetStatus() != "Success" {
-			parentTask.SetStatus("SUCCESS")
-
-			// 发送成功事件（让 handleTaskSuccess 处理）
-			select {
-			case m.queueUpdateChan <- TaskStatusEvent{
-				TaskID:      parentTaskID,
-				Status:      "Success",
-				IsTemplate:  true,
-				IsProcessed: false,
-				Timestamp:   time.Now(),
-			}:
-			case <-time.After(5 * time.Second):
-				log.Printf("警告: queueUpdateChan 发送超时，模板任务成功事件可能丢失: TaskID=%s", parentTaskID)
-			case <-m.ctx.Done():
-				return
-			}
-		}
-
 		// 如果依赖未满足，尝试批量添加子任务（用于处理后续依赖满足的情况）
 		if !allDepsProcessed {
 			m.tryBatchAddSubTasks(parentTaskID, parentTask, targetLevel)

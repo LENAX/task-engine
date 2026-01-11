@@ -268,19 +268,29 @@ func registerE2EFunctions(t *testing.T, ctx *E2EContext) {
 	registry.Register(bgCtx, "FetchStockBasic", FetchStockBasic, "获取股票基本信息")
 	registry.Register(bgCtx, "FetchTopList", FetchTopList, "获取龙虎榜")
 
-	// 注册模板任务占位函数（模板任务需要 JobFunction，但实际逻辑在 Success Handler 中）
-	registry.Register(bgCtx, "TemplateNoOp", func(tc *task.TaskContext) (interface{}, error) {
-		log.Printf("📋 [模板任务] %s - 准备生成子任务", tc.TaskName)
-		return map[string]string{"status": "template_ready"}, nil
-	}, "模板任务占位函数")
+	// 注册模板任务的 Job Functions（在 Job Function 中生成子任务，符合设计文档要求）
+	// 根据设计文档：用户应该把任务生成函数放在 Job Function 中
+	// Job Function 可以从 context 引用之前任务的结果，并注入给子任务
+	registry.Register(bgCtx, "GenerateDailySubTasksJob", GenerateDailySubTasksJob, "生成日线数据子任务（JobFunc）")
+	registry.Register(bgCtx, "GenerateAdjFactorSubTasksJob", GenerateAdjFactorSubTasksJob, "生成复权因子子任务（JobFunc）")
+	registry.Register(bgCtx, "GenerateIncomeSubTasksJob", GenerateIncomeSubTasksJob, "生成利润表子任务（JobFunc）")
+	registry.Register(bgCtx, "GenerateBalanceSheetSubTasksJob", GenerateBalanceSheetSubTasksJob, "生成资产负债表子任务（JobFunc）")
+	registry.Register(bgCtx, "GenerateCashFlowSubTasksJob", GenerateCashFlowSubTasksJob, "生成现金流量表子任务（JobFunc）")
+	registry.Register(bgCtx, "GenerateAPIDetailSubTasksJob", GenerateAPIDetailSubTasksJob, "生成API详情子任务（JobFunc）")
 
-	// 注册子任务的 Job Functions（由模板任务的 Handler 生成的子任务使用）
+	// 注册子任务的 Job Functions（由模板任务的 Job Function 生成的子任务使用）
 	// 这些函数从参数中获取 ts_code 并执行实际的数据获取
 	registry.Register(bgCtx, "FetchDailySub", FetchDaily, "获取日线行情(子任务)")
 	registry.Register(bgCtx, "FetchAdjFactorSub", FetchAdjFactor, "获取复权因子(子任务)")
 	registry.Register(bgCtx, "FetchIncomeSub", FetchIncome, "获取利润表(子任务)")
 	registry.Register(bgCtx, "FetchBalanceSheetSub", FetchBalanceSheet, "获取资产负债表(子任务)")
 	registry.Register(bgCtx, "FetchCashFlowSub", FetchCashFlow, "获取现金流量表(子任务)")
+
+	// 保留旧的 TemplateNoOp 用于向后兼容（但不推荐使用）
+	registry.Register(bgCtx, "TemplateNoOp", func(tc *task.TaskContext) (interface{}, error) {
+		log.Printf("⚠️ [模板任务] %s - 使用废弃的 TemplateNoOp，建议迁移到 Job Function 模式", tc.TaskName)
+		return map[string]string{"status": "template_ready"}, nil
+	}, "模板任务占位函数（已废弃，仅用于向后兼容）")
 
 	// 注册通用Handler
 	registry.RegisterTaskHandler(bgCtx, "LogSuccess", func(tc *task.TaskContext) {
@@ -1519,24 +1529,258 @@ func generateSubTasksForType(tc *task.TaskContext, taskTypeName, jobFuncName str
 	log.Printf("✅ [%s] 共生成 %d 个子任务", taskTypeName, generatedCount)
 }
 
-// GenerateDailySubTasks 日线数据模板任务的 Success Handler
+// GenerateDailySubTasks 日线数据模板任务的 Success Handler（已废弃，仅用于向后兼容）
 func GenerateDailySubTasks(tc *task.TaskContext) {
 	generateSubTasksForType(tc, "获取日线数据", "FetchDailySub")
 }
 
-// GenerateAdjFactorSubTasks 复权因子模板任务的 Success Handler
+// GenerateAdjFactorSubTasks 复权因子模板任务的 Success Handler（已废弃，仅用于向后兼容）
 func GenerateAdjFactorSubTasks(tc *task.TaskContext) {
 	generateSubTasksForType(tc, "获取复权因子", "FetchAdjFactorSub")
 }
 
-// GenerateIncomeSubTasks 利润表模板任务的 Success Handler
+// GenerateIncomeSubTasks 利润表模板任务的 Success Handler（已废弃，仅用于向后兼容）
 func GenerateIncomeSubTasks(tc *task.TaskContext) {
 	generateSubTasksForType(tc, "获取利润表", "FetchIncomeSub")
 }
 
-// GenerateBalanceSheetSubTasks 资产负债表模板任务的 Success Handler
+// GenerateBalanceSheetSubTasks 资产负债表模板任务的 Success Handler（已废弃，仅用于向后兼容）
 func GenerateBalanceSheetSubTasks(tc *task.TaskContext) {
 	generateSubTasksForType(tc, "获取资产负债表", "FetchBalanceSheetSub")
+}
+
+// ==================== Job Function 版本的子任务生成函数（推荐使用） ====================
+// 根据设计文档要求：用户应该把任务生成函数放在 Job Function 中
+// Job Function 可以从 context 引用之前任务的结果，并注入给子任务
+
+// generateSubTasksForTypeJob 通用的子任务生成 Job Function
+// 返回生成的子任务数量和状态信息
+func generateSubTasksForTypeJob(tc *task.TaskContext, taskTypeName, jobFuncName string) (interface{}, error) {
+	// 调试：打印所有参数
+	log.Printf("🔍 [%s] Job Function 执行，Params 内容: %+v", taskTypeName, tc.Params)
+
+	// 获取Engine
+	engineInterface, ok := tc.GetDependency("Engine")
+	if !ok {
+		return nil, fmt.Errorf("[%s] 未找到Engine依赖", taskTypeName)
+	}
+	eng, ok := engineInterface.(*engine.Engine)
+	if !ok {
+		return nil, fmt.Errorf("[%s] Engine类型转换失败", taskTypeName)
+	}
+
+	registry := eng.GetRegistry()
+	if registry == nil {
+		return nil, fmt.Errorf("[%s] 无法获取Registry", taskTypeName)
+	}
+
+	// 从上游任务结果中提取 ts_codes
+	tsCodes := extractTsCodesFromUpstream(tc)
+	if len(tsCodes) == 0 {
+		log.Printf("⚠️ [%s] 未找到 ts_codes，Params keys: %v", taskTypeName, getParamKeys(tc.Params))
+		return map[string]interface{}{
+			"status":    "no_data",
+			"generated": 0,
+			"message":   "未找到 ts_codes，跳过子任务生成",
+		}, nil
+	}
+
+	log.Printf("📡 [%s] 从上游任务获取到 %d 个股票代码: %v", taskTypeName, len(tsCodes), tsCodes)
+
+	parentTaskID := tc.TaskID
+	workflowInstanceID := tc.WorkflowInstanceID
+	generatedCount := 0
+
+	// 收集所有子任务
+	var subTasks []interface{}
+	for _, tsCode := range tsCodes {
+		subTaskName := fmt.Sprintf("%s_%s", taskTypeName, tsCode)
+		subTask, err := builder.NewTaskBuilder(subTaskName, fmt.Sprintf("获取%s的%s", tsCode, taskTypeName), registry).
+			WithJobFunction(jobFuncName, map[string]interface{}{
+				"ts_code": tsCode,
+			}).
+			WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+			WithTaskHandler(task.TaskStatusFailed, "LogError").
+			Build()
+		if err != nil {
+			log.Printf("❌ [%s] 创建子任务失败: %s, error=%v", taskTypeName, subTaskName, err)
+			continue
+		}
+
+		bgCtx := context.Background()
+		if err := eng.AddSubTaskToInstance(bgCtx, workflowInstanceID, subTask, parentTaskID); err != nil {
+			log.Printf("❌ [%s] 添加子任务失败: %s, error=%v", taskTypeName, subTaskName, err)
+			continue
+		}
+
+		generatedCount++
+		subTasks = append(subTasks, map[string]interface{}{
+			"name":    subTaskName,
+			"ts_code": tsCode,
+		})
+		log.Printf("✅ [%s] 子任务已添加: %s (ts_code=%s)", taskTypeName, subTaskName, tsCode)
+	}
+
+	log.Printf("✅ [%s] 共生成 %d 个子任务", taskTypeName, generatedCount)
+
+	return map[string]interface{}{
+		"status":    "success",
+		"generated": generatedCount,
+		"sub_tasks": subTasks,
+	}, nil
+}
+
+// GenerateDailySubTasksJob 日线数据模板任务的 Job Function
+func GenerateDailySubTasksJob(tc *task.TaskContext) (interface{}, error) {
+	return generateSubTasksForTypeJob(tc, "获取日线数据", "FetchDailySub")
+}
+
+// GenerateAdjFactorSubTasksJob 复权因子模板任务的 Job Function
+func GenerateAdjFactorSubTasksJob(tc *task.TaskContext) (interface{}, error) {
+	return generateSubTasksForTypeJob(tc, "获取复权因子", "FetchAdjFactorSub")
+}
+
+// GenerateIncomeSubTasksJob 利润表模板任务的 Job Function
+func GenerateIncomeSubTasksJob(tc *task.TaskContext) (interface{}, error) {
+	return generateSubTasksForTypeJob(tc, "获取利润表", "FetchIncomeSub")
+}
+
+// GenerateBalanceSheetSubTasksJob 资产负债表模板任务的 Job Function
+func GenerateBalanceSheetSubTasksJob(tc *task.TaskContext) (interface{}, error) {
+	return generateSubTasksForTypeJob(tc, "获取资产负债表", "FetchBalanceSheetSub")
+}
+
+// GenerateCashFlowSubTasksJob 现金流量表模板任务的 Job Function
+func GenerateCashFlowSubTasksJob(tc *task.TaskContext) (interface{}, error) {
+	return generateSubTasksForTypeJob(tc, "获取现金流量表", "FetchCashFlowSub")
+}
+
+// GenerateAPIDetailSubTasksJob 爬取API详情模板任务的 Job Function
+func GenerateAPIDetailSubTasksJob(tc *task.TaskContext) (interface{}, error) {
+	e2eCtx, ok := tc.GetDependency("E2EContext")
+	if !ok {
+		return nil, fmt.Errorf("[GenerateAPIDetailSubTasksJob] 未找到E2EContext依赖")
+	}
+	ctx := e2eCtx.(*E2EContext)
+
+	// 从上游任务获取目录列表
+	catalogs := extractCatalogsFromUpstream(tc)
+	if len(catalogs) == 0 {
+		log.Printf("⚠️ [GenerateAPIDetailSubTasksJob] 未找到目录数据，Params keys: %v", getParamKeys(tc.Params))
+		return map[string]interface{}{
+			"status":    "no_data",
+			"generated": 0,
+			"message":   "未找到目录数据，跳过子任务生成",
+		}, nil
+	}
+
+	// 真实模式下限制爬取数量
+	if ctx.Config.MaxAPICrawl > 0 && len(catalogs) > ctx.Config.MaxAPICrawl {
+		log.Printf("📡 [GenerateAPIDetailSubTasksJob] 真实模式：限制爬取数量从 %d 到 %d", len(catalogs), ctx.Config.MaxAPICrawl)
+		catalogs = catalogs[:ctx.Config.MaxAPICrawl]
+	}
+
+	log.Printf("📡 [GenerateAPIDetailSubTasksJob] 从上游任务获取到 %d 个目录，开始生成子任务", len(catalogs))
+
+	// 获取Engine
+	engineInterface, ok := tc.GetDependency("Engine")
+	if !ok {
+		return nil, fmt.Errorf("[GenerateAPIDetailSubTasksJob] 未找到Engine依赖")
+	}
+	eng, ok := engineInterface.(*engine.Engine)
+	if !ok {
+		return nil, fmt.Errorf("[GenerateAPIDetailSubTasksJob] Engine类型转换失败")
+	}
+
+	registry := eng.GetRegistry()
+	if registry == nil {
+		return nil, fmt.Errorf("[GenerateAPIDetailSubTasksJob] 无法获取Registry")
+	}
+
+	parentTaskID := tc.TaskID
+	workflowInstanceID := tc.WorkflowInstanceID
+	generatedCount := 0
+
+	// 初始化结果收集器
+	ctx.crawlResultMu.Lock()
+	if ctx.crawlCollector == nil {
+		ctx.crawlCollector = &CrawlResultCollector{
+			Provider: DataProvider{
+				ID:          1,
+				Name:        "Tushare",
+				BaseURL:     ctx.Config.APIServerURL,
+				Description: "Tushare金融大数据平台",
+				CreatedAt:   time.Now(),
+			},
+			Catalogs:   []APICatalog{},
+			Params:     []APIParam{},
+			DataFields: []APIDataField{},
+		}
+	}
+	ctx.crawlResultMu.Unlock()
+
+	// 统计叶子节点和目录节点数量
+	leafCount := 0
+	dirCount := 0
+	for _, c := range catalogs {
+		if c.IsLeaf {
+			leafCount++
+		} else {
+			dirCount++
+		}
+	}
+	log.Printf("📊 [GenerateAPIDetailSubTasksJob] 目录结构: 叶子节点=%d, 目录节点=%d", leafCount, dirCount)
+
+	var subTaskInfos []map[string]interface{}
+	for _, catalog := range catalogs {
+		// 只为叶子节点生成子任务（跳过目录节点）
+		if !catalog.IsLeaf {
+			log.Printf("📁 [GenerateAPIDetailSubTasksJob] 跳过目录节点: %s", catalog.Name)
+			continue
+		}
+
+		if catalog.Link == "" {
+			continue
+		}
+
+		subTaskName := fmt.Sprintf("爬取API详情_%s", catalog.Name)
+		subTask, err := builder.NewTaskBuilder(subTaskName, fmt.Sprintf("爬取%s的API详情", catalog.Name), registry).
+			WithJobFunction("CrawlSingleAPIDetail", map[string]interface{}{
+				"catalog_id":   catalog.ID,
+				"catalog_name": catalog.Name,
+				"catalog_link": catalog.Link,
+			}).
+			WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
+			WithTaskHandler(task.TaskStatusFailed, "LogError").
+			Build()
+		if err != nil {
+			log.Printf("❌ [GenerateAPIDetailSubTasksJob] 创建子任务失败: %s, error=%v", subTaskName, err)
+			continue
+		}
+
+		bgCtx := context.Background()
+		if err := eng.AddSubTaskToInstance(bgCtx, workflowInstanceID, subTask, parentTaskID); err != nil {
+			log.Printf("❌ [GenerateAPIDetailSubTasksJob] 添加子任务失败: %s, error=%v", subTaskName, err)
+			continue
+		}
+
+		generatedCount++
+		subTaskInfos = append(subTaskInfos, map[string]interface{}{
+			"name":    subTaskName,
+			"catalog": catalog.Name,
+		})
+		log.Printf("✅ [GenerateAPIDetailSubTasksJob] 子任务已添加: %s (catalog=%s)", subTaskName, catalog.Name)
+	}
+
+	log.Printf("✅ [GenerateAPIDetailSubTasksJob] 共生成 %d 个子任务", generatedCount)
+
+	return map[string]interface{}{
+		"status":     "success",
+		"generated":  generatedCount,
+		"leaf_count": leafCount,
+		"dir_count":  dirCount,
+		"sub_tasks":  subTaskInfos,
+	}, nil
 }
 
 // GenerateCashFlowSubTasks 现金流量表模板任务的 Success Handler
@@ -1778,10 +2022,10 @@ func TestE2E_Workflow1_MetadataCrawl(t *testing.T) {
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		Build()
 
+	// 模板任务：在 Job Function 中生成子任务（符合设计文档要求）
 	task2, err := builder.NewTaskBuilder("爬取API详情", "爬取每个API的详细信息", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateAPIDetailSubTasksJob", nil).
 		WithDependency("爬取文档目录").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateAPIDetailSubTasks").
 		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		WithTemplate(true).
@@ -1921,11 +2165,11 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 		Build()
 	tasks = append(tasks, t2)
 
-	// 日线数据模板任务（依赖获取股票信息，Success Handler 生成子任务）
+	// 日线数据模板任务（依赖获取股票信息，在 Job Function 中生成子任务）
 	t3, err := builder.NewTaskBuilder("获取日线数据", "获取日线行情数据", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateDailySubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateDailySubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		WithTemplate(true).
 		Build()
@@ -1936,9 +2180,9 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 
 	// 复权因子模板任务
 	t4, err := builder.NewTaskBuilder("获取复权因子", "获取复权因子数据", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateAdjFactorSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateAdjFactorSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		WithTemplate(true).
 		Build()
@@ -1949,9 +2193,9 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 
 	// 利润表模板任务
 	t5, err := builder.NewTaskBuilder("获取利润表", "获取利润表数据", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateIncomeSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateIncomeSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		WithTemplate(true).
 		Build()
@@ -1962,9 +2206,9 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 
 	// 资产负债表模板任务
 	t6, err := builder.NewTaskBuilder("获取资产负债表", "获取资产负债表数据", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateBalanceSheetSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateBalanceSheetSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		WithTemplate(true).
 		Build()
@@ -1975,9 +2219,9 @@ func TestE2E_Workflow3_DataAcquisition(t *testing.T) {
 
 	// 现金流量表模板任务
 	t7, err := builder.NewTaskBuilder("获取现金流量表", "获取现金流量表数据", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateCashFlowSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateCashFlowSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTaskHandler(task.TaskStatusFailed, "LogError").
 		WithTemplate(true).
 		Build()
@@ -2089,10 +2333,11 @@ func runMetadataCrawlWorkflow(t *testing.T, ctx *E2EContext) {
 		WithJobFunction("CrawlDocCatalog", nil).
 		Build()
 
+	// 模板任务：在 Job Function 中生成子任务
 	task2, err := builder.NewTaskBuilder("爬取API详情", "爬取每个API的详细信息", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateAPIDetailSubTasksJob", nil).
 		WithDependency("爬取文档目录").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateAPIDetailSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTemplate(true).
 		Build()
 	if err != nil {
@@ -2126,7 +2371,7 @@ func runCreateTablesWorkflow(t *testing.T, ctx *E2EContext) {
 func runDataAcquisitionWorkflow(t *testing.T, ctx *E2EContext) {
 	bgCtx := context.Background()
 
-	// 使用模板任务模式：模板任务的 Success Handler 会根据上游结果动态生成子任务
+	// 使用模板任务模式：模板任务的 Job Function 会根据上游结果动态生成子任务
 	// Level 0: 获取交易日历, 获取股票信息
 	// Level 1: 5个模板任务（日线、复权因子、利润表、资产负债表、现金流量表），获取龙虎榜
 	// Level 2: 动态生成的子任务
@@ -2141,39 +2386,39 @@ func runDataAcquisitionWorkflow(t *testing.T, ctx *E2EContext) {
 		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		Build()
 
-	// 5个模板任务，使用 TemplateNoOp 占位函数，Success Handler 生成子任务
+	// 5个模板任务，在 Job Function 中生成子任务（符合设计文档要求）
 	t3, _ := builder.NewTaskBuilder("获取日线数据", "获取日线数据", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateDailySubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateDailySubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTemplate(true).
 		Build()
 
 	t4, _ := builder.NewTaskBuilder("获取复权因子", "获取复权因子", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateAdjFactorSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateAdjFactorSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTemplate(true).
 		Build()
 
 	t5, _ := builder.NewTaskBuilder("获取利润表", "获取利润表", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateIncomeSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateIncomeSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTemplate(true).
 		Build()
 
 	t6, _ := builder.NewTaskBuilder("获取资产负债表", "获取资产负债表", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateBalanceSheetSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateBalanceSheetSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTemplate(true).
 		Build()
 
 	t7, _ := builder.NewTaskBuilder("获取现金流量表", "获取现金流量表", ctx.Registry).
-		WithJobFunction("TemplateNoOp", nil).
+		WithJobFunction("GenerateCashFlowSubTasksJob", nil).
 		WithDependency("获取股票信息").
-		WithTaskHandler(task.TaskStatusSuccess, "GenerateCashFlowSubTasks").
+		WithTaskHandler(task.TaskStatusSuccess, "LogSuccess").
 		WithTemplate(true).
 		Build()
 
