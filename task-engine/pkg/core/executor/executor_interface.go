@@ -1,7 +1,7 @@
 package executor
 
 import (
-	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/LENAX/task-engine/pkg/core/task"
 )
 
 // Executor 任务执行器接口（对外导出）

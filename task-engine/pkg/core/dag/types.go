@@ -2,7 +2,7 @@ package dag
 
 import (
 	godag "github.com/begmaroman/go-dag"
-	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/LENAX/task-engine/pkg/core/workflow"
 )
 
 // dagImpl 有向无环图实现（内部实现）

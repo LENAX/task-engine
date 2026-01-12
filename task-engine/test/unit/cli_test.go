@@ -6,9 +6,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/stevelan1995/task-engine/pkg/api/dto"
-	"github.com/stevelan1995/task-engine/pkg/cli/output"
-	"github.com/stevelan1995/task-engine/pkg/cli/taskengine"
+	"github.com/LENAX/task-engine/pkg/api/dto"
+	"github.com/LENAX/task-engine/pkg/cli/output"
+	"github.com/LENAX/task-engine/pkg/cli/taskengine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

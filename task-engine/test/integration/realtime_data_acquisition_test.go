@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/stevelan1995/task-engine/test/mocks"
+	"github.com/LENAX/task-engine/test/mocks"
 )
 
 // TestMockTushareWSServer_BasicConnection 测试 WebSocket 服务器基本连接

@@ -298,7 +298,7 @@ $ task-engine server start --port=8080 --config=./config.yaml
 #### TaskBuilder 使用示例
 
 ```go
-import "github.com/stevelan1995/task-engine/pkg/core/builder"
+import "github.com/LENAX/task-engine/pkg/core/builder"
 
 // 方式1：使用JobFunction定义Task
 task1, err := builder.NewTaskBuilder("数据提取", "从数据源提取原始数据").
@@ -330,7 +330,7 @@ task3, err := builder.NewTaskBuilder("数据写入", "写入目标数据库").
 #### WorkflowBuilder 使用示例
 
 ```go
-import "github.com/stevelan1995/task-engine/pkg/core/builder"
+import "github.com/LENAX/task-engine/pkg/core/builder"
 
 // 创建Workflow
 wf, err := builder.NewWorkflowBuilder("数据同步工作流", "每日数据同步任务").
@@ -486,7 +486,7 @@ func (m *WorkflowInstanceManagerV2) updateTaskStatus(taskID, status string) {
 #### 安装方式
 
 ```bash
-go get github.com/stevelan1995/task-engine
+go get github.com/LENAX/task-engine
 ```
 
 #### 导出包结构
@@ -510,8 +510,8 @@ import (
     "context"
     "log"
 
-    "github.com/stevelan1995/task-engine/pkg/core/engine"
-    "github.com/stevelan1995/task-engine/pkg/core/builder"
+    "github.com/LENAX/task-engine/pkg/core/engine"
+    "github.com/LENAX/task-engine/pkg/core/builder"
 )
 
 func main() {
@@ -744,7 +744,7 @@ CLI ───────┴──> (调用HTTP API)
 
 | 模式 | 入口 | 适用场景 | 说明 |
 |------|------|----------|------|
-| **SDK模式** | `go get github.com/stevelan1995/task-engine` | 程序化集成 | 上层项目import后直接使用，支持Builder构建Workflow |
+| **SDK模式** | `go get github.com/LENAX/task-engine` | 程序化集成 | 上层项目import后直接使用，支持Builder构建Workflow |
 | **库模式** | `pkg/core/*` | 嵌入式使用 | 作为Go库嵌入到现有应用中 |
 | **服务模式** | `cmd/task-engine-server` | 独立部署 | 作为独立服务运行，提供HTTP API |
 | **CLI模式** | `cmd/task-engine` | 运维管理 | 命令行工具，调用HTTP API进行管理操作 |
@@ -754,10 +754,10 @@ CLI ───────┴──> (调用HTTP API)
 ```
 上层项目
     │
-    ├── go get github.com/stevelan1995/task-engine
+    ├── go get github.com/LENAX/task-engine
     │
-    ├── import "github.com/stevelan1995/task-engine/pkg/core/engine"
-    │   import "github.com/stevelan1995/task-engine/pkg/core/builder"
+    ├── import "github.com/LENAX/task-engine/pkg/core/engine"
+    │   import "github.com/LENAX/task-engine/pkg/core/builder"
     │
     ├── engine.NewEngineBuilder(...).Build()
     │

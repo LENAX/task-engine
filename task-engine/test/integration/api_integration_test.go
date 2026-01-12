@@ -8,11 +8,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/stevelan1995/task-engine/pkg/api"
-	"github.com/stevelan1995/task-engine/pkg/api/dto"
-	"github.com/stevelan1995/task-engine/pkg/core/builder"
-	"github.com/stevelan1995/task-engine/pkg/core/engine"
-	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/LENAX/task-engine/pkg/api"
+	"github.com/LENAX/task-engine/pkg/api/dto"
+	"github.com/LENAX/task-engine/pkg/core/builder"
+	"github.com/LENAX/task-engine/pkg/core/engine"
+	"github.com/LENAX/task-engine/pkg/core/task"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

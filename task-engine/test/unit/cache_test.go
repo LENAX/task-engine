@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stevelan1995/task-engine/pkg/core/cache"
+	"github.com/LENAX/task-engine/pkg/core/cache"
 )
 
 // TestMemoryResultCache_SetAndGet 测试缓存设置和获取

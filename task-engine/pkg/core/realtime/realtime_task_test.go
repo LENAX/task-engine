@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/LENAX/task-engine/pkg/core/task"
 )
 
 func createTestTask(name string) *task.Task {

@@ -1,8 +1,6 @@
-module github.com/stevelan1995/task-engine
+module github.com/LENAX/task-engine
 
 go 1.24.2
-
-replace github.com/stevelan1995/task-engine => /Users/stevelan/Desktop/projects/task-engine/task-engine
 
 require (
 	github.com/PuerkitoBio/goquery v1.11.0

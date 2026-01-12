@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/stevelan1995/task-engine/pkg/core/types"
+	"github.com/LENAX/task-engine/pkg/core/types"
 )
 
 // Task 使用公共包中的Task接口（类型别名，保持向后兼容）

@@ -8,9 +8,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/stevelan1995/task-engine/pkg/api/dto"
-	"github.com/stevelan1995/task-engine/pkg/api/handler"
-	"github.com/stevelan1995/task-engine/pkg/api/middleware"
+	"github.com/LENAX/task-engine/pkg/api/dto"
+	"github.com/LENAX/task-engine/pkg/api/handler"
+	"github.com/LENAX/task-engine/pkg/api/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

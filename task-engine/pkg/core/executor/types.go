@@ -3,7 +3,7 @@ package executor
 import (
 	"time"
 
-	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/LENAX/task-engine/pkg/core/workflow"
 )
 
 // PendingTask 待调度的Task结构（对外导出）

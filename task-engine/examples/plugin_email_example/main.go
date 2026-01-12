@@ -6,9 +6,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/stevelan1995/task-engine/pkg/core/builder"
-	"github.com/stevelan1995/task-engine/pkg/core/engine"
-	"github.com/stevelan1995/task-engine/pkg/plugin"
+	"github.com/LENAX/task-engine/pkg/core/builder"
+	"github.com/LENAX/task-engine/pkg/core/engine"
+	"github.com/LENAX/task-engine/pkg/plugin"
 )
 
 func main() {

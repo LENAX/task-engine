@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/stevelan1995/task-engine/pkg/api"
-	"github.com/stevelan1995/task-engine/pkg/core/engine"
+	"github.com/LENAX/task-engine/pkg/api"
+	"github.com/LENAX/task-engine/pkg/core/engine"
 )
 
 var (

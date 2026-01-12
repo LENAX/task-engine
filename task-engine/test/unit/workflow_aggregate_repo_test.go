@@ -7,9 +7,9 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/stevelan1995/task-engine/pkg/core/task"
-	"github.com/stevelan1995/task-engine/pkg/core/workflow"
-	"github.com/stevelan1995/task-engine/pkg/storage/sqlite"
+	"github.com/LENAX/task-engine/pkg/core/task"
+	"github.com/LENAX/task-engine/pkg/core/workflow"
+	"github.com/LENAX/task-engine/pkg/storage/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stevelan1995/task-engine/pkg/core/engine"
+	"github.com/LENAX/task-engine/pkg/core/engine"
 )
 
 func TestEngineBuilderAndLoadWorkflow(t *testing.T) {

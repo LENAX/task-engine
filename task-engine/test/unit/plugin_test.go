@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/stevelan1995/task-engine/pkg/plugin"
+	"github.com/LENAX/task-engine/pkg/plugin"
 )
 
 // mockPlugin 测试用的Mock插件

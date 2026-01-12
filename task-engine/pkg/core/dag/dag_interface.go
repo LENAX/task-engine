@@ -1,7 +1,7 @@
 package dag
 
 import (
-	"github.com/stevelan1995/task-engine/pkg/core/workflow"
+	"github.com/LENAX/task-engine/pkg/core/workflow"
 )
 
 // DAG 有向无环图接口（对外导出）

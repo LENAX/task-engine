@@ -9,9 +9,9 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/stevelan1995/task-engine/pkg/api"
-	"github.com/stevelan1995/task-engine/pkg/cli/output"
-	"github.com/stevelan1995/task-engine/pkg/core/engine"
+	"github.com/LENAX/task-engine/pkg/api"
+	"github.com/LENAX/task-engine/pkg/cli/output"
+	"github.com/LENAX/task-engine/pkg/core/engine"
 )
 
 var (

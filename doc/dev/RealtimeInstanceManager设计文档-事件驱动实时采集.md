@@ -403,7 +403,7 @@ import (
     "context"
     "time"
     
-    "github.com/stevelan1995/task-engine/pkg/core/types"
+    "github.com/LENAX/task-engine/pkg/core/types"
 )
 
 // RealtimeInstanceManager 实时实例管理器接口
@@ -491,9 +491,9 @@ import (
     "github.com/ThreeDotsLabs/watermill/message/router"
     "github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
     
-    "github.com/stevelan1995/task-engine/pkg/core/task"
-    "github.com/stevelan1995/task-engine/pkg/core/workflow"
-    "github.com/stevelan1995/task-engine/pkg/storage"
+    "github.com/LENAX/task-engine/pkg/core/task"
+    "github.com/LENAX/task-engine/pkg/core/workflow"
+    "github.com/LENAX/task-engine/pkg/storage"
 )
 
 // realtimeInstanceManagerImpl RealtimeInstanceManager 实现
@@ -1679,8 +1679,8 @@ wf := builder.NewWorkflowBuilder("realtime_workflow", "实时工作流").
 package builder
 
 import (
-    "github.com/stevelan1995/task-engine/pkg/core/realtime"
-    "github.com/stevelan1995/task-engine/pkg/core/task"
+    "github.com/LENAX/task-engine/pkg/core/realtime"
+    "github.com/LENAX/task-engine/pkg/core/task"
 )
 
 // RealtimeTaskBuilder 实时任务构建器
@@ -1953,9 +1953,9 @@ import (
     "context"
     "log"
     
-    "github.com/stevelan1995/task-engine/pkg/core/builder"
-    "github.com/stevelan1995/task-engine/pkg/core/engine"
-    "github.com/stevelan1995/task-engine/pkg/core/realtime"
+    "github.com/LENAX/task-engine/pkg/core/builder"
+    "github.com/LENAX/task-engine/pkg/core/engine"
+    "github.com/LENAX/task-engine/pkg/core/realtime"
 )
 
 func main() {

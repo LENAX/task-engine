@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stevelan1995/task-engine/pkg/core/builder"
-	"github.com/stevelan1995/task-engine/pkg/core/executor"
-	"github.com/stevelan1995/task-engine/pkg/core/task"
+	"github.com/LENAX/task-engine/pkg/core/builder"
+	"github.com/LENAX/task-engine/pkg/core/executor"
+	"github.com/LENAX/task-engine/pkg/core/task"
 )
 
 func TestExecutor_Basic(t *testing.T) {
