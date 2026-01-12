@@ -22,7 +22,7 @@ Icon?
 
 # Go modules/packages
 /vendor/
-/pkg/
+# /pkg/  # 注释掉，因为我们的代码在 pkg/ 目录下
 
 # Editor & tooling
 .idea/
