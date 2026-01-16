@@ -42,6 +42,7 @@ type Task interface {
 	SetCompensationFuncName(funcName string)
 	GetCompensationFuncID() string
 	SetCompensationFuncID(funcID string)
+	ReplaceParams(params map[string]interface{}) error
 }
 
 // TaskInfo 定义Task信息接口（用于DAG构建，避免循环依赖）

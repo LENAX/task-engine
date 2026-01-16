@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -759,4 +760,146 @@ func (w *Workflow) IsStreamingMode() bool {
 // IsBatchMode 检查是否为批处理模式（对外导出，线程安全）
 func (w *Workflow) IsBatchMode() bool {
 	return w.GetExecutionMode() == ExecutionModeBatch
+}
+
+// ReplaceWorkflowParams 仅替换Workflow级别的参数占位符（不替换Task参数）（对外导出，线程安全）
+// params: 参数映射，key为占位符名称（不含${}），value为实际值
+// 返回错误如果存在未替换的占位符
+func (w *Workflow) ReplaceWorkflowParams(params map[string]interface{}) error {
+	if len(params) == 0 {
+		return nil
+	}
+
+	// 将sync.Map转换为普通map进行处理
+	paramsMap := make(map[string]interface{})
+	w.Params.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			if valueStr, ok := value.(string); ok {
+				paramsMap[keyStr] = valueStr
+			}
+		}
+		return true
+	})
+
+	// 替换占位符
+	var unreplaced []string
+	for key, value := range paramsMap {
+		strValue, ok := value.(string)
+		if !ok {
+			continue
+		}
+
+		// 检查是否为占位符格式
+		if strings.HasPrefix(strValue, "${") && strings.HasSuffix(strValue, "}") {
+			paramName := strings.TrimPrefix(strings.TrimSuffix(strValue, "}"), "${")
+			if paramName == "" {
+				continue
+			}
+
+			// 从params中查找对应的值
+			actualValue, exists := params[paramName]
+			if exists {
+				// 将实际值转换为字符串
+				var newValue string
+				switch v := actualValue.(type) {
+				case string:
+					newValue = v
+				case nil:
+					newValue = ""
+				default:
+					newValue = fmt.Sprintf("%v", v)
+				}
+				// 更新参数
+				w.Params.Store(key, newValue)
+			} else {
+				// 记录未替换的占位符
+				unreplaced = append(unreplaced, paramName)
+			}
+		}
+	}
+
+	if len(unreplaced) > 0 {
+		return fmt.Errorf("Workflow %s 中以下占位符未找到对应的参数值: %v", w.Name, unreplaced)
+	}
+
+	return nil
+}
+
+// ReplaceTaskParams 替换指定Task的参数占位符（对外导出，线程安全）
+// taskIdentifier: Task的ID或名称
+// params: 参数映射，key为占位符名称（不含${}），value为实际值
+// 返回错误如果Task不存在或存在未替换的占位符
+func (w *Workflow) ReplaceTaskParams(taskIdentifier string, params map[string]interface{}) error {
+	if taskIdentifier == "" {
+		return fmt.Errorf("Task标识符不能为空")
+	}
+
+	// 先尝试通过Task名称查找
+	var task Task
+	var found bool
+
+	// 通过TaskNameIndex查找名称
+	if taskIDValue, exists := w.TaskNameIndex.Load(taskIdentifier); exists {
+		taskID := taskIDValue.(string)
+		if t, ok := w.GetTask(taskID); ok {
+			task = t
+			found = true
+		}
+	}
+
+	// 如果通过名称未找到，尝试通过ID查找
+	if !found {
+		if t, ok := w.GetTask(taskIdentifier); ok {
+			task = t
+			found = true
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("Task %s 不存在", taskIdentifier)
+	}
+
+	// 调用Task的ReplaceParams方法
+	return task.ReplaceParams(params)
+}
+
+// ReplaceAllTaskParams 替换所有Task的参数占位符（对外导出，线程安全）
+// params: 参数映射，key为占位符名称（不含${}），value为实际值
+// 返回错误如果存在未替换的占位符
+func (w *Workflow) ReplaceAllTaskParams(params map[string]interface{}) error {
+	if len(params) == 0 {
+		return nil
+	}
+
+	var errors []string
+	w.Tasks.Range(func(key, value interface{}) bool {
+		task := value.(Task)
+		if err := task.ReplaceParams(params); err != nil {
+			errors = append(errors, err.Error())
+		}
+		return true
+	})
+
+	if len(errors) > 0 {
+		return fmt.Errorf("替换Task参数时发生错误: %v", errors)
+	}
+
+	return nil
+}
+
+// ReplaceParams 替换Workflow和所有Task中的参数占位符（便捷方法）（对外导出，线程安全）
+// params: 参数映射，key为占位符名称（不含${}），value为实际值
+// 返回错误如果存在未替换的占位符
+func (w *Workflow) ReplaceParams(params map[string]interface{}) error {
+	// 先替换Workflow级别的参数
+	if err := w.ReplaceWorkflowParams(params); err != nil {
+		return fmt.Errorf("替换Workflow参数失败: %w", err)
+	}
+
+	// 再替换所有Task的参数
+	if err := w.ReplaceAllTaskParams(params); err != nil {
+		return fmt.Errorf("替换Task参数失败: %w", err)
+	}
+
+	return nil
 }
