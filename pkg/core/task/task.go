@@ -3,6 +3,7 @@ package task
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -472,4 +473,66 @@ func (t *Task) SetCompensationFuncID(funcID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.CompensationFuncID = funcID
+}
+
+// ReplaceParams 替换Task中的参数占位符（对外导出，线程安全）
+// params: 参数映射，key为占位符名称（不含${}），value为实际值
+// 返回错误如果存在未替换的占位符
+func (t *Task) ReplaceParams(params map[string]interface{}) error {
+	if len(params) == 0 {
+		return nil
+	}
+
+	// 将sync.Map转换为普通map进行处理
+	paramsMap := make(map[string]interface{})
+	t.Params.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok {
+			paramsMap[keyStr] = value
+		}
+		return true
+	})
+
+	// 使用workflow包的工具函数进行替换
+	// 注意：这里需要导入workflow包，但为了避免循环依赖，我们直接实现替换逻辑
+	var unreplaced []string
+	for key, value := range paramsMap {
+		strValue, ok := value.(string)
+		if !ok {
+			continue
+		}
+
+		// 检查是否为占位符格式
+		if strings.HasPrefix(strValue, "${") && strings.HasSuffix(strValue, "}") {
+			paramName := strings.TrimPrefix(strings.TrimSuffix(strValue, "}"), "${")
+			if paramName == "" {
+				continue
+			}
+
+			// 从params中查找对应的值
+			actualValue, exists := params[paramName]
+			if exists {
+				// 将实际值转换为字符串
+				var newValue string
+				switch v := actualValue.(type) {
+				case string:
+					newValue = v
+				case nil:
+					newValue = ""
+				default:
+					newValue = fmt.Sprintf("%v", v)
+				}
+				// 更新参数
+				t.Params.Store(key, newValue)
+			} else {
+				// 记录未替换的占位符
+				unreplaced = append(unreplaced, paramName)
+			}
+		}
+	}
+
+	if len(unreplaced) > 0 {
+		return fmt.Errorf("Task %s 中以下占位符未找到对应的参数值: %v", t.Name, unreplaced)
+	}
+
+	return nil
 }
