@@ -22,7 +22,7 @@ Icon?
 
 # Go modules/packages
 /vendor/
-/pkg/
+# /pkg/  # 注释掉，因为我们的代码在 pkg/ 目录下
 
 # Editor & tooling
 .idea/
@@ -42,10 +42,13 @@ coverage.html
 # Dependency
 go.sum
 
+# Documentation (excluded from Go module to avoid special character issues in file paths)
+/doc/
+
 # By default, ignore all hidden files and folders except .git
 .*
 !.gitignore
-doc/.DS_Store
 task-engine/server
 task-engine/test/unit/test_repository.db-shm
 tushare-1.4.24.tar.gz
+tmp/

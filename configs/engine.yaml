@@ -1,0 +1,6 @@
+engine:
+  max_concurrency: 100
+  timeout_seconds: 30
+storage:
+  type: "sqlite"
+  dsn: "./data.db"
