@@ -7,13 +7,13 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
 	"github.com/LENAX/task-engine/pkg/core/task"
 	"github.com/LENAX/task-engine/pkg/core/workflow"
 	"github.com/LENAX/task-engine/pkg/storage"
 	"github.com/LENAX/task-engine/pkg/storage/dao"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 )
 
 // WorkflowAggregateRepo Workflow聚合根Repository的MySQL实现（对外导出）
@@ -85,7 +85,7 @@ func (r *WorkflowAggregateRepo) initSchema() error {
 	createWorkflowSQL := `
 	CREATE TABLE IF NOT EXISTS workflow_definition (
 		id VARCHAR(36) PRIMARY KEY,
-		name VARCHAR(255) NOT NULL,
+		name VARCHAR(255) NOT NULL UNIQUE,
 		description TEXT,
 		params TEXT,
 		dependencies TEXT,
@@ -121,6 +121,7 @@ func (r *WorkflowAggregateRepo) initSchema() error {
 		is_template TINYINT(1) DEFAULT 0,
 		create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (workflow_id) REFERENCES workflow_definition(id) ON DELETE CASCADE,
+		UNIQUE KEY uk_task_definition_workflow_name (workflow_id, name),
 		INDEX idx_task_definition_workflow_id (workflow_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`
@@ -231,8 +232,24 @@ func (r *WorkflowAggregateRepo) saveWorkflowInTx(ctx context.Context, tx *sqlx.T
 		return fmt.Errorf("序列化参数失败: %w", err)
 	}
 
+	// 先检查是否存在相同name或id的workflow（幂等性：根据name或id排除重复）
+	var existingID string
+	checkQuery := `SELECT id FROM workflow_definition WHERE name = ? OR id = ? LIMIT 1`
+	if err := tx.GetContext(ctx, &existingID, checkQuery, wf.GetName(), wf.GetID()); err != nil {
+		// 如果不存在，existingID保持为空字符串，将使用新的id插入
+		if err.Error() != "sql: no rows in result set" {
+			return fmt.Errorf("检查Workflow是否存在失败: %w", err)
+		}
+	}
+
+	// 如果找到已存在的记录，使用其id进行更新（幂等性）
+	workflowID := wf.GetID()
+	if existingID != "" {
+		workflowID = existingID
+	}
+
 	workflowDAO := &dao.WorkflowDAO{
-		ID:                    wf.GetID(),
+		ID:                    workflowID,
 		Name:                  wf.GetName(),
 		Description:           wf.Description,
 		Params:                string(paramsJSON),
@@ -262,27 +279,75 @@ func (r *WorkflowAggregateRepo) saveWorkflowInTx(ctx context.Context, tx *sqlx.T
 	 cron_enabled = VALUES(cron_enabled)
 	`
 	if _, err := tx.NamedExecContext(ctx, query, workflowDAO); err != nil {
-		return fmt.Errorf("保存Workflow定义失败: %w", err)
+		// 如果插入失败且是name唯一性约束冲突（并发情况下可能发生），重新查询并更新
+		if errStr := err.Error(); errStr != "" && strings.Contains(errStr, "Duplicate entry") && strings.Contains(errStr, "for key 'name'") {
+			// name冲突，需要先获取该name对应的id
+			var nameConflictID string
+			if err := tx.GetContext(ctx, &nameConflictID, `SELECT id FROM workflow_definition WHERE name = ?`, wf.GetName()); err != nil {
+				return fmt.Errorf("获取name冲突的Workflow ID失败: %w", err)
+			}
+			workflowDAO.ID = nameConflictID
+			// 使用获取到的id重新插入
+			if _, err := tx.NamedExecContext(ctx, query, workflowDAO); err != nil {
+				return fmt.Errorf("保存Workflow定义失败: %w", err)
+			}
+		} else {
+			return fmt.Errorf("保存Workflow定义失败: %w", err)
+		}
 	}
 
 	return nil
 }
 
 func (r *WorkflowAggregateRepo) saveTaskDefinitionInTx(ctx context.Context, tx *sqlx.Tx, workflowID string, t workflow.Task) error {
-	paramsJSON, _ := json.Marshal(t.GetParams())
-	depsJSON, _ := json.Marshal(t.GetDependencies())
+	paramsJSON, err := json.Marshal(t.GetParams())
+	if err != nil {
+		return fmt.Errorf("序列化Task参数失败: %w", err)
+	}
+
+	depsJSON, err := json.Marshal(t.GetDependencies())
+	if err != nil {
+		return fmt.Errorf("序列化Task依赖失败: %w", err)
+	}
 
 	taskObj, ok := t.(*task.Task)
 	if !ok {
 		return fmt.Errorf("Task类型断言失败")
 	}
 
-	requiredParamsJSON, _ := json.Marshal(taskObj.GetRequiredParams())
-	resultMappingJSON, _ := json.Marshal(taskObj.GetResultMapping())
-	statusHandlersJSON, _ := json.Marshal(taskObj.GetStatusHandlers())
+	requiredParamsJSON, err := json.Marshal(taskObj.GetRequiredParams())
+	if err != nil {
+		return fmt.Errorf("序列化必需参数失败: %w", err)
+	}
+
+	resultMappingJSON, err := json.Marshal(taskObj.GetResultMapping())
+	if err != nil {
+		return fmt.Errorf("序列化结果映射失败: %w", err)
+	}
+
+	statusHandlersJSON, err := json.Marshal(taskObj.GetStatusHandlers())
+	if err != nil {
+		return fmt.Errorf("序列化状态处理器失败: %w", err)
+	}
+
+	// 先检查是否存在相同(workflow_id, name)或id的task（幂等性：根据id或(workflow_id, name)排除重复）
+	var existingID string
+	checkQuery := `SELECT id FROM task_definition WHERE (workflow_id = ? AND name = ?) OR id = ? LIMIT 1`
+	if err := tx.GetContext(ctx, &existingID, checkQuery, workflowID, taskObj.GetName(), taskObj.GetID()); err != nil {
+		// 如果不存在，existingID保持为空字符串，将使用新的id插入
+		if err.Error() != "sql: no rows in result set" {
+			return fmt.Errorf("检查Task定义是否存在失败: %w", err)
+		}
+	}
+
+	// 如果找到已存在的记录，使用其id进行更新（幂等性）
+	taskID := taskObj.GetID()
+	if existingID != "" {
+		taskID = existingID
+	}
 
 	taskDefDAO := &dao.TaskDefinitionDAO{
-		ID:                   taskObj.GetID(),
+		ID:                   taskID,
 		WorkflowID:           workflowID,
 		Name:                 taskObj.GetName(),
 		Description:          taskObj.GetDescription(),
@@ -315,7 +380,7 @@ func (r *WorkflowAggregateRepo) saveTaskDefinitionInTx(ctx context.Context, tx *
 	VALUES (:id, :workflow_id, :name, :description, :job_func_id, :job_func_name, :compensation_func_id, :compensation_func_name,
 	 :params, :timeout_seconds, :retry_count, :dependencies, :required_params, :result_mapping, :status_handlers, :is_template, :create_time)
 	ON DUPLICATE KEY UPDATE
-	 name = VALUES(name), description = VALUES(description), job_func_id = VALUES(job_func_id),
+	 workflow_id = VALUES(workflow_id), name = VALUES(name), description = VALUES(description), job_func_id = VALUES(job_func_id),
 	 job_func_name = VALUES(job_func_name), compensation_func_id = VALUES(compensation_func_id),
 	 compensation_func_name = VALUES(compensation_func_name), params = VALUES(params),
 	 timeout_seconds = VALUES(timeout_seconds), retry_count = VALUES(retry_count),
@@ -324,7 +389,21 @@ func (r *WorkflowAggregateRepo) saveTaskDefinitionInTx(ctx context.Context, tx *
 	 is_template = VALUES(is_template)
 	`
 	if _, err := tx.NamedExecContext(ctx, query, taskDefDAO); err != nil {
-		return fmt.Errorf("保存Task定义失败: %w", err)
+		// 如果插入失败且是(workflow_id, name)唯一性约束冲突（并发情况下可能发生），重新查询并更新
+		if errStr := err.Error(); errStr != "" && strings.Contains(errStr, "Duplicate entry") && strings.Contains(errStr, "for key 'uk_task_definition_workflow_name'") {
+			// (workflow_id, name)冲突，需要先获取该记录对应的id
+			var conflictID string
+			if err := tx.GetContext(ctx, &conflictID, `SELECT id FROM task_definition WHERE workflow_id = ? AND name = ?`, workflowID, taskObj.GetName()); err != nil {
+				return fmt.Errorf("获取(workflow_id, name)冲突的Task ID失败: %w", err)
+			}
+			taskDefDAO.ID = conflictID
+			// 使用获取到的id重新插入
+			if _, err := tx.NamedExecContext(ctx, query, taskDefDAO); err != nil {
+				return fmt.Errorf("保存Task定义失败: %w", err)
+			}
+		} else {
+			return fmt.Errorf("保存Task定义失败: %w", err)
+		}
 	}
 
 	return nil

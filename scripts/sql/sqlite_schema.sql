@@ -4,7 +4,7 @@
 -- Workflow定义表
 CREATE TABLE IF NOT EXISTS workflow_definition (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
+    name TEXT NOT NULL UNIQUE,
     description TEXT,
     params TEXT,  -- JSON格式存储参数
     dependencies TEXT,  -- JSON格式存储依赖关系
@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS task_definition (
     status_handlers TEXT,  -- JSON对象，状态处理器映射
     is_template INTEGER DEFAULT 0,
     create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (workflow_id) REFERENCES workflow_definition(id) ON DELETE CASCADE
+    FOREIGN KEY (workflow_id) REFERENCES workflow_definition(id) ON DELETE CASCADE,
+    UNIQUE(workflow_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_task_definition_workflow_id ON task_definition(workflow_id);
 

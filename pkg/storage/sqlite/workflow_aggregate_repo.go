@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/LENAX/task-engine/pkg/core/task"
 	"github.com/LENAX/task-engine/pkg/core/workflow"
 	"github.com/LENAX/task-engine/pkg/storage"
 	"github.com/LENAX/task-engine/pkg/storage/dao"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // WorkflowAggregateRepo Workflow聚合根Repository的SQLite实现（对外导出）
@@ -84,7 +84,7 @@ func (r *WorkflowAggregateRepo) initSchema() error {
 	createWorkflowSQL := `
 	CREATE TABLE IF NOT EXISTS workflow_definition (
 		id TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
+		name TEXT NOT NULL UNIQUE,
 		description TEXT,
 		params TEXT,
 		dependencies TEXT,
@@ -119,7 +119,8 @@ func (r *WorkflowAggregateRepo) initSchema() error {
 		status_handlers TEXT,
 		is_template INTEGER DEFAULT 0,
 		create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		FOREIGN KEY (workflow_id) REFERENCES workflow_definition(id) ON DELETE CASCADE
+		FOREIGN KEY (workflow_id) REFERENCES workflow_definition(id) ON DELETE CASCADE,
+		UNIQUE(workflow_id, name)
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_definition_workflow_id ON task_definition(workflow_id);
 	`
@@ -247,15 +248,59 @@ func (r *WorkflowAggregateRepo) saveWorkflowInTx(ctx context.Context, tx *sqlx.T
 		CronEnabled:           wf.IsCronEnabled(),
 	}
 
+	// 先检查是否存在相同name或id的workflow（幂等性：根据name或id排除重复）
+	var existingID string
+	checkQuery := `SELECT id FROM workflow_definition WHERE name = ? OR id = ? LIMIT 1`
+	if err := tx.GetContext(ctx, &existingID, checkQuery, wf.GetName(), wf.GetID()); err != nil {
+		// 如果不存在，existingID保持为空字符串，将使用新的id插入
+		if err.Error() != "sql: no rows in result set" {
+			return fmt.Errorf("检查Workflow是否存在失败: %w", err)
+		}
+	}
+
+	// 如果找到已存在的记录，使用其id进行更新（幂等性）
+	if existingID != "" {
+		workflowDAO.ID = existingID
+	}
+
+	// 使用ON CONFLICT处理id和name的唯一性约束
+	// 如果id冲突，更新记录；如果name冲突（但id不同），也会通过先查询找到existingID并更新
 	query := `
-	INSERT OR REPLACE INTO workflow_definition 
+	INSERT INTO workflow_definition 
 	(id, name, description, params, dependencies, create_time, status, sub_task_error_tolerance, 
 	 transactional, transaction_mode, max_concurrent_task, cron_expr, cron_enabled)
 	VALUES (:id, :name, :description, :params, :dependencies, :create_time, :status, :sub_task_error_tolerance,
 	 :transactional, :transaction_mode, :max_concurrent_task, :cron_expr, :cron_enabled)
+	ON CONFLICT(id) DO UPDATE SET
+		name = excluded.name,
+		description = excluded.description,
+		params = excluded.params,
+		dependencies = excluded.dependencies,
+		status = excluded.status,
+		sub_task_error_tolerance = excluded.sub_task_error_tolerance,
+		transactional = excluded.transactional,
+		transaction_mode = excluded.transaction_mode,
+		max_concurrent_task = excluded.max_concurrent_task,
+		cron_expr = excluded.cron_expr,
+		cron_enabled = excluded.cron_enabled
 	`
 	if _, err := tx.NamedExecContext(ctx, query, workflowDAO); err != nil {
-		return fmt.Errorf("保存Workflow定义失败: %w", err)
+		// 如果插入失败且是name唯一性约束冲突（并发情况下可能发生），重新查询并更新
+		if errStr := err.Error(); errStr != "" && (errStr == "UNIQUE constraint failed: workflow_definition.name" ||
+			errStr == "UNIQUE constraint failed: workflow_definition.name (19)") {
+			// name冲突，需要先获取该name对应的id
+			var nameConflictID string
+			if err := tx.GetContext(ctx, &nameConflictID, `SELECT id FROM workflow_definition WHERE name = ?`, wf.GetName()); err != nil {
+				return fmt.Errorf("获取name冲突的Workflow ID失败: %w", err)
+			}
+			workflowDAO.ID = nameConflictID
+			// 使用获取到的id重新插入
+			if _, err := tx.NamedExecContext(ctx, query, workflowDAO); err != nil {
+				return fmt.Errorf("保存Workflow定义失败: %w", err)
+			}
+		} else {
+			return fmt.Errorf("保存Workflow定义失败: %w", err)
+		}
 	}
 
 	return nil
@@ -320,15 +365,62 @@ func (r *WorkflowAggregateRepo) saveTaskDefinitionInTx(ctx context.Context, tx *
 		taskDefDAO.CompensationFuncID.String = taskObj.GetCompensationFuncID()
 	}
 
+	// 先检查是否存在相同(workflow_id, name)或id的task（幂等性：根据id或(workflow_id, name)排除重复）
+	var existingID string
+	checkQuery := `SELECT id FROM task_definition WHERE (workflow_id = ? AND name = ?) OR id = ? LIMIT 1`
+	if err := tx.GetContext(ctx, &existingID, checkQuery, workflowID, taskObj.GetName(), taskObj.GetID()); err != nil {
+		// 如果不存在，existingID保持为空字符串，将使用新的id插入
+		if err.Error() != "sql: no rows in result set" {
+			return fmt.Errorf("检查Task定义是否存在失败: %w", err)
+		}
+	}
+
+	// 如果找到已存在的记录，使用其id进行更新（幂等性）
+	if existingID != "" {
+		taskDefDAO.ID = existingID
+	}
+
+	// 使用ON CONFLICT处理id和(workflow_id, name)的唯一性约束
 	query := `
-	INSERT OR REPLACE INTO task_definition
+	INSERT INTO task_definition
 	(id, workflow_id, name, description, job_func_id, job_func_name, compensation_func_id, compensation_func_name,
 	 params, timeout_seconds, retry_count, dependencies, required_params, result_mapping, status_handlers, is_template, create_time)
 	VALUES (:id, :workflow_id, :name, :description, :job_func_id, :job_func_name, :compensation_func_id, :compensation_func_name,
 	 :params, :timeout_seconds, :retry_count, :dependencies, :required_params, :result_mapping, :status_handlers, :is_template, :create_time)
+	ON CONFLICT(id) DO UPDATE SET
+		workflow_id = excluded.workflow_id,
+		name = excluded.name,
+		description = excluded.description,
+		job_func_id = excluded.job_func_id,
+		job_func_name = excluded.job_func_name,
+		compensation_func_id = excluded.compensation_func_id,
+		compensation_func_name = excluded.compensation_func_name,
+		params = excluded.params,
+		timeout_seconds = excluded.timeout_seconds,
+		retry_count = excluded.retry_count,
+		dependencies = excluded.dependencies,
+		required_params = excluded.required_params,
+		result_mapping = excluded.result_mapping,
+		status_handlers = excluded.status_handlers,
+		is_template = excluded.is_template
 	`
 	if _, err := tx.NamedExecContext(ctx, query, taskDefDAO); err != nil {
-		return fmt.Errorf("保存Task定义失败: %w", err)
+		// 如果插入失败且是(workflow_id, name)唯一性约束冲突（并发情况下可能发生），重新查询并更新
+		if errStr := err.Error(); errStr != "" && (errStr == "UNIQUE constraint failed: task_definition.workflow_id, task_definition.name" ||
+			errStr == "UNIQUE constraint failed: task_definition.workflow_id, task_definition.name (19)") {
+			// (workflow_id, name)冲突，需要先获取该记录对应的id
+			var conflictID string
+			if err := tx.GetContext(ctx, &conflictID, `SELECT id FROM task_definition WHERE workflow_id = ? AND name = ?`, workflowID, taskObj.GetName()); err != nil {
+				return fmt.Errorf("获取(workflow_id, name)冲突的Task ID失败: %w", err)
+			}
+			taskDefDAO.ID = conflictID
+			// 使用获取到的id重新插入
+			if _, err := tx.NamedExecContext(ctx, query, taskDefDAO); err != nil {
+				return fmt.Errorf("保存Task定义失败: %w", err)
+			}
+		} else {
+			return fmt.Errorf("保存Task定义失败: %w", err)
+		}
 	}
 
 	return nil
