@@ -308,9 +308,10 @@ func (r *WorkflowAggregateRepo) saveTaskDefinitionInTx(ctx context.Context, tx *
 		return fmt.Errorf("序列化状态处理器失败: %w", err)
 	}
 
-	// 先检查是否存在相同(workflow_id, name)或id的task（幂等性：根据id或(workflow_id, name)排除重复）
+	// 先检查是否存在相同name的task（幂等性：优先根据name排除重复，防止重复插入）
+	// 优先检查(workflow_id, name)组合，如果不存在再检查id
 	var existingID string
-	checkQuery := `SELECT id FROM task_definition WHERE (workflow_id = $1 AND name = $2) OR id = $3 LIMIT 1`
+	checkQuery := `SELECT id FROM task_definition WHERE (workflow_id = $1 AND name = $2) OR id = $3 ORDER BY CASE WHEN workflow_id = $1 AND name = $2 THEN 1 ELSE 2 END LIMIT 1`
 	if err := tx.GetContext(ctx, &existingID, checkQuery, workflowID, taskObj.GetName(), taskObj.GetID()); err != nil {
 		// 如果不存在，existingID保持为空字符串，将使用新的id插入
 		if err.Error() != "sql: no rows in result set" {

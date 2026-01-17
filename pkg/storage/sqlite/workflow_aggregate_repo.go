@@ -365,10 +365,11 @@ func (r *WorkflowAggregateRepo) saveTaskDefinitionInTx(ctx context.Context, tx *
 		taskDefDAO.CompensationFuncID.String = taskObj.GetCompensationFuncID()
 	}
 
-	// 先检查是否存在相同(workflow_id, name)或id的task（幂等性：根据id或(workflow_id, name)排除重复）
+	// 先检查是否存在相同name的task（幂等性：优先根据name排除重复，防止重复插入）
+	// 优先检查(workflow_id, name)组合，如果不存在再检查id
 	var existingID string
-	checkQuery := `SELECT id FROM task_definition WHERE (workflow_id = ? AND name = ?) OR id = ? LIMIT 1`
-	if err := tx.GetContext(ctx, &existingID, checkQuery, workflowID, taskObj.GetName(), taskObj.GetID()); err != nil {
+	checkQuery := `SELECT id FROM task_definition WHERE (workflow_id = ? AND name = ?) OR id = ? ORDER BY CASE WHEN workflow_id = ? AND name = ? THEN 1 ELSE 2 END LIMIT 1`
+	if err := tx.GetContext(ctx, &existingID, checkQuery, workflowID, taskObj.GetName(), taskObj.GetID(), workflowID, taskObj.GetName()); err != nil {
 		// 如果不存在，existingID保持为空字符串，将使用新的id插入
 		if err.Error() != "sql: no rows in result set" {
 			return fmt.Errorf("检查Task定义是否存在失败: %w", err)
