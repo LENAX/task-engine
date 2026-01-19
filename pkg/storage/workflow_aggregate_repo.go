@@ -90,6 +90,44 @@ type WorkflowAggregateRepository interface {
 
 	// GetTaskInstancesByWorkflowInstance 根据WorkflowInstance ID获取所有TaskInstance
 	GetTaskInstancesByWorkflowInstance(ctx context.Context, instanceID string) ([]*TaskInstance, error)
+
+	// ========== 函数元数据管理操作 ==========
+
+	// SaveJobFunctionMeta 保存Job函数元数据（幂等）
+	// 如果函数元数据已存在则更新，不存在则创建
+	SaveJobFunctionMeta(ctx context.Context, meta *JobFunctionMeta) error
+
+	// GetJobFunctionMetaByID 根据ID获取Job函数元数据
+	// 如果不存在返回 nil, nil
+	GetJobFunctionMetaByID(ctx context.Context, id string) (*JobFunctionMeta, error)
+
+	// GetJobFunctionMetaByName 根据名称获取Job函数元数据
+	// 如果不存在返回 nil, nil
+	GetJobFunctionMetaByName(ctx context.Context, name string) (*JobFunctionMeta, error)
+
+	// SaveTaskHandlerMeta 保存Task Handler元数据（幂等）
+	// 如果Handler元数据已存在则更新，不存在则创建
+	SaveTaskHandlerMeta(ctx context.Context, meta *TaskHandlerMeta) error
+
+	// GetTaskHandlerMetaByID 根据ID获取Task Handler元数据
+	// 如果不存在返回 nil, nil
+	GetTaskHandlerMetaByID(ctx context.Context, id string) (*TaskHandlerMeta, error)
+
+	// GetTaskHandlerMetaByName 根据名称获取Task Handler元数据
+	// 如果不存在返回 nil, nil
+	GetTaskHandlerMetaByName(ctx context.Context, name string) (*TaskHandlerMeta, error)
+
+	// SaveCompensationFunctionMeta 保存补偿函数元数据（幂等）
+	// 如果函数元数据已存在则更新，不存在则创建
+	SaveCompensationFunctionMeta(ctx context.Context, meta *CompensationFunctionMeta) error
+
+	// GetCompensationFunctionMetaByID 根据ID获取补偿函数元数据
+	// 如果不存在返回 nil, nil
+	GetCompensationFunctionMetaByID(ctx context.Context, id string) (*CompensationFunctionMeta, error)
+
+	// GetCompensationFunctionMetaByName 根据名称获取补偿函数元数据
+	// 如果不存在返回 nil, nil
+	GetCompensationFunctionMetaByName(ctx context.Context, name string) (*CompensationFunctionMeta, error)
 }
 
 // TaskDefinition Task定义结构（对外导出）

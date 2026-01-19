@@ -155,7 +155,54 @@ func (r *WorkflowAggregateRepo) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_task_instance_status ON task_instance(status);
 	`
 
-	for _, sql := range []string{createWorkflowSQL, createTaskDefSQL, createInstanceSQL, createTaskInstSQL} {
+	// Job函数元数据表
+	createJobFunctionMetaSQL := `
+	CREATE TABLE IF NOT EXISTS job_function_meta (
+		id VARCHAR(36) PRIMARY KEY,
+		name VARCHAR(255) NOT NULL UNIQUE,
+		description TEXT,
+		code_path TEXT,
+		hash VARCHAR(255),
+		param_types TEXT,
+		create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_job_function_meta_name ON job_function_meta(name);
+	`
+
+	// Task Handler元数据表
+	createTaskHandlerMetaSQL := `
+	CREATE TABLE IF NOT EXISTS task_handler_meta (
+		id VARCHAR(36) PRIMARY KEY,
+		name VARCHAR(255) NOT NULL UNIQUE,
+		description TEXT,
+		create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_task_handler_meta_name ON task_handler_meta(name);
+	`
+
+	// 补偿函数元数据表
+	createCompensationFunctionMetaSQL := `
+	CREATE TABLE IF NOT EXISTS compensation_function_meta (
+		id VARCHAR(36) PRIMARY KEY,
+		name VARCHAR(255) NOT NULL UNIQUE,
+		description TEXT,
+		create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_compensation_function_meta_name ON compensation_function_meta(name);
+	`
+
+	for _, sql := range []string{
+		createWorkflowSQL,
+		createTaskDefSQL,
+		createInstanceSQL,
+		createTaskInstSQL,
+		createJobFunctionMetaSQL,
+		createTaskHandlerMetaSQL,
+		createCompensationFunctionMetaSQL,
+	} {
 		if _, err := r.db.Exec(sql); err != nil {
 			// PostgreSQL会报错如果表/索引已存在，忽略这些错误
 			if !strings.Contains(err.Error(), "already exists") {
@@ -177,15 +224,23 @@ func (r *WorkflowAggregateRepo) SaveWorkflow(ctx context.Context, wf *workflow.W
 	}
 	defer tx.Rollback()
 
+	// 1. 提取并保存所有函数元数据
+	if err := r.extractAndSaveFunctionMetasInTx(ctx, tx, wf); err != nil {
+		return err
+	}
+
+	// 2. 保存Workflow定义
 	if err := r.saveWorkflowInTx(ctx, tx, wf); err != nil {
 		return err
 	}
 
+	// 3. 删除旧的Task定义
 	deleteTaskDefSQL := `DELETE FROM task_definition WHERE workflow_id = $1`
 	if _, err := tx.ExecContext(ctx, deleteTaskDefSQL, wf.GetID()); err != nil {
 		return fmt.Errorf("删除旧Task定义失败: %w", err)
 	}
 
+	// 4. 保存新的Task定义
 	tasks := wf.GetTasks()
 	for _, t := range tasks {
 		if err := r.saveTaskDefinitionInTx(ctx, tx, wf.GetID(), t); err != nil {
@@ -955,6 +1010,425 @@ func (r *WorkflowAggregateRepo) DeleteTaskInstance(ctx context.Context, taskID s
 		return fmt.Errorf("删除TaskInstance失败: %w", err)
 	}
 	return nil
+}
+
+// ========== 函数元数据管理操作 ==========
+
+// extractAndSaveFunctionMetasInTx 在事务中提取并保存所有函数元数据
+func (r *WorkflowAggregateRepo) extractAndSaveFunctionMetasInTx(ctx context.Context, tx *sqlx.Tx, wf *workflow.Workflow) error {
+	// 收集所有函数元数据
+	jobFuncs := make(map[string]*storage.JobFunctionMeta)
+	compensationFuncs := make(map[string]*storage.CompensationFunctionMeta)
+	taskHandlers := make(map[string]*storage.TaskHandlerMeta)
+
+	// 遍历所有Task，提取函数元数据
+	tasks := wf.GetTasks()
+	for _, t := range tasks {
+		taskObj, ok := t.(*task.Task)
+		if !ok {
+			continue
+		}
+
+		// 提取 Job function
+		if taskObj.GetJobFuncName() != "" {
+			jobFuncs[taskObj.GetJobFuncName()] = &storage.JobFunctionMeta{
+				ID:          taskObj.GetJobFuncID(),
+				Name:        taskObj.GetJobFuncName(),
+				Description: "", // Task中没有函数描述，使用空字符串
+			}
+		}
+
+		// 提取 Compensation function
+		if taskObj.GetCompensationFuncName() != "" {
+			compensationFuncs[taskObj.GetCompensationFuncName()] = &storage.CompensationFunctionMeta{
+				ID:          taskObj.GetCompensationFuncID(),
+				Name:        taskObj.GetCompensationFuncName(),
+				Description: "", // Task中没有函数描述，使用空字符串
+			}
+		}
+
+		// 提取 Task handlers
+		statusHandlers := taskObj.GetStatusHandlers()
+		for _, handlers := range statusHandlers {
+			for _, handlerName := range handlers {
+				if handlerName != "" {
+					taskHandlers[handlerName] = &storage.TaskHandlerMeta{
+						Name:        handlerName,
+						Description: "", // Task中没有handler描述，使用空字符串
+					}
+				}
+			}
+		}
+	}
+
+	// 在事务中保存所有Job function元数据
+	for _, meta := range jobFuncs {
+		if err := r.saveJobFunctionMetaInTx(ctx, tx, meta); err != nil {
+			return fmt.Errorf("保存Job函数元数据失败: %w", err)
+		}
+	}
+
+	// 在事务中保存所有Compensation function元数据
+	for _, meta := range compensationFuncs {
+		if err := r.saveCompensationFunctionMetaInTx(ctx, tx, meta); err != nil {
+			return fmt.Errorf("保存补偿函数元数据失败: %w", err)
+		}
+	}
+
+	// 在事务中保存所有Task handler元数据
+	for _, meta := range taskHandlers {
+		if err := r.saveTaskHandlerMetaInTx(ctx, tx, meta); err != nil {
+			return fmt.Errorf("保存Task Handler元数据失败: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// saveJobFunctionMetaInTx 在事务中保存Job函数元数据（幂等）
+func (r *WorkflowAggregateRepo) saveJobFunctionMetaInTx(ctx context.Context, tx *sqlx.Tx, meta *storage.JobFunctionMeta) error {
+	// 如果ID为空，生成新ID
+	if meta.ID == "" {
+		meta.ID = uuid.NewString()
+	}
+
+	// 设置时间戳
+	now := time.Now()
+	if meta.CreateTime.IsZero() {
+		meta.CreateTime = now
+	}
+	meta.UpdateTime = now
+
+	// 构建DAO对象
+	jobFuncDAO := &dao.JobFunctionDAO{
+		ID:          meta.ID,
+		Name:        meta.Name,
+		Description: meta.Description,
+		CreateTime:  meta.CreateTime,
+		UpdateTime:  meta.UpdateTime,
+		// CodePath, Hash, ParamTypes 暂时为空
+		CodePath:   "",
+		Hash:       "",
+		ParamTypes: "",
+	}
+
+	// 使用 INSERT ... ON CONFLICT 实现幂等性
+	query := `
+	INSERT INTO job_function_meta 
+	(id, name, description, code_path, hash, param_types, create_time, update_time)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	ON CONFLICT (name) DO UPDATE SET
+		description = EXCLUDED.description,
+		code_path = EXCLUDED.code_path,
+		hash = EXCLUDED.hash,
+		param_types = EXCLUDED.param_types,
+		update_time = EXCLUDED.update_time
+	`
+	if _, err := tx.ExecContext(ctx, query,
+		jobFuncDAO.ID,
+		jobFuncDAO.Name,
+		jobFuncDAO.Description,
+		jobFuncDAO.CodePath,
+		jobFuncDAO.Hash,
+		jobFuncDAO.ParamTypes,
+		jobFuncDAO.CreateTime,
+		jobFuncDAO.UpdateTime,
+	); err != nil {
+		return fmt.Errorf("保存JobFunctionMeta失败: %w", err)
+	}
+
+	return nil
+}
+
+// SaveJobFunctionMeta 保存Job函数元数据（幂等）
+func (r *WorkflowAggregateRepo) SaveJobFunctionMeta(ctx context.Context, meta *storage.JobFunctionMeta) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := r.saveJobFunctionMetaInTx(ctx, tx, meta); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	return nil
+}
+
+// GetJobFunctionMetaByID 根据ID获取Job函数元数据
+func (r *WorkflowAggregateRepo) GetJobFunctionMetaByID(ctx context.Context, id string) (*storage.JobFunctionMeta, error) {
+	var dao dao.JobFunctionDAO
+	query := `SELECT id, name, description, code_path, hash, param_types, create_time, update_time 
+	          FROM job_function_meta WHERE id = $1`
+	err := r.db.GetContext(ctx, &dao, query, id)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询JobFunctionMeta失败: %w", err)
+	}
+
+	meta := &storage.JobFunctionMeta{
+		ID:          dao.ID,
+		Name:        dao.Name,
+		Description: dao.Description,
+		CreateTime:  dao.CreateTime,
+		UpdateTime:  dao.UpdateTime,
+	}
+
+	return meta, nil
+}
+
+// GetJobFunctionMetaByName 根据名称获取Job函数元数据
+func (r *WorkflowAggregateRepo) GetJobFunctionMetaByName(ctx context.Context, name string) (*storage.JobFunctionMeta, error) {
+	var dao dao.JobFunctionDAO
+	query := `SELECT id, name, description, code_path, hash, param_types, create_time, update_time 
+	          FROM job_function_meta WHERE name = $1`
+	err := r.db.GetContext(ctx, &dao, query, name)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询JobFunctionMeta失败: %w", err)
+	}
+
+	meta := &storage.JobFunctionMeta{
+		ID:          dao.ID,
+		Name:        dao.Name,
+		Description: dao.Description,
+		CreateTime:  dao.CreateTime,
+		UpdateTime:  dao.UpdateTime,
+	}
+
+	return meta, nil
+}
+
+// saveTaskHandlerMetaInTx 在事务中保存Task Handler元数据（幂等）
+func (r *WorkflowAggregateRepo) saveTaskHandlerMetaInTx(ctx context.Context, tx *sqlx.Tx, meta *storage.TaskHandlerMeta) error {
+	// 如果ID为空，生成新ID
+	if meta.ID == "" {
+		meta.ID = uuid.NewString()
+	}
+
+	// 设置时间戳
+	now := time.Now()
+	if meta.CreateTime.IsZero() {
+		meta.CreateTime = now
+	}
+	meta.UpdateTime = now
+
+	// 构建DAO对象
+	taskHandlerDAO := &dao.TaskHandlerDAO{
+		ID:          meta.ID,
+		Name:        meta.Name,
+		Description: meta.Description,
+		CreateTime:  meta.CreateTime,
+		UpdateTime:  meta.UpdateTime,
+	}
+
+	// 使用 INSERT ... ON CONFLICT 实现幂等性
+	query := `
+	INSERT INTO task_handler_meta 
+	(id, name, description, create_time, update_time)
+	VALUES ($1, $2, $3, $4, $5)
+	ON CONFLICT (name) DO UPDATE SET
+		description = EXCLUDED.description,
+		update_time = EXCLUDED.update_time
+	`
+	if _, err := tx.ExecContext(ctx, query,
+		taskHandlerDAO.ID,
+		taskHandlerDAO.Name,
+		taskHandlerDAO.Description,
+		taskHandlerDAO.CreateTime,
+		taskHandlerDAO.UpdateTime,
+	); err != nil {
+		return fmt.Errorf("保存TaskHandlerMeta失败: %w", err)
+	}
+
+	return nil
+}
+
+// SaveTaskHandlerMeta 保存Task Handler元数据（幂等）
+func (r *WorkflowAggregateRepo) SaveTaskHandlerMeta(ctx context.Context, meta *storage.TaskHandlerMeta) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := r.saveTaskHandlerMetaInTx(ctx, tx, meta); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	return nil
+}
+
+// GetTaskHandlerMetaByID 根据ID获取Task Handler元数据
+func (r *WorkflowAggregateRepo) GetTaskHandlerMetaByID(ctx context.Context, id string) (*storage.TaskHandlerMeta, error) {
+	var dao dao.TaskHandlerDAO
+	query := `SELECT id, name, description, create_time, update_time 
+	          FROM task_handler_meta WHERE id = $1`
+	err := r.db.GetContext(ctx, &dao, query, id)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询TaskHandlerMeta失败: %w", err)
+	}
+
+	meta := &storage.TaskHandlerMeta{
+		ID:          dao.ID,
+		Name:        dao.Name,
+		Description: dao.Description,
+		CreateTime:  dao.CreateTime,
+		UpdateTime:  dao.UpdateTime,
+	}
+
+	return meta, nil
+}
+
+// GetTaskHandlerMetaByName 根据名称获取Task Handler元数据
+func (r *WorkflowAggregateRepo) GetTaskHandlerMetaByName(ctx context.Context, name string) (*storage.TaskHandlerMeta, error) {
+	var dao dao.TaskHandlerDAO
+	query := `SELECT id, name, description, create_time, update_time 
+	          FROM task_handler_meta WHERE name = $1`
+	err := r.db.GetContext(ctx, &dao, query, name)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询TaskHandlerMeta失败: %w", err)
+	}
+
+	meta := &storage.TaskHandlerMeta{
+		ID:          dao.ID,
+		Name:        dao.Name,
+		Description: dao.Description,
+		CreateTime:  dao.CreateTime,
+		UpdateTime:  dao.UpdateTime,
+	}
+
+	return meta, nil
+}
+
+// saveCompensationFunctionMetaInTx 在事务中保存补偿函数元数据（幂等）
+func (r *WorkflowAggregateRepo) saveCompensationFunctionMetaInTx(ctx context.Context, tx *sqlx.Tx, meta *storage.CompensationFunctionMeta) error {
+	// 如果ID为空，生成新ID
+	if meta.ID == "" {
+		meta.ID = uuid.NewString()
+	}
+
+	// 设置时间戳
+	now := time.Now()
+	if meta.CreateTime.IsZero() {
+		meta.CreateTime = now
+	}
+	meta.UpdateTime = now
+
+	// 构建DAO对象
+	compensationFuncDAO := &dao.CompensationFunctionDAO{
+		ID:          meta.ID,
+		Name:        meta.Name,
+		Description: meta.Description,
+		CreateTime:  meta.CreateTime,
+		UpdateTime:  meta.UpdateTime,
+	}
+
+	// 使用 INSERT ... ON CONFLICT 实现幂等性
+	query := `
+	INSERT INTO compensation_function_meta 
+	(id, name, description, create_time, update_time)
+	VALUES ($1, $2, $3, $4, $5)
+	ON CONFLICT (name) DO UPDATE SET
+		description = EXCLUDED.description,
+		update_time = EXCLUDED.update_time
+	`
+	if _, err := tx.ExecContext(ctx, query,
+		compensationFuncDAO.ID,
+		compensationFuncDAO.Name,
+		compensationFuncDAO.Description,
+		compensationFuncDAO.CreateTime,
+		compensationFuncDAO.UpdateTime,
+	); err != nil {
+		return fmt.Errorf("保存CompensationFunctionMeta失败: %w", err)
+	}
+
+	return nil
+}
+
+// SaveCompensationFunctionMeta 保存补偿函数元数据（幂等）
+func (r *WorkflowAggregateRepo) SaveCompensationFunctionMeta(ctx context.Context, meta *storage.CompensationFunctionMeta) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := r.saveCompensationFunctionMetaInTx(ctx, tx, meta); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	return nil
+}
+
+// GetCompensationFunctionMetaByID 根据ID获取补偿函数元数据
+func (r *WorkflowAggregateRepo) GetCompensationFunctionMetaByID(ctx context.Context, id string) (*storage.CompensationFunctionMeta, error) {
+	var dao dao.CompensationFunctionDAO
+	query := `SELECT id, name, description, create_time, update_time 
+	          FROM compensation_function_meta WHERE id = $1`
+	err := r.db.GetContext(ctx, &dao, query, id)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询CompensationFunctionMeta失败: %w", err)
+	}
+
+	meta := &storage.CompensationFunctionMeta{
+		ID:          dao.ID,
+		Name:        dao.Name,
+		Description: dao.Description,
+		CreateTime:  dao.CreateTime,
+		UpdateTime:  dao.UpdateTime,
+	}
+
+	return meta, nil
+}
+
+// GetCompensationFunctionMetaByName 根据名称获取补偿函数元数据
+func (r *WorkflowAggregateRepo) GetCompensationFunctionMetaByName(ctx context.Context, name string) (*storage.CompensationFunctionMeta, error) {
+	var dao dao.CompensationFunctionDAO
+	query := `SELECT id, name, description, create_time, update_time 
+	          FROM compensation_function_meta WHERE name = $1`
+	err := r.db.GetContext(ctx, &dao, query, name)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询CompensationFunctionMeta失败: %w", err)
+	}
+
+	meta := &storage.CompensationFunctionMeta{
+		ID:          dao.ID,
+		Name:        dao.Name,
+		Description: dao.Description,
+		CreateTime:  dao.CreateTime,
+		UpdateTime:  dao.UpdateTime,
+	}
+
+	return meta, nil
 }
 
 // 确保实现接口
