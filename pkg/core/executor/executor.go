@@ -451,6 +451,14 @@ func (e *executorImpl) executeTask(pendingTask *PendingTask, domainPool *domainP
 		paramsMap,
 	)
 
+	// 设置引擎组件引用（用于 Job Function 访问引擎能力）
+	if e.registry != nil {
+		taskCtx.SetRegistry(e.registry)
+	}
+	if pendingTask.InstanceManager != nil {
+		taskCtx.SetInstanceManager(pendingTask.InstanceManager)
+	}
+
 	// 执行Job函数
 	log.Printf("📞 [调用函数] TaskID=%s, TaskName=%s, JobFuncName=%s, 开始执行...", t.GetID(), t.GetName(), t.GetJobFuncName())
 	stateCh := jobFunc(taskCtx)
