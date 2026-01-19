@@ -49,6 +49,25 @@ type AtomicAddSubTasksEvent struct {
 	Timestamp time.Time       // 事件时间戳
 }
 
+// SubTaskTracker 子任务跟踪器（用于结果聚合）
+type SubTaskTracker struct {
+	SubTaskIDs     []string   // 子任务 ID 列表
+	CompletedCount int32      // 已完成数量（atomic）
+	FailedCount    int32      // 失败数量（atomic）
+	TotalCount     int32      // 总数量
+	Results        sync.Map   // subTaskID -> SubTaskResult
+	mu             sync.Mutex // 保护 SubTaskIDs 的并发访问
+}
+
+// SubTaskResult 子任务结果
+type SubTaskResult struct {
+	TaskID   string      // 子任务 ID
+	TaskName string      // 子任务名称
+	Status   string      // 状态：Success, Failed
+	Result   interface{} // 结果数据
+	Error    string      // 错误信息（失败时）
+}
+
 // LeveledTaskQueue 二维任务队列（按拓扑层级组织，使用 map[string]Task）
 type LeveledTaskQueue struct {
 	queues        []map[string]workflow.Task // []map[string]Task，每个层级一个 map
@@ -316,6 +335,9 @@ type WorkflowInstanceManagerV2 struct {
 
 	// 运行时任务存储（动态添加的子任务，不存储在 workflow 中）
 	runtimeTasks sync.Map // taskID -> workflow.Task（子任务存储）
+
+	// 子任务跟踪器（用于结果聚合，parentTaskID -> *SubTaskTracker）
+	subTaskTracker sync.Map
 
 	// 新增：队列结构
 	taskQueue          *LeveledTaskQueue
@@ -1023,6 +1045,11 @@ func (m *WorkflowInstanceManagerV2) handleTaskSuccess(event TaskStatusEvent) {
 		}
 	}
 
+	// 如果是子任务，处理子任务完成逻辑（记录结果，触发聚合）
+	if event.IsSubTask {
+		m.handleSubTaskCompletion(event)
+	}
+
 	// 如果是模板任务，检查并批量添加等待中的子任务
 	// 这是新设计中的关键步骤：模板任务的 Job Function 执行完毕后，触发等待中的子任务添加
 	if event.IsTemplate {
@@ -1173,6 +1200,11 @@ func (m *WorkflowInstanceManagerV2) handleTaskFailure(event TaskStatusEvent) {
 		// 执行 Task 的 Failed 状态 Handler（重要：达到最大重试次数时也需要触发）
 		m.executeTaskFailedHandler(event.TaskID, task, errorMsg)
 
+		// 如果是子任务，处理子任务失败逻辑（记录结果，触发聚合）
+		if event.IsSubTask {
+			m.handleSubTaskFailure(event)
+		}
+
 		// 注意：任务失败计数已通过taskStatsChan在processBatch中更新，这里不需要再计数
 	}
 }
@@ -1214,7 +1246,13 @@ func (m *WorkflowInstanceManagerV2) canAdvanceLevel() bool {
 		return false
 	}
 
-	// 3. 检查是否有下一层级
+	// 3. 检查当前层级的所有模板任务的子任务是否都已完成
+	if !m.allSubTasksCompleted(currentLevel) {
+		log.Printf("调试: canAdvanceLevel=false，currentLevel=%d，子任务未全部完成", currentLevel)
+		return false
+	}
+
+	// 4. 检查是否有下一层级
 	if currentLevel >= m.taskQueue.GetMaxLevel() {
 		return false
 	}
@@ -1554,18 +1592,29 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			task.SetJobFuncID(m.registry.GetIDByName(task.GetJobFuncName()))
 		}
 
+		// 创建 InstanceManager 接口包装器（用于模板任务在 Job Function 中添加子任务）
+		managerInterface := &InstanceManagerInterfaceV2{
+			manager: m,
+		}
+
+		// 同时注入到 registry（保持向后兼容）
+		if m.registry != nil {
+			_ = m.registry.RegisterDependencyWithKey("InstanceManager", managerInterface)
+		}
+
 		// 确保状态为Pending
 		task.SetStatus("PENDING")
 
-		// 创建 executor.PendingTask
+		// 创建 executor.PendingTask（通过 InstanceManager 字段直接传递引用）
 		pendingTask := &executor.PendingTask{
-			Task:       task,
-			WorkflowID: m.instance.WorkflowID,
-			InstanceID: m.instance.ID,
-			Domain:     "",
-			MaxRetries: 0,
-			OnComplete: m.createTaskCompleteHandler(taskID),
-			OnError:    m.createTaskErrorHandler(taskID),
+			Task:            task,
+			WorkflowID:      m.instance.WorkflowID,
+			InstanceID:      m.instance.ID,
+			Domain:          "",
+			MaxRetries:      0,
+			OnComplete:      m.createTaskCompleteHandler(taskID),
+			OnError:         m.createTaskErrorHandler(taskID),
+			InstanceManager: managerInterface,
 		}
 
 		// 提交到Executor
@@ -1710,9 +1759,14 @@ func (m *WorkflowInstanceManagerV2) injectCachedResults(t workflow.Task, taskID 
 
 		upstreamResult, ok := cachedResult.(map[string]interface{})
 		if !ok {
-			cacheKey := fmt.Sprintf("_cached_%s", depTaskID)
-			if _, exists := t.GetParam(cacheKey); !exists {
-				t.SetParam(cacheKey, cachedResult)
+			// 同时使用 taskID 和 taskName 作为 key（保持向后兼容，同时支持按名称访问）
+			cacheKeyByID := fmt.Sprintf("_cached_%s", depTaskID)
+			cacheKeyByName := fmt.Sprintf("_cached_%s", depName)
+			if _, exists := t.GetParam(cacheKeyByID); !exists {
+				t.SetParam(cacheKeyByID, cachedResult)
+			}
+			if _, exists := t.GetParam(cacheKeyByName); !exists {
+				t.SetParam(cacheKeyByName, cachedResult)
 			}
 			continue
 		}
@@ -1742,9 +1796,14 @@ func (m *WorkflowInstanceManagerV2) injectCachedResults(t workflow.Task, taskID 
 				}
 			}
 
-			cacheKey := fmt.Sprintf("_cached_%s", depTaskID)
-			if _, exists := t.GetParam(cacheKey); !exists {
-				t.SetParam(cacheKey, cachedResult)
+			// 同时使用 taskID 和 taskName 作为 key（保持向后兼容，同时支持按名称访问）
+			cacheKeyByID := fmt.Sprintf("_cached_%s", depTaskID)
+			cacheKeyByName := fmt.Sprintf("_cached_%s", depName)
+			if _, exists := t.GetParam(cacheKeyByID); !exists {
+				t.SetParam(cacheKeyByID, cachedResult)
+			}
+			if _, exists := t.GetParam(cacheKeyByName); !exists {
+				t.SetParam(cacheKeyByName, cachedResult)
 			}
 		}
 	}
@@ -1863,11 +1922,19 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 		// 发送任务完成事件到taskStatusChan
 		isTemplate := false
 		isSubTask := false
+		parentID := ""
 		if workflowTask, exists := m.workflow.GetTasks()[taskID]; exists {
 			isTemplate = workflowTask.IsTemplate()
 			isSubTask = workflowTask.IsSubTask()
 		} else if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
 			isSubTask = runtimeTask.(workflow.Task).IsSubTask()
+		}
+		// 获取子任务的父任务ID
+		if isSubTask {
+			parentKey := fmt.Sprintf("%s:parent_task_id", taskID)
+			if parentValue, exists := m.contextData.Load(parentKey); exists {
+				parentID = parentValue.(string)
+			}
 		}
 
 		select {
@@ -1877,6 +1944,7 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 			Result:      result.Data,
 			IsTemplate:  isTemplate,
 			IsSubTask:   isSubTask,
+			ParentID:    parentID,
 			IsProcessed: false,
 			Timestamp:   time.Now(),
 		}:
@@ -2038,11 +2106,19 @@ func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(e
 		// 发送任务失败事件到taskStatusChan
 		isTemplate := false
 		isSubTask := false
+		parentID := ""
 		if workflowTask, exists := m.workflow.GetTasks()[taskID]; exists {
 			isTemplate = workflowTask.IsTemplate()
 			isSubTask = workflowTask.IsSubTask()
 		} else if runtimeTask, ok := m.runtimeTasks.Load(taskID); ok {
 			isSubTask = runtimeTask.(workflow.Task).IsSubTask()
+		}
+		// 获取子任务的父任务ID
+		if isSubTask {
+			parentKey := fmt.Sprintf("%s:parent_task_id", taskID)
+			if parentValue, exists := m.contextData.Load(parentKey); exists {
+				parentID = parentValue.(string)
+			}
 		}
 
 		select {
@@ -2052,6 +2128,7 @@ func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(e
 			Error:       err,
 			IsTemplate:  isTemplate,
 			IsSubTask:   isSubTask,
+			ParentID:    parentID,
 			IsProcessed: false,
 			Timestamp:   time.Now(),
 		}:
@@ -2274,10 +2351,38 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 		}
 	}
 
-	// 存储所有子任务到运行时任务
+	// 存储所有子任务到运行时任务，同时记录父任务ID
 	for _, subTask := range subTasks {
 		m.runtimeTasks.Store(subTask.GetID(), subTask)
+		// 存储子任务的父任务ID（用于子任务完成时查找跟踪器）
+		parentKey := fmt.Sprintf("%s:parent_task_id", subTask.GetID())
+		m.contextData.Store(parentKey, parentTaskID)
 	}
+
+	// 初始化或更新子任务跟踪器（用于结果聚合）
+	var tracker *SubTaskTracker
+	if existingTracker, exists := m.subTaskTracker.Load(parentTaskID); exists {
+		// 已存在跟踪器，追加子任务
+		tracker = existingTracker.(*SubTaskTracker)
+		tracker.mu.Lock()
+		for _, subTask := range subTasks {
+			tracker.SubTaskIDs = append(tracker.SubTaskIDs, subTask.GetID())
+		}
+		atomic.AddInt32(&tracker.TotalCount, int32(len(subTasks)))
+		tracker.mu.Unlock()
+	} else {
+		// 创建新的跟踪器
+		tracker = &SubTaskTracker{
+			SubTaskIDs: make([]string, 0, len(subTasks)),
+			TotalCount: int32(len(subTasks)),
+		}
+		for _, subTask := range subTasks {
+			tracker.SubTaskIDs = append(tracker.SubTaskIDs, subTask.GetID())
+		}
+		m.subTaskTracker.Store(parentTaskID, tracker)
+	}
+	log.Printf("WorkflowInstance %s: 初始化子任务跟踪器，父任务: %s，子任务数量: %d",
+		m.instance.ID, parentTaskID, len(subTasks))
 
 	// 批量更新任务统计（通过taskStatsChan发送task_added事件）
 	for _, subTask := range subTasks {
@@ -2942,4 +3047,226 @@ func (m *WorkflowInstanceManagerV2) updateTaskInstanceStatusWithError(ctx contex
 		return m.taskRepo.UpdateStatusWithError(ctx, taskID, status, errorMsg)
 	}
 	return nil
+}
+
+// ==================== 子任务结果聚合相关方法 ====================
+
+// handleSubTaskCompletion 处理子任务完成事件（记录结果，触发聚合）
+func (m *WorkflowInstanceManagerV2) handleSubTaskCompletion(event TaskStatusEvent) {
+	// 获取子任务信息
+	var subTask workflow.Task
+	if runtimeTask, ok := m.runtimeTasks.Load(event.TaskID); ok {
+		subTask = runtimeTask.(workflow.Task)
+	} else {
+		log.Printf("警告: WorkflowInstance %s: 子任务 %s 在 runtimeTasks 中不存在", m.instance.ID, event.TaskID)
+		return
+	}
+
+	// 获取父任务ID
+	parentTaskID := event.ParentID
+	if parentTaskID == "" {
+		// 尝试从 contextData 中获取父任务ID
+		parentKey := fmt.Sprintf("%s:parent_task_id", event.TaskID)
+		if parentValue, exists := m.contextData.Load(parentKey); exists {
+			parentTaskID = parentValue.(string)
+		}
+	}
+	if parentTaskID == "" {
+		// 尝试从子任务的依赖中获取父任务ID
+		deps := subTask.GetDependencies()
+		if len(deps) > 0 {
+			// 假设第一个依赖是父任务
+			if taskID, exists := m.workflow.GetTaskIDByName(deps[0]); exists {
+				parentTaskID = taskID
+			}
+		}
+	}
+
+	if parentTaskID == "" {
+		log.Printf("警告: WorkflowInstance %s: 无法确定子任务 %s 的父任务ID", m.instance.ID, event.TaskID)
+		return
+	}
+
+	// 获取子任务跟踪器
+	trackerValue, exists := m.subTaskTracker.Load(parentTaskID)
+	if !exists {
+		log.Printf("警告: WorkflowInstance %s: 父任务 %s 的子任务跟踪器不存在", m.instance.ID, parentTaskID)
+		return
+	}
+	tracker := trackerValue.(*SubTaskTracker)
+
+	// 记录子任务结果
+	subTaskResult := SubTaskResult{
+		TaskID:   event.TaskID,
+		TaskName: subTask.GetName(),
+		Status:   event.Status,
+		Result:   event.Result,
+	}
+	tracker.Results.Store(event.TaskID, subTaskResult)
+
+	// 增加完成计数（atomic）
+	completedCount := atomic.AddInt32(&tracker.CompletedCount, 1)
+	log.Printf("WorkflowInstance %s: 子任务 %s 完成，父任务 %s 进度: %d/%d",
+		m.instance.ID, event.TaskID, parentTaskID, completedCount, tracker.TotalCount)
+
+	// 检查是否所有子任务都已完成
+	if completedCount >= tracker.TotalCount {
+		// 所有子任务完成，触发结果聚合
+		m.aggregateSubTaskResults(parentTaskID, tracker)
+	}
+}
+
+// handleSubTaskFailure 处理子任务失败事件（记录结果，可能触发聚合）
+func (m *WorkflowInstanceManagerV2) handleSubTaskFailure(event TaskStatusEvent) {
+	// 获取子任务信息
+	var subTask workflow.Task
+	if runtimeTask, ok := m.runtimeTasks.Load(event.TaskID); ok {
+		subTask = runtimeTask.(workflow.Task)
+	} else {
+		log.Printf("警告: WorkflowInstance %s: 子任务 %s 在 runtimeTasks 中不存在", m.instance.ID, event.TaskID)
+		return
+	}
+
+	// 获取父任务ID
+	parentTaskID := event.ParentID
+	if parentTaskID == "" {
+		// 尝试从 contextData 中获取父任务ID
+		parentKey := fmt.Sprintf("%s:parent_task_id", event.TaskID)
+		if parentValue, exists := m.contextData.Load(parentKey); exists {
+			parentTaskID = parentValue.(string)
+		}
+	}
+	if parentTaskID == "" {
+		deps := subTask.GetDependencies()
+		if len(deps) > 0 {
+			if taskID, exists := m.workflow.GetTaskIDByName(deps[0]); exists {
+				parentTaskID = taskID
+			}
+		}
+	}
+
+	if parentTaskID == "" {
+		log.Printf("警告: WorkflowInstance %s: 无法确定子任务 %s 的父任务ID", m.instance.ID, event.TaskID)
+		return
+	}
+
+	// 获取子任务跟踪器
+	trackerValue, exists := m.subTaskTracker.Load(parentTaskID)
+	if !exists {
+		log.Printf("警告: WorkflowInstance %s: 父任务 %s 的子任务跟踪器不存在", m.instance.ID, parentTaskID)
+		return
+	}
+	tracker := trackerValue.(*SubTaskTracker)
+
+	// 记录子任务失败结果
+	errorMsg := ""
+	if event.Error != nil {
+		errorMsg = event.Error.Error()
+	}
+	subTaskResult := SubTaskResult{
+		TaskID:   event.TaskID,
+		TaskName: subTask.GetName(),
+		Status:   "Failed",
+		Result:   nil,
+		Error:    errorMsg,
+	}
+	tracker.Results.Store(event.TaskID, subTaskResult)
+
+	// 增加完成计数和失败计数（atomic）
+	atomic.AddInt32(&tracker.FailedCount, 1)
+	completedCount := atomic.AddInt32(&tracker.CompletedCount, 1)
+	log.Printf("WorkflowInstance %s: 子任务 %s 失败，父任务 %s 进度: %d/%d",
+		m.instance.ID, event.TaskID, parentTaskID, completedCount, tracker.TotalCount)
+
+	// 检查是否所有子任务都已完成（包括失败的）
+	if completedCount >= tracker.TotalCount {
+		// 所有子任务完成，触发结果聚合
+		m.aggregateSubTaskResults(parentTaskID, tracker)
+	}
+}
+
+// aggregateSubTaskResults 聚合子任务结果到父任务
+func (m *WorkflowInstanceManagerV2) aggregateSubTaskResults(parentTaskID string, tracker *SubTaskTracker) {
+	log.Printf("WorkflowInstance %s: 开始聚合父任务 %s 的子任务结果", m.instance.ID, parentTaskID)
+
+	// 收集所有子任务结果
+	subtaskResults := make([]map[string]interface{}, 0, len(tracker.SubTaskIDs))
+	allSucceeded := true
+
+	for _, subTaskID := range tracker.SubTaskIDs {
+		if resultValue, exists := tracker.Results.Load(subTaskID); exists {
+			result := resultValue.(SubTaskResult)
+			subtaskResults = append(subtaskResults, map[string]interface{}{
+				"task_id":   result.TaskID,
+				"task_name": result.TaskName,
+				"status":    result.Status,
+				"result":    result.Result,
+				"error":     result.Error,
+			})
+			if result.Status != "Success" {
+				allSucceeded = false
+			}
+		}
+	}
+
+	// 获取父任务的原始结果
+	var parentResult map[string]interface{}
+	if existingResult, exists := m.contextData.Load(parentTaskID); exists {
+		if result, ok := existingResult.(map[string]interface{}); ok {
+			parentResult = result
+		} else {
+			// 如果父任务结果不是 map 类型，包装它
+			parentResult = map[string]interface{}{
+				"original_result": existingResult,
+			}
+		}
+	} else {
+		parentResult = make(map[string]interface{})
+	}
+
+	// 注入子任务聚合结果
+	parentResult["subtask_results"] = subtaskResults
+	parentResult["subtask_count"] = len(tracker.SubTaskIDs)
+	parentResult["all_subtasks_succeeded"] = allSucceeded
+
+	// 更新 contextData
+	m.contextData.Store(parentTaskID, parentResult)
+
+	// 更新 resultCache
+	if m.resultCache != nil {
+		ttl := 1 * time.Hour
+		_ = m.resultCache.Set(parentTaskID, parentResult, ttl)
+	}
+
+	log.Printf("WorkflowInstance %s: 父任务 %s 的子任务结果聚合完成，共 %d 个子任务，全部成功: %v",
+		m.instance.ID, parentTaskID, len(subtaskResults), allSucceeded)
+}
+
+// allSubTasksCompleted 检查当前层级的所有模板任务的子任务是否都已完成
+func (m *WorkflowInstanceManagerV2) allSubTasksCompleted(currentLevel int) bool {
+	allCompleted := true
+
+	// 遍历所有子任务跟踪器
+	m.subTaskTracker.Range(func(key, value interface{}) bool {
+		parentTaskID := key.(string)
+		tracker := value.(*SubTaskTracker)
+
+		// 检查父任务是否在当前层级
+		levelKey := fmt.Sprintf("%s:original_level", parentTaskID)
+		if levelValue, exists := m.contextData.Load(levelKey); exists {
+			if level, ok := levelValue.(int); ok && level == currentLevel {
+				// 检查子任务是否全部完成
+				completedCount := atomic.LoadInt32(&tracker.CompletedCount)
+				if completedCount < tracker.TotalCount {
+					log.Printf("WorkflowInstance %s: 父任务 %s 的子任务未全部完成: %d/%d",
+						m.instance.ID, parentTaskID, completedCount, tracker.TotalCount)
+					allCompleted = false
+					return false // 停止遍历
+				}
+			}
+		}
+		return true
+	})
+
+	return allCompleted
 }

@@ -802,10 +802,15 @@ func (m *WorkflowInstanceManager) injectCachedResults(t workflow.Task, taskID st
 		upstreamResult, ok := cachedResult.(map[string]interface{})
 		if !ok {
 			// 如果结果不是map类型，直接注入整个结果（向后兼容）
-			cacheKey := fmt.Sprintf("_cached_%s", depTaskID)
-			if _, exists := t.GetParam(cacheKey); !exists {
-				t.SetParam(cacheKey, cachedResult)
+			// 同时使用 taskID 和 taskName 作为 key
+			cacheKeyByID := fmt.Sprintf("_cached_%s", depTaskID)
+			cacheKeyByName := fmt.Sprintf("_cached_%s", depName)
+			if _, exists := t.GetParam(cacheKeyByID); !exists {
+				t.SetParam(cacheKeyByID, cachedResult)
 				log.Printf("📦 [缓存命中] TaskID=%s, 从缓存获取上游任务 %s 的结果（非map类型）", taskID, depTaskID)
+			}
+			if _, exists := t.GetParam(cacheKeyByName); !exists {
+				t.SetParam(cacheKeyByName, cachedResult)
 			}
 			continue
 		}
@@ -860,10 +865,15 @@ func (m *WorkflowInstanceManager) injectCachedResults(t workflow.Task, taskID st
 			}
 
 			// 向后兼容：如果没有ResultMapping，注入整个结果（使用特殊前缀）
-			cacheKey := fmt.Sprintf("_cached_%s", depTaskID)
-			if _, exists := t.GetParam(cacheKey); !exists {
-				t.SetParam(cacheKey, cachedResult)
+			// 同时使用 taskID 和 taskName 作为 key
+			cacheKeyByID := fmt.Sprintf("_cached_%s", depTaskID)
+			cacheKeyByName := fmt.Sprintf("_cached_%s", depName)
+			if _, exists := t.GetParam(cacheKeyByID); !exists {
+				t.SetParam(cacheKeyByID, cachedResult)
 				log.Printf("📦 [缓存命中] TaskID=%s, 从缓存获取上游任务 %s 的结果", taskID, depTaskID)
+			}
+			if _, exists := t.GetParam(cacheKeyByName); !exists {
+				t.SetParam(cacheKeyByName, cachedResult)
 			}
 		}
 	}

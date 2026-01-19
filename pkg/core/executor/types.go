@@ -8,15 +8,16 @@ import (
 
 // PendingTask 待调度的Task结构（对外导出）
 type PendingTask struct {
-	Task       workflow.Task         // Task实例（使用接口，避免循环依赖）
-	WorkflowID string                // Workflow ID
-	InstanceID string                // WorkflowInstance ID
-	Domain     string                // 业务域名称
-	RetryCount int                   // 当前重试次数
-	MaxRetries int                   // 最大重试次数
-	OnComplete func(*TaskResult)     // 完成回调（可选，与 StatusChan 二选一或同时使用）
-	OnError    func(error)           // 错误回调（可选，与 StatusChan 二选一或同时使用）
-	StatusChan chan *TaskStatusEvent // 任务状态事件 channel（可选，基于 channel 的监听模式）
+	Task            workflow.Task         // Task实例（使用接口，避免循环依赖）
+	WorkflowID      string                // Workflow ID
+	InstanceID      string                // WorkflowInstance ID
+	Domain          string                // 业务域名称
+	RetryCount      int                   // 当前重试次数
+	MaxRetries      int                   // 最大重试次数
+	OnComplete      func(*TaskResult)     // 完成回调（可选，与 StatusChan 二选一或同时使用）
+	OnError         func(error)           // 错误回调（可选，与 StatusChan 二选一或同时使用）
+	StatusChan      chan *TaskStatusEvent // 任务状态事件 channel（可选，基于 channel 的监听模式）
+	InstanceManager interface{}           // InstanceManager 接口（用于模板任务添加子任务）
 }
 
 // TaskResult Task执行结果（对外导出）
