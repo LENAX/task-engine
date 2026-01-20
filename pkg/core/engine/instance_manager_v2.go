@@ -444,6 +444,14 @@ func NewWorkflowInstanceManagerV2(
 	log.Printf("WorkflowInstance %s: V2初始化完成，总任务数: %d，Channel 容量: %d",
 		instance.ID, totalTasks, channelCapacity)
 
+	// 在初始化时注册 InstanceManagerInterfaceV2 到 registry（只注册一次）
+	if registry != nil {
+		managerInterface := &InstanceManagerInterfaceV2{
+			manager: manager,
+		}
+		_ = registry.RegisterDependencyWithKey("InstanceManager", managerInterface)
+	}
+
 	return manager, nil
 }
 
@@ -525,6 +533,14 @@ func NewWorkflowInstanceManagerV2WithAggregate(
 
 	log.Printf("WorkflowInstance %s: V2初始化完成（聚合Repository模式），总任务数: %d，Channel 容量: %d",
 		instance.ID, totalTasks, channelCapacity)
+
+	// 在初始化时注册 InstanceManagerInterfaceV2 到 registry（只注册一次）
+	if registry != nil {
+		managerInterface := &InstanceManagerInterfaceV2{
+			manager: manager,
+		}
+		_ = registry.RegisterDependencyWithKey("InstanceManager", managerInterface)
+	}
 
 	return manager, nil
 }
@@ -1593,13 +1609,9 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 		}
 
 		// 创建 InstanceManager 接口包装器（用于模板任务在 Job Function 中添加子任务）
+		// 注意：InstanceManagerInterfaceV2 已在初始化时注册到 registry，这里只是创建引用用于 PendingTask
 		managerInterface := &InstanceManagerInterfaceV2{
 			manager: m,
-		}
-
-		// 同时注入到 registry（保持向后兼容）
-		if m.registry != nil {
-			_ = m.registry.RegisterDependencyWithKey("InstanceManager", managerInterface)
 		}
 
 		// 确保状态为Pending
@@ -1847,12 +1859,7 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 			taskObj.SetDependencies(workflowTask.GetDependencies())
 			taskObj.SetStatus("SUCCESS")
 
-			// 注入Manager接口
-			managerInterface := &InstanceManagerInterfaceV2{
-				manager: m,
-			}
-			_ = m.registry.RegisterDependencyWithKey("InstanceManager", managerInterface)
-
+			// InstanceManagerInterfaceV2 已在初始化时注册到 registry，无需重复注册
 			if err := task.ExecuteTaskHandlerWithContext(
 				m.registry,
 				taskObj,
