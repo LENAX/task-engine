@@ -788,6 +788,23 @@ func (m *realtimeInstanceManagerImpl) GetStatus() string {
 	return m.instance.Status
 }
 
+// GetProgress 获取当前实例的内存中任务进度（实现 types.WorkflowInstanceManager 接口）
+// 实时实例以持续任务数为总任务数，均视为运行中
+func (m *realtimeInstanceManagerImpl) GetProgress() types.ProgressSnapshot {
+	var total int
+	m.continuousTasks.Range(func(_, _ interface{}) bool {
+		total++
+		return true
+	})
+	return types.ProgressSnapshot{
+		Total:     total,
+		Completed: 0,
+		Running:   total,
+		Failed:    0,
+		Pending:   0,
+	}
+}
+
 // Context 获取上下文
 func (m *realtimeInstanceManagerImpl) Context() context.Context {
 	return m.ctx
@@ -1209,4 +1226,3 @@ func (m *realtimeInstanceManagerImpl) PushData(data interface{}) bool {
 func (m *realtimeInstanceManagerImpl) GetDataBuffer() *DataBuffer {
 	return m.dataBuffer
 }
-

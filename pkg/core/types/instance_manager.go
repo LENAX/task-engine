@@ -48,4 +48,17 @@ type WorkflowInstanceManager interface {
 
 	// Context 获取context（用于监听取消信号）
 	Context() context.Context
+
+	// GetProgress 获取当前实例的内存中任务进度（总任务数、已完成、运行中、失败、待执行）
+	// 用于运行中实例的实时进度展示，包含动态子任务
+	GetProgress() ProgressSnapshot
+}
+
+// ProgressSnapshot 内存中的任务进度快照（与入库数据无关）
+type ProgressSnapshot struct {
+	Total     int // 总任务数（含动态子任务）
+	Completed int // 成功完成数
+	Running   int // 正在执行数
+	Failed    int // 失败数
+	Pending   int // 待执行数
 }

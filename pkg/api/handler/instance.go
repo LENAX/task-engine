@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/gin-gonic/gin"
 	"github.com/LENAX/task-engine/pkg/api/dto"
 	"github.com/LENAX/task-engine/pkg/core/engine"
 	"github.com/LENAX/task-engine/pkg/storage"
+	"github.com/gin-gonic/gin"
 )
 
 // InstanceHandler Instance API处理器
@@ -125,8 +125,19 @@ func (h *InstanceHandler) Get(c *gin.Context) {
 		wfName = wf.Name
 	}
 
-	// 计算进度
-	progress := calculateProgress(tasks)
+	// 进度：运行中实例优先使用内存中的实时进度（含动态子任务），否则用入库任务计算
+	var progress dto.ProgressInfo
+	if snapshot, ok := h.engine.GetInstanceProgress(id); ok {
+		progress = dto.ProgressInfo{
+			Total:     snapshot.Total,
+			Completed: snapshot.Completed,
+			Running:   snapshot.Running,
+			Failed:    snapshot.Failed,
+			Pending:   snapshot.Pending,
+		}
+	} else {
+		progress = calculateProgress(tasks)
+	}
 
 	detail := dto.InstanceDetail{
 		ID:           inst.ID,

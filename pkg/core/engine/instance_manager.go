@@ -1793,6 +1793,33 @@ func (m *WorkflowInstanceManager) GetStatus() string {
 	return m.instance.Status
 }
 
+// GetProgress 获取当前实例的内存中任务进度（公共方法，实现接口）
+// 从 workflow.GetTasks()、processedNodes、contextData 统计，包含动态子任务
+func (m *WorkflowInstanceManager) GetProgress() types.ProgressSnapshot {
+	allTasks := m.workflow.GetTasks()
+	total := len(allTasks)
+	var completed, failed, pending int
+	for taskID := range allTasks {
+		if _, processed := m.processedNodes.Load(taskID); processed {
+			errorKey := fmt.Sprintf("%s:error", taskID)
+			if _, hasError := m.contextData.Load(errorKey); hasError {
+				failed++
+			} else {
+				completed++
+			}
+		} else {
+			pending++
+		}
+	}
+	return types.ProgressSnapshot{
+		Total:     total,
+		Completed: completed,
+		Failed:    failed,
+		Pending:   pending,
+		Running:   0, // v1 不单独统计运行中数量
+	}
+}
+
 // Context 获取context（公共方法，实现接口）
 func (m *WorkflowInstanceManager) Context() context.Context {
 	return m.ctx
