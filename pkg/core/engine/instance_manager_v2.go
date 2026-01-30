@@ -2816,6 +2816,26 @@ func (m *WorkflowInstanceManagerV2) GetStatus() string {
 	return m.instance.Status
 }
 
+// GetProgress 获取当前实例的内存中任务进度（公共方法，实现接口）
+// 从 taskStats 原子读取，包含动态子任务，用于运行中实例的实时进度展示
+func (m *WorkflowInstanceManagerV2) GetProgress() types.ProgressSnapshot {
+	total := int(atomic.LoadInt32(&m.taskStats.TotalTasks))
+	completed := int(atomic.LoadInt32(&m.taskStats.SuccessTasks))
+	failed := int(atomic.LoadInt32(&m.taskStats.FailedTasks))
+	pending := int(atomic.LoadInt32(&m.taskStats.PendingTasks))
+	running := total - completed - failed - pending
+	if running < 0 {
+		running = 0
+	}
+	return types.ProgressSnapshot{
+		Total:     total,
+		Completed: completed,
+		Running:   running,
+		Failed:    failed,
+		Pending:   pending,
+	}
+}
+
 // Context 获取context（公共方法，实现接口）
 func (m *WorkflowInstanceManagerV2) Context() context.Context {
 	return m.ctx

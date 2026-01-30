@@ -315,6 +315,21 @@ func (i *InstanceManagerInterface) AddSubTask(subTask workflow.Task, parentTaskI
 	return i.manager.AddSubTask(subTask, parentTaskID)
 }
 
+// GetInstanceProgress 获取指定运行中实例的内存进度（对外导出）
+// 若实例正在运行则返回 (ProgressSnapshot, true)，否则返回 (零值, false)，供 API 优先使用内存进度
+func (e *Engine) GetInstanceProgress(instanceID string) (types.ProgressSnapshot, bool) {
+	if !e.running {
+		return types.ProgressSnapshot{}, false
+	}
+	e.mu.RLock()
+	manager, exists := e.managers[instanceID]
+	e.mu.RUnlock()
+	if !exists {
+		return types.ProgressSnapshot{}, false
+	}
+	return manager.GetProgress(), true
+}
+
 // restoreUnfinishedInstances 恢复未完成的WorkflowInstance（内部方法）
 // 从数据库加载所有状态为Running或Paused的WorkflowInstance，并恢复执行
 func (e *Engine) restoreUnfinishedInstances(ctx context.Context) error {
