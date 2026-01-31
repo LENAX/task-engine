@@ -129,11 +129,13 @@ func (h *InstanceHandler) Get(c *gin.Context) {
 	var progress dto.ProgressInfo
 	if snapshot, ok := h.engine.GetInstanceProgress(id); ok {
 		progress = dto.ProgressInfo{
-			Total:     snapshot.Total,
-			Completed: snapshot.Completed,
-			Running:   snapshot.Running,
-			Failed:    snapshot.Failed,
-			Pending:   snapshot.Pending,
+			Total:          snapshot.Total,
+			Completed:      snapshot.Completed,
+			Running:        snapshot.Running,
+			Failed:         snapshot.Failed,
+			Pending:        snapshot.Pending,
+			RunningTaskIDs: snapshot.RunningTaskIDs,
+			PendingTaskIDs: snapshot.PendingTaskIDs,
 		}
 	} else {
 		progress = calculateProgress(tasks)

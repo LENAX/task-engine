@@ -1479,6 +1479,10 @@ func (m *WorkflowInstanceManagerV2) taskSubmissionGoroutine() {
 			return
 
 		case tasks := <-m.taskSubmissionChan:
+			// 进入提交管道的任务（含动态 notifyTaskReady）统一计入“运行中”
+			for _, t := range tasks {
+				m.runningTaskIDs.Store(t.GetID(), struct{}{})
+			}
 			// 添加到批次
 			batch = append(batch, tasks...)
 
@@ -1522,6 +1526,7 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 	if len(tasks) > 0 {
 		select {
 		case m.taskSubmissionChan <- tasks:
+			// 接收方 taskSubmissionGoroutine 会统一计入 runningTaskIDs
 		case <-time.After(5 * time.Second):
 			log.Printf("警告: taskSubmissionChan 发送超时，任务加回队列: count=%d", len(tasks))
 			for _, task := range tasks {
@@ -1587,6 +1592,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			m.contextData.Store(errorKey, fmt.Sprintf("依赖任务 %s 执行失败，跳过当前任务", failedDep))
 
 			// 发送任务失败事件
+			m.runningTaskIDs.Delete(taskID) // 未真正提交，从运行中移除
 			select {
 			case m.taskStatusChan <- TaskStatusEvent{
 				TaskID:      taskID,
@@ -1614,6 +1620,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 		// 参数校验和结果映射
 		if err := m.validateAndMapParams(task, taskID); err != nil {
 			log.Printf("参数校验失败: TaskID=%s, Error=%v", taskID, err)
+			m.runningTaskIDs.Delete(taskID)
 			continue
 		}
 
@@ -1658,6 +1665,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 
 			if currentRetries < retryCount {
 				// 可以重试：将任务添加回当前 level 的队列
+				m.runningTaskIDs.Delete(taskID)
 				currentLevel := m.taskQueue.GetCurrentLevel()
 				m.incrementTaskRetryCount(taskID)
 				m.taskQueue.AddTask(currentLevel, task)
@@ -1666,6 +1674,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 					m.instance.ID, taskID, currentRetries+1, retryCount, currentLevel)
 			} else {
 				// 超过最大重试次数，警告并移除任务
+				m.runningTaskIDs.Delete(taskID)
 				log.Printf("⚠️ 警告: WorkflowInstance %s: 任务 %s (%s) 提交失败，已达到最大重试次数 %d，将移除任务。错误: %v",
 					m.instance.ID, taskID, task.GetName(), retryCount, err)
 
@@ -1687,8 +1696,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			continue
 		}
 
-		// 记录为正在执行，供 GetProgress 暴露未完成任务
-		m.runningTaskIDs.Store(taskID, struct{}{})
+		// 运行中已在 fetchTasksFromQueue 出队时计入，此处无需重复
 
 		// 更新统计：任务已提交
 		select {
