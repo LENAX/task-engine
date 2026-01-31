@@ -2876,29 +2876,23 @@ func (m *WorkflowInstanceManagerV2) GetStatus() string {
 const maxPendingTaskIDsInSnapshot = 500
 
 // GetProgress 获取当前实例的内存中任务进度（公共方法，实现接口）
-// 从 taskStats 原子读取，包含动态子任务，用于运行中实例的实时进度展示
-// RunningTaskIDs / PendingTaskIDs 用于排查进度卡在 99.x% 时定位未完成任务
-// Pending 为全局待执行数；PendingTaskIDs 为各层队列中的任务 ID（当前层优先，总数不超过 maxPendingTaskIDsInSnapshot）
+// Running = len(RunningTaskIDs)，Pending = 各层队列待运行任务总数，PendingTaskIDs 为其 ID 列表（当前层优先，可能截断）
 func (m *WorkflowInstanceManagerV2) GetProgress() types.ProgressSnapshot {
 	total := int(atomic.LoadInt32(&m.taskStats.TotalTasks))
 	completed := int(atomic.LoadInt32(&m.taskStats.SuccessTasks))
 	failed := int(atomic.LoadInt32(&m.taskStats.FailedTasks))
-	pending := int(atomic.LoadInt32(&m.taskStats.PendingTasks))
-	running := total - completed - failed - pending
-	if running < 0 {
-		running = 0
-	}
 	var runningIDs, pendingIDs []string
+	var pending int
 	if m.taskQueue != nil {
 		currentLevel := m.taskQueue.GetCurrentLevel()
 		maxLevel := m.taskQueue.GetMaxLevel()
-		for level := currentLevel; level < maxLevel && len(pendingIDs) < maxPendingTaskIDsInSnapshot; level++ {
+		for level := currentLevel; level < maxLevel; level++ {
 			ids := m.taskQueue.GetTaskIDsAtLevel(level)
+			pending += len(ids)
 			for _, id := range ids {
-				if len(pendingIDs) >= maxPendingTaskIDsInSnapshot {
-					break
+				if len(pendingIDs) < maxPendingTaskIDsInSnapshot {
+					pendingIDs = append(pendingIDs, id)
 				}
-				pendingIDs = append(pendingIDs, id)
 			}
 		}
 	}
@@ -2906,6 +2900,7 @@ func (m *WorkflowInstanceManagerV2) GetProgress() types.ProgressSnapshot {
 		runningIDs = append(runningIDs, key.(string))
 		return true
 	})
+	running := len(runningIDs)
 	return types.ProgressSnapshot{
 		Total:          total,
 		Completed:      completed,

@@ -55,12 +55,13 @@ type WorkflowInstanceManager interface {
 }
 
 // ProgressSnapshot 内存中的任务进度快照（与入库数据无关）
+// Running = len(RunningTaskIDs)，Pending = 各层级队列中待运行任务总数，PendingTaskIDs 为其 ID 列表（可能截断）
 type ProgressSnapshot struct {
 	Total          int      // 总任务数（含动态子任务）
 	Completed      int      // 成功完成数
 	Running        int      // 正在执行数
 	Failed         int      // 失败数
-	Pending        int      // 待执行数
-	RunningTaskIDs []string // 正在执行的任务 ID 列表（用于排查卡在 99.x% 时定位未完成任务）
-	PendingTaskIDs []string // 待执行的任务 ID 列表
+	Pending        int      // 各层级待运行任务总数
+	RunningTaskIDs []string // 正在执行的任务 ID 列表
+	PendingTaskIDs []string // 待运行的任务 ID 列表（当前层优先，可能截断）
 }
