@@ -212,6 +212,21 @@ func (q *LeveledTaskQueue) GetRunningCount(level int) int32 {
 	return atomic.LoadInt32(&q.runningCounts[level])
 }
 
+// GetTaskIDsAtLevel 返回指定层级队列中的任务 ID 列表（用于进度 API 暴露待执行任务）
+func (q *LeveledTaskQueue) GetTaskIDsAtLevel(level int) []string {
+	if level < 0 || level >= len(q.queues) {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	queue := q.queues[level]
+	ids := make([]string, 0, len(queue))
+	for taskID := range queue {
+		ids = append(ids, taskID)
+	}
+	return ids
+}
+
 // GetCurrentLevel 获取当前层级（atomic 读取）
 func (q *LeveledTaskQueue) GetCurrentLevel() int {
 	return int(atomic.LoadInt32(&q.currentLevel))
@@ -350,6 +365,7 @@ type WorkflowInstanceManagerV2 struct {
 
 	contextData    sync.Map // 上下文数据
 	processedNodes sync.Map // 已处理任务标记（taskID -> bool）
+	runningTaskIDs sync.Map // 正在执行的任务 ID（taskID -> struct{}），用于 GetProgress 暴露未完成任务
 
 	// 层级推进锁（保护层级推进的原子性）
 	levelAdvanceMu sync.Mutex // 保护 canAdvanceLevel 检查和 advanceLevel 执行的原子性
@@ -1019,6 +1035,9 @@ func (m *WorkflowInstanceManagerV2) initTaskQueue() {
 
 // handleTaskCompletion 处理任务完成事件
 func (m *WorkflowInstanceManagerV2) handleTaskCompletion(event TaskStatusEvent) {
+	// 从“正在执行”集合移除，供 GetProgress 暴露未完成任务
+	m.runningTaskIDs.Delete(event.TaskID)
+
 	// 标记任务执行完成，减少 runningCounts（无论成功或失败）
 	levelKey := fmt.Sprintf("%s:original_level", event.TaskID)
 	if levelVal, ok := m.contextData.Load(levelKey); ok {
@@ -1667,6 +1686,9 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			}
 			continue
 		}
+
+		// 记录为正在执行，供 GetProgress 暴露未完成任务
+		m.runningTaskIDs.Store(taskID, struct{}{})
 
 		// 更新统计：任务已提交
 		select {
@@ -2818,6 +2840,7 @@ func (m *WorkflowInstanceManagerV2) GetStatus() string {
 
 // GetProgress 获取当前实例的内存中任务进度（公共方法，实现接口）
 // 从 taskStats 原子读取，包含动态子任务，用于运行中实例的实时进度展示
+// RunningTaskIDs / PendingTaskIDs 用于排查进度卡在 99.x% 时定位未完成任务
 func (m *WorkflowInstanceManagerV2) GetProgress() types.ProgressSnapshot {
 	total := int(atomic.LoadInt32(&m.taskStats.TotalTasks))
 	completed := int(atomic.LoadInt32(&m.taskStats.SuccessTasks))
@@ -2827,12 +2850,23 @@ func (m *WorkflowInstanceManagerV2) GetProgress() types.ProgressSnapshot {
 	if running < 0 {
 		running = 0
 	}
+	var runningIDs, pendingIDs []string
+	if m.taskQueue != nil {
+		currentLevel := m.taskQueue.GetCurrentLevel()
+		pendingIDs = m.taskQueue.GetTaskIDsAtLevel(currentLevel)
+	}
+	m.runningTaskIDs.Range(func(key, _ interface{}) bool {
+		runningIDs = append(runningIDs, key.(string))
+		return true
+	})
 	return types.ProgressSnapshot{
-		Total:     total,
-		Completed: completed,
-		Running:   running,
-		Failed:    failed,
-		Pending:   pending,
+		Total:          total,
+		Completed:      completed,
+		Running:        running,
+		Failed:         failed,
+		Pending:        pending,
+		RunningTaskIDs: runningIDs,
+		PendingTaskIDs: pendingIDs,
 	}
 }
 
