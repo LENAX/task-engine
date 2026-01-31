@@ -1513,6 +1513,8 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 	}
 
 	currentLevel := m.taskQueue.GetCurrentLevel()
+	maxLevel := m.taskQueue.GetMaxLevel()
+	pendingAtCurrent := len(m.taskQueue.GetTaskIDsAtLevel(currentLevel))
 
 	// 从 workflow 获取最大并发任务数
 	maxConcurrent := m.workflow.GetMaxConcurrentTask()
@@ -1524,6 +1526,12 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 	tasks := m.taskQueue.PopTasks(currentLevel, maxConcurrent)
 
 	if len(tasks) > 0 {
+		ids := make([]string, 0, len(tasks))
+		for _, t := range tasks {
+			ids = append(ids, t.GetID())
+		}
+		log.Printf("[进度诊断] WorkflowInstance %s: Pop 出队 level=%d maxLevel=%d count=%d task_ids=%v",
+			m.instance.ID, currentLevel, maxLevel, len(tasks), ids)
 		select {
 		case m.taskSubmissionChan <- tasks:
 			// 接收方 taskSubmissionGoroutine 会统一计入 runningTaskIDs
@@ -1537,6 +1545,17 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 			for _, task := range tasks {
 				m.taskQueue.AddTask(currentLevel, task)
 			}
+		}
+	} else if pendingAtCurrent > 0 {
+		// 当前层级队列应有任务但 Pop 返回 0（可能竞态），记一条便于排查
+		log.Printf("[进度诊断] WorkflowInstance %s: level=%d 队列应有 %d 个任务但 Pop 返回 0",
+			m.instance.ID, currentLevel, pendingAtCurrent)
+	} else if currentLevel < maxLevel {
+		// 当前层为空时，记录下一层 pending 数量，便于判断“挂起的 5 个”是否在下一层未推进
+		nextPending := len(m.taskQueue.GetTaskIDsAtLevel(currentLevel + 1))
+		if nextPending > 0 {
+			log.Printf("[进度诊断] WorkflowInstance %s: level=%d 当前层为空，下一层 level=%d pending=%d（未推进则这 %d 个会一直挂起）",
+				m.instance.ID, currentLevel, currentLevel+1, nextPending, nextPending)
 		}
 	}
 }
