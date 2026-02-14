@@ -212,6 +212,21 @@ func (q *LeveledTaskQueue) GetRunningCount(level int) int32 {
 	return atomic.LoadInt32(&q.runningCounts[level])
 }
 
+// GetTaskIDsAtLevel 返回指定层级队列中的任务 ID 列表（用于进度 API 暴露待执行任务）
+func (q *LeveledTaskQueue) GetTaskIDsAtLevel(level int) []string {
+	if level < 0 || level >= len(q.queues) {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	queue := q.queues[level]
+	ids := make([]string, 0, len(queue))
+	for taskID := range queue {
+		ids = append(ids, taskID)
+	}
+	return ids
+}
+
 // GetCurrentLevel 获取当前层级（atomic 读取）
 func (q *LeveledTaskQueue) GetCurrentLevel() int {
 	return int(atomic.LoadInt32(&q.currentLevel))
@@ -347,9 +362,12 @@ type WorkflowInstanceManagerV2 struct {
 
 	// 任务完成检查优化
 	lastCompletionCheck int64 // atomic，上次完成检查的时间戳（纳秒），用于减少检查频率
+	// “当前层为空、下一层 pending”诊断日志节流（纳秒），避免 ticker 每次触发都打一条导致刷屏
+	lastLevelEmptyDiagnosticLog int64
 
 	contextData    sync.Map // 上下文数据
 	processedNodes sync.Map // 已处理任务标记（taskID -> bool）
+	runningTaskIDs sync.Map // 正在执行的任务 ID（taskID -> struct{}），用于 GetProgress 暴露未完成任务
 
 	// 层级推进锁（保护层级推进的原子性）
 	levelAdvanceMu sync.Mutex // 保护 canAdvanceLevel 检查和 advanceLevel 执行的原子性
@@ -665,12 +683,11 @@ func (m *WorkflowInstanceManagerV2) processBatch(batch []TaskStatusEvent) {
 			})
 		}
 
-		// 使用阻塞发送或带超时的发送，确保事件不丢失
+		// 必须阻塞发送，否则事件丢失会导致 handleTaskCompletion 未调用、TaskCompleted(level) 未执行，
+		// runningCount 无法归零、层级无法推进，出现“大量 pending 但无任务在执行”
 		select {
 		case m.queueUpdateChan <- event:
 			// 事件已发送
-		case <-time.After(5 * time.Second):
-			log.Printf("错误: queueUpdateChan 发送超时，事件可能丢失: TaskID=%s", event.TaskID)
 		case <-m.ctx.Done():
 			log.Printf("Context 已取消，停止发送事件: TaskID=%s", event.TaskID)
 			return
@@ -1019,6 +1036,9 @@ func (m *WorkflowInstanceManagerV2) initTaskQueue() {
 
 // handleTaskCompletion 处理任务完成事件
 func (m *WorkflowInstanceManagerV2) handleTaskCompletion(event TaskStatusEvent) {
+	// 从“正在执行”集合移除，供 GetProgress 暴露未完成任务
+	m.runningTaskIDs.Delete(event.TaskID)
+
 	// 标记任务执行完成，减少 runningCounts（无论成功或失败）
 	levelKey := fmt.Sprintf("%s:original_level", event.TaskID)
 	if levelVal, ok := m.contextData.Load(levelKey); ok {
@@ -1460,6 +1480,10 @@ func (m *WorkflowInstanceManagerV2) taskSubmissionGoroutine() {
 			return
 
 		case tasks := <-m.taskSubmissionChan:
+			// 进入提交管道的任务（含动态 notifyTaskReady）统一计入“运行中”
+			for _, t := range tasks {
+				m.runningTaskIDs.Store(t.GetID(), struct{}{})
+			}
 			// 添加到批次
 			batch = append(batch, tasks...)
 
@@ -1490,6 +1514,8 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 	}
 
 	currentLevel := m.taskQueue.GetCurrentLevel()
+	maxLevel := m.taskQueue.GetMaxLevel()
+	pendingAtCurrent := len(m.taskQueue.GetTaskIDsAtLevel(currentLevel))
 
 	// 从 workflow 获取最大并发任务数
 	maxConcurrent := m.workflow.GetMaxConcurrentTask()
@@ -1501,8 +1527,15 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 	tasks := m.taskQueue.PopTasks(currentLevel, maxConcurrent)
 
 	if len(tasks) > 0 {
+		ids := make([]string, 0, len(tasks))
+		for _, t := range tasks {
+			ids = append(ids, t.GetID())
+		}
+		log.Printf("[进度诊断] WorkflowInstance %s: Pop 出队 level=%d maxLevel=%d count=%d task_ids=%v",
+			m.instance.ID, currentLevel, maxLevel, len(tasks), ids)
 		select {
 		case m.taskSubmissionChan <- tasks:
+			// 接收方 taskSubmissionGoroutine 会统一计入 runningTaskIDs
 		case <-time.After(5 * time.Second):
 			log.Printf("警告: taskSubmissionChan 发送超时，任务加回队列: count=%d", len(tasks))
 			for _, task := range tasks {
@@ -1512,6 +1545,25 @@ func (m *WorkflowInstanceManagerV2) fetchTasksFromQueue() {
 			log.Printf("Context 已取消，任务加回队列: count=%d", len(tasks))
 			for _, task := range tasks {
 				m.taskQueue.AddTask(currentLevel, task)
+			}
+		}
+	} else if pendingAtCurrent > 0 {
+		// 当前层级队列应有任务但 Pop 返回 0（可能竞态），记一条便于排查
+		log.Printf("[进度诊断] WorkflowInstance %s: level=%d 队列应有 %d 个任务但 Pop 返回 0",
+			m.instance.ID, currentLevel, pendingAtCurrent)
+	} else if currentLevel < maxLevel {
+		// 当前层待 Pop 队列为空时，记录本层 running 与下一层 pending，便于排查“为何不推进”
+		// 推进条件：当前层队列空 且 当前层 runningCount==0；若 runningCount>0 会一直不推进
+		// 节流：同一实例该条诊断最多每 10 秒打一次，避免 ticker 高频触发导致刷屏
+		nextPending := len(m.taskQueue.GetTaskIDsAtLevel(currentLevel + 1))
+		runningCount := m.taskQueue.GetRunningCount(currentLevel)
+		if nextPending > 0 || runningCount > 0 {
+			nowNano := time.Now().UnixNano()
+			lastNano := atomic.LoadInt64(&m.lastLevelEmptyDiagnosticLog)
+			if nowNano-lastNano >= int64(10*time.Second) {
+				atomic.StoreInt64(&m.lastLevelEmptyDiagnosticLog, nowNano)
+				log.Printf("[进度诊断] WorkflowInstance %s: level=%d 当前层待出队为空，running=%d；下一层 level=%d pending=%d（推进需本层 running=0，未推进则下一层会挂起）",
+					m.instance.ID, currentLevel, runningCount, currentLevel+1, nextPending)
 			}
 		}
 	}
@@ -1568,6 +1620,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			m.contextData.Store(errorKey, fmt.Sprintf("依赖任务 %s 执行失败，跳过当前任务", failedDep))
 
 			// 发送任务失败事件
+			m.runningTaskIDs.Delete(taskID) // 未真正提交，从运行中移除
 			select {
 			case m.taskStatusChan <- TaskStatusEvent{
 				TaskID:      taskID,
@@ -1595,6 +1648,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 		// 参数校验和结果映射
 		if err := m.validateAndMapParams(task, taskID); err != nil {
 			log.Printf("参数校验失败: TaskID=%s, Error=%v", taskID, err)
+			m.runningTaskIDs.Delete(taskID)
 			continue
 		}
 
@@ -1639,6 +1693,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 
 			if currentRetries < retryCount {
 				// 可以重试：将任务添加回当前 level 的队列
+				m.runningTaskIDs.Delete(taskID)
 				currentLevel := m.taskQueue.GetCurrentLevel()
 				m.incrementTaskRetryCount(taskID)
 				m.taskQueue.AddTask(currentLevel, task)
@@ -1647,6 +1702,7 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 					m.instance.ID, taskID, currentRetries+1, retryCount, currentLevel)
 			} else {
 				// 超过最大重试次数，警告并移除任务
+				m.runningTaskIDs.Delete(taskID)
 				log.Printf("⚠️ 警告: WorkflowInstance %s: 任务 %s (%s) 提交失败，已达到最大重试次数 %d，将移除任务。错误: %v",
 					m.instance.ID, taskID, task.GetName(), retryCount, err)
 
@@ -1667,6 +1723,8 @@ func (m *WorkflowInstanceManagerV2) submitBatch(batch []workflow.Task) {
 			}
 			continue
 		}
+
+		// 运行中已在 fetchTasksFromQueue 出队时计入，此处无需重复
 
 		// 更新统计：任务已提交
 		select {
@@ -1944,6 +2002,7 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 			}
 		}
 
+		// 必须阻塞发送，否则完成事件丢失会导致 runningCount 不归零、层级不推进、出现“大量 pending 但无任务执行”
 		select {
 		case m.taskStatusChan <- TaskStatusEvent{
 			TaskID:      taskID,
@@ -1955,8 +2014,6 @@ func (m *WorkflowInstanceManagerV2) createTaskCompleteHandler(taskID string) fun
 			IsProcessed: false,
 			Timestamp:   time.Now(),
 		}:
-		case <-time.After(5 * time.Second):
-			log.Printf("警告: taskStatusChan 发送超时，任务完成事件可能丢失: TaskID=%s", taskID)
 		case <-m.ctx.Done():
 			return
 		}
@@ -2128,6 +2185,7 @@ func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(e
 			}
 		}
 
+		// 必须阻塞发送，否则失败事件丢失会导致 runningCount 不归零、层级不推进
 		select {
 		case m.taskStatusChan <- TaskStatusEvent{
 			TaskID:      taskID,
@@ -2139,8 +2197,6 @@ func (m *WorkflowInstanceManagerV2) createTaskErrorHandler(taskID string) func(e
 			IsProcessed: false,
 			Timestamp:   time.Now(),
 		}:
-		case <-time.After(5 * time.Second):
-			log.Printf("警告: taskStatusChan 发送超时，任务失败事件可能丢失: TaskID=%s", taskID)
 		case <-m.ctx.Done():
 			return
 		}
@@ -2816,23 +2872,43 @@ func (m *WorkflowInstanceManagerV2) GetStatus() string {
 	return m.instance.Status
 }
 
+// maxPendingTaskIDsInSnapshot 进度快照中 PendingTaskIDs 最大数量，避免单次返回数万 ID
+const maxPendingTaskIDsInSnapshot = 500
+
 // GetProgress 获取当前实例的内存中任务进度（公共方法，实现接口）
-// 从 taskStats 原子读取，包含动态子任务，用于运行中实例的实时进度展示
+// Running = len(RunningTaskIDs)，Pending = 各层队列待运行任务总数，PendingTaskIDs 为其 ID 列表（当前层优先，可能截断）
 func (m *WorkflowInstanceManagerV2) GetProgress() types.ProgressSnapshot {
 	total := int(atomic.LoadInt32(&m.taskStats.TotalTasks))
 	completed := int(atomic.LoadInt32(&m.taskStats.SuccessTasks))
 	failed := int(atomic.LoadInt32(&m.taskStats.FailedTasks))
-	pending := int(atomic.LoadInt32(&m.taskStats.PendingTasks))
-	running := total - completed - failed - pending
-	if running < 0 {
-		running = 0
+	var runningIDs, pendingIDs []string
+	var pending int
+	if m.taskQueue != nil {
+		currentLevel := m.taskQueue.GetCurrentLevel()
+		maxLevel := m.taskQueue.GetMaxLevel()
+		for level := currentLevel; level < maxLevel; level++ {
+			ids := m.taskQueue.GetTaskIDsAtLevel(level)
+			pending += len(ids)
+			for _, id := range ids {
+				if len(pendingIDs) < maxPendingTaskIDsInSnapshot {
+					pendingIDs = append(pendingIDs, id)
+				}
+			}
+		}
 	}
+	m.runningTaskIDs.Range(func(key, _ interface{}) bool {
+		runningIDs = append(runningIDs, key.(string))
+		return true
+	})
+	running := len(runningIDs)
 	return types.ProgressSnapshot{
-		Total:     total,
-		Completed: completed,
-		Running:   running,
-		Failed:    failed,
-		Pending:   pending,
+		Total:          total,
+		Completed:      completed,
+		Running:        running,
+		Failed:         failed,
+		Pending:        pending,
+		RunningTaskIDs: runningIDs,
+		PendingTaskIDs: pendingIDs,
 	}
 }
 

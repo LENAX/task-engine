@@ -67,13 +67,15 @@ type InstanceDetail struct {
 	ErrorMessage string       `json:"error_message,omitempty"`
 }
 
-// ProgressInfo 进度信息
+// ProgressInfo 进度信息（Running = len(running_task_ids)，Pending = 各层待运行总数）
 type ProgressInfo struct {
-	Total     int `json:"total"`
-	Completed int `json:"completed"`
-	Running   int `json:"running"`
-	Failed    int `json:"failed"`
-	Pending   int `json:"pending"`
+	Total          int      `json:"total"`
+	Completed      int      `json:"completed"`
+	Running        int      `json:"running"`
+	Failed         int      `json:"failed"`
+	Pending        int      `json:"pending"`
+	RunningTaskIDs []string `json:"running_task_ids,omitempty"`
+	PendingTaskIDs []string `json:"pending_task_ids,omitempty"`
 }
 
 // TaskInstanceDetail Task实例详细信息
