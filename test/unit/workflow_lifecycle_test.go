@@ -182,6 +182,22 @@ func TestWorkflowController_StateTransitions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Pause失败: %v", err)
 		}
+		// 等待暂停生效后再终止，避免后续直接校验终止状态时仍停留在Paused
+		time.Sleep(100 * time.Millisecond)
+		currentStatus, err = controller.GetStatus()
+		if err != nil {
+			t.Fatalf("获取状态失败: %v", err)
+		}
+		if currentStatus != "Paused" && currentStatus != "Success" && currentStatus != "Failed" {
+			t.Errorf("暂停后状态错误，期望: Paused/Success/Failed, 实际: %s", currentStatus)
+		}
+		// Running->Paused 后继续执行 Terminate，进入统一终止校验逻辑
+		if currentStatus == "Paused" {
+			err = controller.Terminate()
+			if err != nil {
+				t.Fatalf("终止WorkflowInstance失败: %v", err)
+			}
+		}
 	} else if currentStatus == "Ready" {
 		// 如果状态仍然是Ready，说明状态更新有延迟或者工作流执行太快
 		// 这种情况下，我们无法测试Pause，但可以测试Terminate

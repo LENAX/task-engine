@@ -8,7 +8,7 @@ import (
 
 // 版本信息（编译时注入）
 var (
-	Version   = "1.0.10"
+	Version   = "1.0.13"
 	GitCommit = "unknown"
 	BuildTime = "unknown"
 )
