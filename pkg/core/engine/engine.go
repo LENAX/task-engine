@@ -34,6 +34,8 @@ const (
 	InstanceManagerV1 InstanceManagerVersion = 1
 	// InstanceManagerV2 使用V2版本的InstanceManager（默认，支持SAGA事务）
 	InstanceManagerV2 InstanceManagerVersion = 2
+	// InstanceManagerV3 使用V3版本的InstanceManager（当前默认）
+	InstanceManagerV3 InstanceManagerVersion = 3
 )
 
 // Engine 调度引擎核心结构体（对外导出）
@@ -109,7 +111,7 @@ func NewEngineWithRepos(
 		managers:                make(map[string]types.WorkflowInstanceManager),
 		controllers:             make(map[string]workflow.WorkflowController),
 		cronScheduler:           NewCronScheduler(nil), // 稍后设置engine引用
-		instanceManagerVersion:  InstanceManagerV2,     // 默认使用V2版本
+		instanceManagerVersion:  InstanceManagerV3,     // 默认使用V3版本
 	}
 	// 设置CronScheduler的engine引用
 	eng.cronScheduler.engine = eng
@@ -144,7 +146,7 @@ func NewEngineWithAggregateRepo(
 		controllers:             make(map[string]workflow.WorkflowController),
 		cronScheduler:           NewCronScheduler(nil),
 		pluginManager:           plugin.NewPluginManager(), // 初始化插件管理器
-		instanceManagerVersion:  InstanceManagerV2,
+		instanceManagerVersion:  InstanceManagerV3,
 	}
 	eng.cronScheduler.engine = eng
 	return eng, nil
@@ -417,8 +419,18 @@ func (e *Engine) restoreInstance(ctx context.Context, instance *workflow.Workflo
 
 	// 根据配置创建对应版本的WorkflowInstanceManager（会自动从断点数据恢复）
 	var manager types.WorkflowInstanceManager
-	if e.instanceManagerVersion == InstanceManagerV2 {
-		manager, err = NewWorkflowInstanceManagerV2WithAggregate(
+	switch e.instanceManagerVersion {
+	case InstanceManagerV1:
+		manager, err = NewWorkflowInstanceManager(
+			instance,
+			wf,
+			e.executor,
+			e.taskRepo,
+			e.workflowInstanceRepo,
+			e.registry,
+		)
+	default:
+		manager, err = NewWorkflowInstanceManagerV3WithAggregate(
 			instance,
 			wf,
 			e.executor,
@@ -427,15 +439,6 @@ func (e *Engine) restoreInstance(ctx context.Context, instance *workflow.Workflo
 			e.workflowInstanceRepo,
 			e.registry,
 			e.pluginManager,
-		)
-	} else {
-		manager, err = NewWorkflowInstanceManager(
-			instance,
-			wf,
-			e.executor,
-			e.taskRepo,
-			e.workflowInstanceRepo,
-			e.registry,
 		)
 	}
 	if err != nil {
@@ -885,8 +888,18 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 		fallthrough
 	default:
 		// 批处理模式：根据版本创建对应的 WorkflowInstanceManager
-		if e.instanceManagerVersion == InstanceManagerV2 {
-			manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
+		switch e.instanceManagerVersion {
+		case InstanceManagerV1:
+			manager, managerErr = NewWorkflowInstanceManager(
+				instance,
+				wf,
+				e.executor,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+			)
+		default:
+			manager, managerErr = NewWorkflowInstanceManagerV3WithAggregate(
 				instance,
 				wf,
 				e.executor,
@@ -895,15 +908,6 @@ func (e *Engine) SubmitWorkflow(ctx context.Context, wf *workflow.Workflow) (wor
 				e.workflowInstanceRepo,
 				e.registry,
 				e.pluginManager,
-			)
-		} else {
-			manager, managerErr = NewWorkflowInstanceManager(
-				instance,
-				wf,
-				e.executor,
-				e.taskRepo,
-				e.workflowInstanceRepo,
-				e.registry,
 			)
 		}
 	}
@@ -1095,8 +1099,18 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 
 		// 根据配置创建对应版本的Manager并恢复
 		var managerErr error
-		if e.instanceManagerVersion == InstanceManagerV2 {
-			manager, managerErr = NewWorkflowInstanceManagerV2WithAggregate(
+		switch e.instanceManagerVersion {
+		case InstanceManagerV1:
+			manager, managerErr = NewWorkflowInstanceManager(
+				instance,
+				wf,
+				e.executor,
+				e.taskRepo,
+				e.workflowInstanceRepo,
+				e.registry,
+			)
+		default:
+			manager, managerErr = NewWorkflowInstanceManagerV3WithAggregate(
 				instance,
 				wf,
 				e.executor,
@@ -1105,15 +1119,6 @@ func (e *Engine) ResumeWorkflowInstance(ctx context.Context, instanceID string) 
 				e.workflowInstanceRepo,
 				e.registry,
 				e.pluginManager,
-			)
-		} else {
-			manager, managerErr = NewWorkflowInstanceManager(
-				instance,
-				wf,
-				e.executor,
-				e.taskRepo,
-				e.workflowInstanceRepo,
-				e.registry,
 			)
 		}
 		if managerErr != nil {
