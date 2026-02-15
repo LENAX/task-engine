@@ -340,3 +340,147 @@ func TestInstanceManagerV3_TemplateDownstreamWaitsAllSubTasksDone(t *testing.T) 
 	require.Equal(t, "Success", finalStatus)
 	require.True(t, subTaskDone.Load(), "模板子任务应先于下游任务完成")
 }
+
+func TestInstanceManagerV3_TemplateSubTaskResultsInjectedToDownstream(t *testing.T) {
+	tmpDir := t.TempDir()
+	repos, err := sqlite.NewRepositories(tmpDir + "/v3-template-subtask-results.db")
+	require.NoError(t, err)
+	defer repos.Close()
+
+	eng, err := engine.NewEngineWithAggregateRepo(64, 30, repos.WorkflowAggregate)
+	require.NoError(t, err)
+	eng.SetInstanceManagerVersion(engine.InstanceManagerV3)
+
+	ctx := context.Background()
+	require.NoError(t, eng.Start(ctx))
+	defer eng.Stop()
+
+	registry := eng.GetRegistry()
+
+	templateJob := func(tc *task.TaskContext) (interface{}, error) {
+		return map[string]interface{}{
+			"generated": 2,
+			"status":    "success",
+			"sub_tasks": []map[string]interface{}{
+				{"name": "fetch-1", "api_url": "https://example.com/1"},
+				{"name": "fetch-2", "api_url": "https://example.com/2"},
+			},
+		}, nil
+	}
+	_, err = registry.Register(ctx, "v3TplResultTemplateJob", templateJob, "V3 模板任务返回定义列表")
+	require.NoError(t, err)
+
+	var seq atomic.Int64
+	subTaskJob := func(tc *task.TaskContext) (interface{}, error) {
+		n := seq.Add(1)
+		return map[string]interface{}{
+			"api_metadata": map[string]interface{}{"id": n},
+			"api_url":      fmt.Sprintf("https://example.com/%d", n),
+		}, nil
+	}
+	_, err = registry.Register(ctx, "v3TplResultSubTaskJob", subTaskJob, "V3 子任务返回 api_metadata")
+	require.NoError(t, err)
+
+	downstreamJob := func(tc *task.TaskContext) (interface{}, error) {
+		raw := tc.GetParam("_cached_template-A")
+		cached, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("missing _cached_template-A map")
+		}
+		arrRaw, ok := cached["subtask_results"]
+		if !ok {
+			return nil, fmt.Errorf("missing subtask_results")
+		}
+		arr, ok := arrRaw.([]map[string]interface{})
+		if !ok {
+			genericArr, ok2 := arrRaw.([]interface{})
+			if !ok2 {
+				return nil, fmt.Errorf("invalid subtask_results type: %T", arrRaw)
+			}
+			converted := make([]map[string]interface{}, 0, len(genericArr))
+			for _, item := range genericArr {
+				asMap, ok3 := item.(map[string]interface{})
+				if !ok3 {
+					return nil, fmt.Errorf("invalid subtask_results item type: %T", item)
+				}
+				converted = append(converted, asMap)
+			}
+			arr = converted
+		}
+		if len(arr) != 2 {
+			return nil, fmt.Errorf("subtask_results size mismatch: %d", len(arr))
+		}
+		for _, item := range arr {
+			resultRaw, ok4 := item["result"]
+			if !ok4 {
+				return nil, fmt.Errorf("missing result in subtask_results item")
+			}
+			resultMap, ok5 := resultRaw.(map[string]interface{})
+			if !ok5 {
+				return nil, fmt.Errorf("invalid result type: %T", resultRaw)
+			}
+			if _, ok6 := resultMap["api_metadata"]; !ok6 {
+				return nil, fmt.Errorf("missing api_metadata in subtask result")
+			}
+		}
+		return map[string]interface{}{"ok": true}, nil
+	}
+	_, err = registry.Register(ctx, "v3TplResultDownstreamJob", downstreamJob, "V3 下游读取 subtask_results")
+	require.NoError(t, err)
+
+	type ManagerWithAddSubTask interface {
+		AddSubTask(subTask types.Task, parentTaskID string) error
+	}
+	templateHandler := func(tc *task.TaskContext) {
+		manager, ok := task.GetDependencyTyped[ManagerWithAddSubTask](tc.Context(), "InstanceManager")
+		if !ok || manager == nil {
+			return
+		}
+		for i := 0; i < 2; i++ {
+			name := fmt.Sprintf("fetch-detail-%d", i+1)
+			st, buildErr := builder.NewTaskBuilder(name, "fetch api detail", registry).
+				WithJobFunction("v3TplResultSubTaskJob", nil).
+				Build()
+			if buildErr != nil {
+				return
+			}
+			_ = manager.AddSubTask(st, tc.TaskID)
+		}
+	}
+	_, err = registry.RegisterTaskHandler(ctx, "v3TplResultHandler", templateHandler, "V3 模板任务添加子任务")
+	require.NoError(t, err)
+
+	templateTask, err := builder.NewTaskBuilder("template-A", "模板任务A", registry).
+		WithJobFunction("v3TplResultTemplateJob", nil).
+		Build()
+	require.NoError(t, err)
+	templateTask.SetTemplate(true)
+	templateTask.SetStatusHandlers(map[string][]string{"SUCCESS": {"v3TplResultHandler"}})
+
+	saveTask, err := builder.NewTaskBuilder("save-all-metadata", "保存所有元数据", registry).
+		WithJobFunction("v3TplResultDownstreamJob", nil).
+		WithDependency("template-A").
+		Build()
+	require.NoError(t, err)
+
+	wf := workflow.NewWorkflow("v3-template-subtask-results", "模板子任务结果注入下游")
+	require.NoError(t, wf.AddTask(templateTask))
+	require.NoError(t, wf.AddTask(saveTask))
+	require.NoError(t, eng.RegisterWorkflow(ctx, wf))
+
+	controller, err := eng.SubmitWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	deadline := time.Now().Add(20 * time.Second)
+	finalStatus := ""
+	for time.Now().Before(deadline) {
+		status, getErr := controller.GetStatus()
+		require.NoError(t, getErr)
+		if status == "Success" || status == "Failed" || status == "Terminated" {
+			finalStatus = status
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.Equal(t, "Success", finalStatus)
+}

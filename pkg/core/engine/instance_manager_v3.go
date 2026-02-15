@@ -429,7 +429,60 @@ func (m *WorkflowInstanceManagerV3) tryCompleteTemplateTask(taskID string, p *su
 	if p == nil || !p.allDone {
 		return
 	}
+	m.aggregateTemplateSubTaskResults(taskID, p)
 	m.completeMainTaskAndReleaseChildren(taskID)
+}
+
+func (m *WorkflowInstanceManagerV3) aggregateTemplateSubTaskResults(parentTaskID string, p *subTaskPool) {
+	if p == nil {
+		return
+	}
+
+	subtaskResults := make([]map[string]interface{}, 0, p.total)
+	allSucceeded := true
+
+	for _, st := range p.tasks {
+		if st == nil {
+			continue
+		}
+		subTaskID := st.GetID()
+		status := st.GetStatus()
+		var subResult interface{}
+		if resultValue, exists := m.contextData.Load(subTaskID); exists {
+			subResult = resultValue
+		}
+		if status != "SUCCESS" {
+			allSucceeded = false
+		}
+		subtaskResults = append(subtaskResults, map[string]interface{}{
+			"task_id":   subTaskID,
+			"task_name": st.GetName(),
+			"status":    status,
+			"result":    subResult,
+		})
+	}
+
+	var parentResult map[string]interface{}
+	if existingResult, exists := m.contextData.Load(parentTaskID); exists {
+		if asMap, ok := existingResult.(map[string]interface{}); ok {
+			parentResult = asMap
+		} else {
+			parentResult = map[string]interface{}{
+				"original_result": existingResult,
+			}
+		}
+	} else {
+		parentResult = make(map[string]interface{})
+	}
+
+	parentResult["subtask_results"] = subtaskResults
+	parentResult["subtask_count"] = len(subtaskResults)
+	parentResult["all_subtasks_succeeded"] = allSucceeded
+
+	m.contextData.Store(parentTaskID, parentResult)
+	if m.resultCache != nil {
+		_ = m.resultCache.Set(parentTaskID, parentResult, 24*time.Hour)
+	}
 }
 
 func (m *WorkflowInstanceManagerV3) completeMainTaskAndReleaseChildren(taskID string) {
