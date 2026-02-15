@@ -435,6 +435,136 @@ func (m *WorkflowInstanceManagerV3) onTemplateHandlerDone(taskID string) {
 	}
 }
 
+func (m *WorkflowInstanceManagerV3) prepareTaskParams(t workflow.Task, taskID string) error {
+	if t == nil {
+		return fmt.Errorf("task不能为空")
+	}
+	if err := m.validateAndMapParams(t); err != nil {
+		return err
+	}
+	m.injectCachedResults(t)
+	return nil
+}
+
+func (m *WorkflowInstanceManagerV3) validateAndMapParams(t workflow.Task) error {
+	requiredParams := t.GetRequiredParams()
+	resultMapping := t.GetResultMapping()
+
+	if len(requiredParams) > 0 {
+		deps := t.GetDependencies()
+		missingParams := make([]string, 0)
+
+		for _, requiredParam := range requiredParams {
+			found := false
+			if t.GetParams()[requiredParam] != nil {
+				found = true
+			} else {
+				for _, depName := range deps {
+					depTaskID, exists := m.taskNameToID[depName]
+					if !exists {
+						continue
+					}
+					if upstreamResultValue, ok := m.contextData.Load(depTaskID); ok {
+						if upstreamResult, typeOK := upstreamResultValue.(map[string]interface{}); typeOK {
+							if _, hasKey := upstreamResult[requiredParam]; hasKey {
+								found = true
+								break
+							}
+						}
+					}
+				}
+			}
+
+			if !found {
+				missingParams = append(missingParams, requiredParam)
+			}
+		}
+
+		if len(missingParams) > 0 {
+			return fmt.Errorf("缺少必需参数: %v", missingParams)
+		}
+	}
+
+	if len(resultMapping) > 0 {
+		deps := t.GetDependencies()
+		for targetParam, sourceField := range resultMapping {
+			if _, exists := t.GetParam(targetParam); exists {
+				continue
+			}
+			for _, depName := range deps {
+				depTaskID, exists := m.taskNameToID[depName]
+				if !exists {
+					continue
+				}
+				if upstreamResultValue, ok := m.contextData.Load(depTaskID); ok {
+					if upstreamResult, typeOK := upstreamResultValue.(map[string]interface{}); typeOK {
+						if sourceValue, hasKey := upstreamResult[sourceField]; hasKey {
+							t.SetParam(targetParam, sourceValue)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *WorkflowInstanceManagerV3) injectCachedResults(t workflow.Task) {
+	if m.resultCache == nil || t == nil {
+		return
+	}
+
+	resultMapping := t.GetResultMapping()
+	hasResultMapping := len(resultMapping) > 0
+
+	for _, depName := range t.GetDependencies() {
+		depTaskID, exists := m.taskNameToID[depName]
+		if !exists {
+			continue
+		}
+
+		cachedResult, found := m.resultCache.Get(depTaskID)
+		if !found {
+			continue
+		}
+
+		upstreamResult, ok := cachedResult.(map[string]interface{})
+		if !ok {
+			cacheKeyByID := fmt.Sprintf("_cached_%s", depTaskID)
+			cacheKeyByName := fmt.Sprintf("_cached_%s", depName)
+			if _, exists := t.GetParam(cacheKeyByID); !exists {
+				t.SetParam(cacheKeyByID, cachedResult)
+			}
+			if _, exists := t.GetParam(cacheKeyByName); !exists {
+				t.SetParam(cacheKeyByName, cachedResult)
+			}
+			continue
+		}
+
+		if hasResultMapping {
+			for targetParam, sourceField := range resultMapping {
+				if sourceValue, hasKey := upstreamResult[sourceField]; hasKey {
+					if _, exists := t.GetParam(targetParam); !exists {
+						t.SetParam(targetParam, sourceValue)
+					}
+				}
+			}
+			continue
+		}
+
+		cacheKeyByID := fmt.Sprintf("_cached_%s", depTaskID)
+		cacheKeyByName := fmt.Sprintf("_cached_%s", depName)
+		if _, exists := t.GetParam(cacheKeyByID); !exists {
+			t.SetParam(cacheKeyByID, cachedResult)
+		}
+		if _, exists := t.GetParam(cacheKeyByName); !exists {
+			t.SetParam(cacheKeyByName, cachedResult)
+		}
+	}
+}
+
 func (m *WorkflowInstanceManagerV3) submit() {
 	if m.paused.Load() {
 		return
@@ -457,6 +587,10 @@ func (m *WorkflowInstanceManagerV3) submit() {
 		m.mainSubmitted[taskID] = true
 		m.running[taskID] = true
 		m.runningTasks.Add(1)
+		if err := m.prepareTaskParams(t, taskID); err != nil {
+			m.onResult(taskResultMsg{taskID: taskID, err: err})
+			continue
+		}
 		id := taskID
 		err := m.executor.SubmitTask(&executor.PendingTask{
 			Task:       t,
