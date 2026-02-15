@@ -410,7 +410,9 @@ func (r *SubTaskResult) GetResultMap(field string) map[string]interface{} {
 // 返回: 子任务结果列表
 //
 // 说明: 当模板任务的子任务全部完成后，引擎会将子任务结果聚合到模板任务的结果中，
-// 结构为: { "subtask_results": [...], "subtask_count": N, "all_subtasks_succeeded": bool }
+// 结构为: { "subtask_results": [...], "subtask_count": N, "all_subtasks_succeeded": bool, "sub_tasks": [...] }
+// 其中 subtask_results 每项为 { task_id, task_name, status, result }，result 已规范为 map，下游可从中读取任意字段；
+// sub_tasks 与 subtask_results 同序，每项为 { result: map }，下游任意任务可通过 GetUpstreamResult(上游任务名) 或 GetSubTaskResults() 一致获取子任务执行结果。
 //
 // 示例:
 //
