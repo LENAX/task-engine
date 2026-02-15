@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/LENAX/task-engine/pkg/core/builder"
 	"github.com/LENAX/task-engine/pkg/core/engine"
 	"github.com/LENAX/task-engine/pkg/core/task"
+	"github.com/LENAX/task-engine/pkg/core/types"
 	"github.com/LENAX/task-engine/pkg/core/workflow"
 	"github.com/stretchr/testify/require"
 )
@@ -240,4 +242,101 @@ func TestInstanceManagerV3_ParamInjection_MissingRequiredParams(t *testing.T) {
 	}
 
 	require.Equal(t, "Failed", finalStatus)
+}
+
+func TestInstanceManagerV3_TemplateDownstreamWaitsAllSubTasksDone(t *testing.T) {
+	tmpDir := t.TempDir()
+	repos, err := sqlite.NewRepositories(tmpDir + "/v3-template-downstream-wait.db")
+	require.NoError(t, err)
+	defer repos.Close()
+
+	eng, err := engine.NewEngineWithAggregateRepo(32, 30, repos.WorkflowAggregate)
+	require.NoError(t, err)
+	eng.SetInstanceManagerVersion(engine.InstanceManagerV3)
+
+	ctx := context.Background()
+	require.NoError(t, eng.Start(ctx))
+	defer eng.Stop()
+
+	registry := eng.GetRegistry()
+
+	var subTaskDone atomic.Bool
+
+	templateJob := func(tc *task.TaskContext) (interface{}, error) {
+		return map[string]interface{}{"ok": true}, nil
+	}
+	_, err = registry.Register(ctx, "v3TemplateMainJob", templateJob, "V3 模板主任务")
+	require.NoError(t, err)
+
+	subTaskJob := func(tc *task.TaskContext) (interface{}, error) {
+		time.Sleep(300 * time.Millisecond)
+		subTaskDone.Store(true)
+		return map[string]interface{}{"sub_done": true}, nil
+	}
+	_, err = registry.Register(ctx, "v3TemplateSubTaskJob", subTaskJob, "V3 模板子任务")
+	require.NoError(t, err)
+
+	downstreamJob := func(tc *task.TaskContext) (interface{}, error) {
+		if !subTaskDone.Load() {
+			return nil, fmt.Errorf("downstream started before all template subtasks done")
+		}
+		return map[string]interface{}{"downstream_ok": true}, nil
+	}
+	_, err = registry.Register(ctx, "v3TemplateDownstreamJob", downstreamJob, "V3 模板下游任务")
+	require.NoError(t, err)
+
+	type ManagerWithAddSubTask interface {
+		AddSubTask(subTask types.Task, parentTaskID string) error
+	}
+	templateHandler := func(tc *task.TaskContext) {
+		manager, ok := task.GetDependencyTyped[ManagerWithAddSubTask](tc.Context(), "InstanceManager")
+		if !ok || manager == nil {
+			return
+		}
+		st, buildErr := builder.NewTaskBuilder("template-subtask", "模板子任务", registry).
+			WithJobFunction("v3TemplateSubTaskJob", nil).
+			Build()
+		if buildErr != nil {
+			return
+		}
+		_ = manager.AddSubTask(st, tc.TaskID)
+	}
+	_, err = registry.RegisterTaskHandler(ctx, "v3TemplateAddSubTaskHandler", templateHandler, "V3 模板添加子任务处理器")
+	require.NoError(t, err)
+
+	templateTask, err := builder.NewTaskBuilder("template-A", "模板任务A", registry).
+		WithJobFunction("v3TemplateMainJob", nil).
+		Build()
+	require.NoError(t, err)
+	templateTask.SetTemplate(true)
+	templateTask.SetStatusHandlers(map[string][]string{"SUCCESS": {"v3TemplateAddSubTaskHandler"}})
+
+	downstreamTask, err := builder.NewTaskBuilder("downstream-B", "下游任务B", registry).
+		WithJobFunction("v3TemplateDownstreamJob", nil).
+		WithDependency("template-A").
+		Build()
+	require.NoError(t, err)
+
+	wf := workflow.NewWorkflow("v3-template-downstream-wait", "模板任务下游等待子任务完成")
+	require.NoError(t, wf.AddTask(templateTask))
+	require.NoError(t, wf.AddTask(downstreamTask))
+	require.NoError(t, eng.RegisterWorkflow(ctx, wf))
+
+	controller, err := eng.SubmitWorkflow(ctx, wf)
+	require.NoError(t, err)
+
+	deadline := time.Now().Add(20 * time.Second)
+	finalStatus := ""
+	for time.Now().Before(deadline) {
+		status, getErr := controller.GetStatus()
+		require.NoError(t, getErr)
+		if status == "Success" || status == "Failed" || status == "Terminated" {
+			finalStatus = status
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	require.Equal(t, "Success", finalStatus)
+	require.True(t, subTaskDone.Load(), "模板子任务应先于下游任务完成")
 }

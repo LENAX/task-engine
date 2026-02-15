@@ -390,9 +390,7 @@ func (m *WorkflowInstanceManagerV3) onResult(v taskResultMsg) {
 	if parent, ok := m.subToParent[v.taskID]; ok {
 		if p := m.subTaskPools[parent]; p != nil {
 			p.taskCompleted()
-			if p.allDone {
-				m.mainDone[parent] = true
-			}
+			m.tryCompleteTemplateTask(parent, p)
 		}
 		return
 	}
@@ -421,12 +419,24 @@ func (m *WorkflowInstanceManagerV3) onTemplateHandlerDone(taskID string) {
 	p := m.subTaskPools[taskID]
 	if p != nil {
 		p.markJobDone()
-		if p.allDone {
-			m.mainDone[taskID] = true
-		}
+		m.tryCompleteTemplateTask(taskID, p)
 	} else {
-		m.mainDone[taskID] = true
+		m.completeMainTaskAndReleaseChildren(taskID)
 	}
+}
+
+func (m *WorkflowInstanceManagerV3) tryCompleteTemplateTask(taskID string, p *subTaskPool) {
+	if p == nil || !p.allDone {
+		return
+	}
+	m.completeMainTaskAndReleaseChildren(taskID)
+}
+
+func (m *WorkflowInstanceManagerV3) completeMainTaskAndReleaseChildren(taskID string) {
+	if m.mainDone[taskID] {
+		return
+	}
+	m.mainDone[taskID] = true
 	for _, c := range m.children[taskID] {
 		m.pendingDeps[c]--
 		if m.pendingDeps[c] <= 0 && !m.mainSubmitted[c] && !m.mainDone[c] {
