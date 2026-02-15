@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -503,19 +502,6 @@ func (m *WorkflowInstanceManagerV3) aggregateTemplateSubTaskResults(parentTaskID
 	parentResult["all_subtasks_succeeded"] = allSucceeded
 	parentResult["sub_tasks"] = subTasksForDownstream // 与 subtask_results 同序；每项含 "result" 及子任务返回的全体顶层字段，下游可按 ["result"] 或 ["api_metadata"] 等任意键读取
 
-	// Debug: 聚合后的父任务结果结构
-	log.Printf("🔍 [V3 子任务结果聚合] parentTaskID=%s | 顶层键=%v | subtask_results 条数=%d | sub_tasks 条数=%d",
-		parentTaskID, mapKeys(parentResult), len(subtaskResults), len(subTasksForDownstream))
-	if len(subtaskResults) > 0 {
-		log.Printf("🔍 [V3 子任务结果聚合] subtask_results[0] 键=%v", mapKeys(subtaskResults[0]))
-		if r, _ := subtaskResults[0]["result"].(map[string]interface{}); r != nil {
-			log.Printf("🔍 [V3 子任务结果聚合] subtask_results[0].result 键=%v", mapKeys(r))
-		}
-	}
-	if len(subTasksForDownstream) > 0 {
-		log.Printf("🔍 [V3 子任务结果聚合] sub_tasks[0] 键=%v", mapKeys(subTasksForDownstream[0]))
-	}
-
 	m.contextData.Store(parentTaskID, parentResult)
 	if m.resultCache != nil {
 		_ = m.resultCache.Set(parentTaskID, parentResult, 24*time.Hour)
@@ -662,13 +648,6 @@ func (m *WorkflowInstanceManagerV3) injectCachedResults(t workflow.Task) {
 		}
 		if _, exists := t.GetParam(cacheKeyByName); !exists {
 			t.SetParam(cacheKeyByName, cachedResult)
-		}
-
-		// Debug: 注入子任务结果后展示其数据结构（仅当上游结果含 subtask_results 或 sub_tasks 时）
-		if _, hasSR := upstreamResult["subtask_results"]; hasSR {
-			debugLogInjectedSubTaskResult(m.instance.ID, t.GetID(), t.GetName(), depName, depTaskID, upstreamResult)
-		} else if _, hasST := upstreamResult["sub_tasks"]; hasST {
-			debugLogInjectedSubTaskResult(m.instance.ID, t.GetID(), t.GetName(), depName, depTaskID, upstreamResult)
 		}
 	}
 }
