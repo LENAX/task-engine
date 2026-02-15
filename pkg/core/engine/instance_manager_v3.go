@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,10 +45,10 @@ type WorkflowInstanceManagerV3 struct {
 	mainDone      map[string]bool
 	running       map[string]bool
 
-	subTaskPools  map[string]*subTaskPool
-	subToParent   map[string]string
-	activePoolIDs []string
-	rrIdx         int
+	subTaskPools            map[string]*subTaskPool
+	subToParent             map[string]string
+	activePoolIDs           []string
+	rrIdx                   int
 	templateHandlerInFlight map[string]bool
 
 	contextData sync.Map
@@ -124,31 +125,31 @@ func newV3(
 ) (*WorkflowInstanceManagerV3, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &WorkflowInstanceManagerV3{
-		instance:             instance,
-		workflow:             wf,
-		executor:             exec,
-		aggregateRepo:        aggregateRepo,
-		workflowInstanceRepo: workflowInstanceRepo,
-		registry:             registry,
-		pluginManager:        pluginManager,
-		ctx:                  ctx,
-		cancel:               cancel,
-		controlSignalChan:    make(chan workflow.ControlSignal, 10),
-		statusUpdateChan:     make(chan string, 10),
-		inbox:                make(chan schedulerMsg, 4096),
-		tasks:                make(map[string]workflow.Task),
-		taskNameToID:         make(map[string]string),
-		children:             make(map[string][]string),
-		pendingDeps:          make(map[string]int),
-		readyMain:            make([]string, 0, 32),
-		mainSubmitted:        make(map[string]bool),
-		mainDone:             make(map[string]bool),
-		running:              make(map[string]bool),
-		subTaskPools:         make(map[string]*subTaskPool),
-		subToParent:          make(map[string]string),
-		activePoolIDs:        make([]string, 0, 8),
+		instance:                instance,
+		workflow:                wf,
+		executor:                exec,
+		aggregateRepo:           aggregateRepo,
+		workflowInstanceRepo:    workflowInstanceRepo,
+		registry:                registry,
+		pluginManager:           pluginManager,
+		ctx:                     ctx,
+		cancel:                  cancel,
+		controlSignalChan:       make(chan workflow.ControlSignal, 10),
+		statusUpdateChan:        make(chan string, 10),
+		inbox:                   make(chan schedulerMsg, 4096),
+		tasks:                   make(map[string]workflow.Task),
+		taskNameToID:            make(map[string]string),
+		children:                make(map[string][]string),
+		pendingDeps:             make(map[string]int),
+		readyMain:               make([]string, 0, 32),
+		mainSubmitted:           make(map[string]bool),
+		mainDone:                make(map[string]bool),
+		running:                 make(map[string]bool),
+		subTaskPools:            make(map[string]*subTaskPool),
+		subToParent:             make(map[string]string),
+		activePoolIDs:           make([]string, 0, 8),
 		templateHandlerInFlight: make(map[string]bool),
-		resultCache:          cache.NewMemoryResultCache(),
+		resultCache:             cache.NewMemoryResultCache(),
 	}
 	if err := m.initState(); err != nil {
 		return nil, err
@@ -204,7 +205,7 @@ func (m *WorkflowInstanceManagerV3) Shutdown() {
 	}
 }
 
-func (m *WorkflowInstanceManagerV3) GetControlSignalChannel() interface{} { return m.controlSignalChan }
+func (m *WorkflowInstanceManagerV3) GetControlSignalChannel() interface{}  { return m.controlSignalChan }
 func (m *WorkflowInstanceManagerV3) GetStatusUpdateChannel() <-chan string { return m.statusUpdateChan }
 
 func (m *WorkflowInstanceManagerV3) AddSubTask(subTask types.Task, parentTaskID string) error {
@@ -251,14 +252,16 @@ func (m *WorkflowInstanceManagerV3) RestoreFromBreakpoint(breakpoint interface{}
 	return nil
 }
 
-func (m *WorkflowInstanceManagerV3) CreateBreakpoint() interface{} { return &workflow.BreakpointData{LastUpdateTime: time.Now()} }
-func (m *WorkflowInstanceManagerV3) GetInstanceID() string          { return m.instance.ID }
+func (m *WorkflowInstanceManagerV3) CreateBreakpoint() interface{} {
+	return &workflow.BreakpointData{LastUpdateTime: time.Now()}
+}
+func (m *WorkflowInstanceManagerV3) GetInstanceID() string { return m.instance.ID }
 func (m *WorkflowInstanceManagerV3) GetStatus() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.instance.Status
 }
-func (m *WorkflowInstanceManagerV3) Context() context.Context       { return m.ctx }
+func (m *WorkflowInstanceManagerV3) Context() context.Context { return m.ctx }
 
 func (m *WorkflowInstanceManagerV3) GetProgress() types.ProgressSnapshot {
 	m.mu.RLock()
@@ -433,12 +436,24 @@ func (m *WorkflowInstanceManagerV3) tryCompleteTemplateTask(taskID string, p *su
 	m.completeMainTaskAndReleaseChildren(taskID)
 }
 
+// normalizeSubTaskResult 将子任务返回值规范为 map，便于下游 GetUpstreamResult/GetSubTaskResults 一致读取（如 api_metadata、api_url）
+func normalizeSubTaskResult(v interface{}) map[string]interface{} {
+	if v == nil {
+		return map[string]interface{}{}
+	}
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
+	}
+	return map[string]interface{}{"_raw": v}
+}
+
 func (m *WorkflowInstanceManagerV3) aggregateTemplateSubTaskResults(parentTaskID string, p *subTaskPool) {
 	if p == nil {
 		return
 	}
 
 	subtaskResults := make([]map[string]interface{}, 0, p.total)
+	subTasksForDownstream := make([]map[string]interface{}, 0, p.total) // 与 subtask_results 同序，每项为 { result: map }，供下游通过 GetUpstreamResult 任意键一致读取
 	allSucceeded := true
 
 	for _, st := range p.tasks {
@@ -454,12 +469,20 @@ func (m *WorkflowInstanceManagerV3) aggregateTemplateSubTaskResults(parentTaskID
 		if status != "SUCCESS" {
 			allSucceeded = false
 		}
+		normalizedResult := normalizeSubTaskResult(subResult)
 		subtaskResults = append(subtaskResults, map[string]interface{}{
 			"task_id":   subTaskID,
 			"task_name": st.GetName(),
 			"status":    status,
-			"result":    subResult,
+			"result":    normalizedResult,
 		})
+		// sub_tasks 每项同时带 result 与子任务返回的所有顶层字段，下游可按 item["result"] 或 item["api_metadata"] 等任意方式读取
+		element := make(map[string]interface{}, len(normalizedResult)+1)
+		element["result"] = normalizedResult
+		for k, v := range normalizedResult {
+			element[k] = v
+		}
+		subTasksForDownstream = append(subTasksForDownstream, element)
 	}
 
 	var parentResult map[string]interface{}
@@ -478,6 +501,20 @@ func (m *WorkflowInstanceManagerV3) aggregateTemplateSubTaskResults(parentTaskID
 	parentResult["subtask_results"] = subtaskResults
 	parentResult["subtask_count"] = len(subtaskResults)
 	parentResult["all_subtasks_succeeded"] = allSucceeded
+	parentResult["sub_tasks"] = subTasksForDownstream // 与 subtask_results 同序；每项含 "result" 及子任务返回的全体顶层字段，下游可按 ["result"] 或 ["api_metadata"] 等任意键读取
+
+	// Debug: 聚合后的父任务结果结构
+	log.Printf("🔍 [V3 子任务结果聚合] parentTaskID=%s | 顶层键=%v | subtask_results 条数=%d | sub_tasks 条数=%d",
+		parentTaskID, mapKeys(parentResult), len(subtaskResults), len(subTasksForDownstream))
+	if len(subtaskResults) > 0 {
+		log.Printf("🔍 [V3 子任务结果聚合] subtask_results[0] 键=%v", mapKeys(subtaskResults[0]))
+		if r, _ := subtaskResults[0]["result"].(map[string]interface{}); r != nil {
+			log.Printf("🔍 [V3 子任务结果聚合] subtask_results[0].result 键=%v", mapKeys(r))
+		}
+	}
+	if len(subTasksForDownstream) > 0 {
+		log.Printf("🔍 [V3 子任务结果聚合] sub_tasks[0] 键=%v", mapKeys(subTasksForDownstream[0]))
+	}
 
 	m.contextData.Store(parentTaskID, parentResult)
 	if m.resultCache != nil {
@@ -617,6 +654,7 @@ func (m *WorkflowInstanceManagerV3) injectCachedResults(t workflow.Task) {
 			continue
 		}
 
+		// 下游任务用 _cached_<上游任务名> 或 _cached_<上游任务ID> 取缓存；推荐用任务名，见 doc/notes/下游任务如何获取上游结果-V3.md
 		cacheKeyByID := fmt.Sprintf("_cached_%s", depTaskID)
 		cacheKeyByName := fmt.Sprintf("_cached_%s", depName)
 		if _, exists := t.GetParam(cacheKeyByID); !exists {
@@ -624,6 +662,13 @@ func (m *WorkflowInstanceManagerV3) injectCachedResults(t workflow.Task) {
 		}
 		if _, exists := t.GetParam(cacheKeyByName); !exists {
 			t.SetParam(cacheKeyByName, cachedResult)
+		}
+
+		// Debug: 注入子任务结果后展示其数据结构（仅当上游结果含 subtask_results 或 sub_tasks 时）
+		if _, hasSR := upstreamResult["subtask_results"]; hasSR {
+			debugLogInjectedSubTaskResult(m.instance.ID, t.GetID(), t.GetName(), depName, depTaskID, upstreamResult)
+		} else if _, hasST := upstreamResult["sub_tasks"]; hasST {
+			debugLogInjectedSubTaskResult(m.instance.ID, t.GetID(), t.GetName(), depName, depTaskID, upstreamResult)
 		}
 	}
 }
