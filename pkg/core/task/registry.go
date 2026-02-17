@@ -502,12 +502,7 @@ func (r *functionRegistryImpl) RegisterDependencyWithKey(key string, dep interfa
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 检查是否已注册相同类型的依赖
-	if _, exists := r.dependencies[depType]; exists {
-		// 如果已存在，允许更新（用于支持重新注册）
-		log.Printf("警告: 类型 %s 的依赖已存在，将更新", depType.String())
-	}
-
+	// 已存在时直接覆盖（支持重新注册，如多 Workflow 共用 registry 时每提交一次会覆盖同类型依赖）
 	r.dependencies[depType] = dep
 
 	// 如果提供了字符串key，也存储到字符串映射中
