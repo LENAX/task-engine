@@ -390,6 +390,8 @@ func (m *WorkflowInstanceManagerV3) onResult(v taskResultMsg) {
 	m.contextData.Store(v.taskID, v.result)
 	_ = m.resultCache.Set(v.taskID, v.result, 24*time.Hour)
 	if parent, ok := m.subToParent[v.taskID]; ok {
+		// 动态子任务完成时也执行该子任务的 Success 回调（如 DataSyncSuccess），便于执行历史正确统计 record_count
+		m.executeStatusHandlerAsync(taskObj, "SUCCESS", v.result, "", nil)
 		if p := m.subTaskPools[parent]; p != nil {
 			p.taskCompleted()
 			m.tryCompleteTemplateTask(parent, p)
