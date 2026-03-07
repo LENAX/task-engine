@@ -35,6 +35,7 @@ type domainPool struct {
 const (
 	maxGlobalWorkers = 1000  // 全局最大并发数上限
 	defaultQueueSize = 10000 // 默认任务队列大小（支持大型workflow）
+	maxLogValueLen   = 200   // 日志中结果/错误字符串最大长度，超出则截断
 )
 
 // NewExecutor 创建执行器实例（对外导出的工厂方法，engine包会调用）
@@ -59,6 +60,15 @@ func NewExecutor(maxWorkers int) (Executor, error) {
 	go exec.scheduler()
 
 	return exec, nil
+}
+
+// truncateLogValue 将任意值格式化为字符串，超过 maxLogValueLen 则截断并追加 "..."
+func truncateLogValue(v any) string {
+	s := fmt.Sprint(v)
+	if len(s) <= maxLogValueLen {
+		return s
+	}
+	return s[:maxLogValueLen-3] + "..."
 }
 
 // Start 启动执行器（对外导出）
@@ -421,8 +431,8 @@ func (e *executorImpl) executeTask(pendingTask *PendingTask, domainPool *domainP
 	// 获取参数用于日志打印
 	paramsForLog := t.GetParams()
 	// 打印函数执行开始日志
-	log.Printf("🚀 [开始执行函数] TaskID=%s, TaskName=%s, JobFuncName=%s, JobFuncID=%s, 参数=%v",
-		t.GetID(), t.GetName(), t.GetJobFuncName(), funcID, paramsForLog)
+	log.Printf("🚀 [开始执行函数] TaskID=%s, TaskName=%s, JobFuncName=%s, JobFuncID=%s, 参数=%s",
+		t.GetID(), t.GetName(), t.GetJobFuncName(), funcID, truncateLogValue(paramsForLog))
 
 	// 创建执行上下文
 	ctx := context.Background()
@@ -477,8 +487,8 @@ func (e *executorImpl) executeTask(pendingTask *PendingTask, domainPool *domainP
 
 		if state.Status == "Success" {
 			t.SetStatus("SUCCESS")
-			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%v",
-				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, state.Data)
+			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%s",
+				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, truncateLogValue(state.Data))
 			// 发送状态事件到 channel（如果提供）
 			e.sendStatusEvent(pendingTask, result)
 			// 调用完成回调（如果提供）
@@ -487,8 +497,8 @@ func (e *executorImpl) executeTask(pendingTask *PendingTask, domainPool *domainP
 			}
 		} else {
 			t.SetStatus("FAILED")
-			log.Printf("❌ [函数执行失败] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 错误=%v",
-				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, state.Error)
+			log.Printf("❌ [函数执行失败] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 错误=%s",
+				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, truncateLogValue(state.Error))
 			// 检查是否需要重试
 			if pendingTask.RetryCount < pendingTask.MaxRetries {
 				// 重试：计算重试间隔（1s、2s、4s...）
