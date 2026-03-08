@@ -1,4 +1,4 @@
-package realtime
+package unit
 
 import (
 	"encoding/json"
@@ -7,30 +7,31 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/LENAX/task-engine/pkg/core/realtime"
 )
 
 func TestEventType_Constants(t *testing.T) {
-	// 验证事件类型常量定义正确
-	assert.Equal(t, EventType("data.arrived"), EventDataArrived)
-	assert.Equal(t, EventType("data.processed"), EventDataProcessed)
-	assert.Equal(t, EventType("task.started"), EventTaskStarted)
-	assert.Equal(t, EventType("connection.established"), EventConnected)
-	assert.Equal(t, EventType("connection.lost"), EventDisconnected)
-	assert.Equal(t, EventType("error.occurred"), EventError)
-	assert.Equal(t, EventType("backpressure.triggered"), EventBackpressure)
+	assert.Equal(t, realtime.EventType("data.arrived"), realtime.EventDataArrived)
+	assert.Equal(t, realtime.EventType("data.processed"), realtime.EventDataProcessed)
+	assert.Equal(t, realtime.EventType("task.started"), realtime.EventTaskStarted)
+	assert.Equal(t, realtime.EventType("connection.established"), realtime.EventConnected)
+	assert.Equal(t, realtime.EventType("connection.lost"), realtime.EventDisconnected)
+	assert.Equal(t, realtime.EventType("error.occurred"), realtime.EventError)
+	assert.Equal(t, realtime.EventType("backpressure.triggered"), realtime.EventBackpressure)
 }
 
 func TestNewRealtimeEvent(t *testing.T) {
-	payload := &DataArrivedPayload{
+	payload := &realtime.DataArrivedPayload{
 		Data:   "test data",
 		Source: "test_source",
 		Size:   100,
 	}
 
-	event := NewRealtimeEvent(EventDataArrived, "task-1", "instance-1", payload)
+	event := realtime.NewRealtimeEvent(realtime.EventDataArrived, "task-1", "instance-1", payload)
 
 	assert.NotEmpty(t, event.ID)
-	assert.Equal(t, EventDataArrived, event.Type)
+	assert.Equal(t, realtime.EventDataArrived, event.Type)
 	assert.Equal(t, "task-1", event.TaskID)
 	assert.Equal(t, "instance-1", event.InstanceID)
 	assert.NotZero(t, event.Timestamp)
@@ -39,7 +40,7 @@ func TestNewRealtimeEvent(t *testing.T) {
 }
 
 func TestRealtimeEvent_WithMetadata(t *testing.T) {
-	event := NewRealtimeEvent(EventDataArrived, "task-1", "instance-1", nil)
+	event := realtime.NewRealtimeEvent(realtime.EventDataArrived, "task-1", "instance-1", nil)
 
 	event.WithMetadata("key1", "value1").WithMetadata("key2", "value2")
 
@@ -48,7 +49,7 @@ func TestRealtimeEvent_WithMetadata(t *testing.T) {
 }
 
 func TestRealtimeEvent_WithCorrelationID(t *testing.T) {
-	event := NewRealtimeEvent(EventDataArrived, "task-1", "instance-1", nil)
+	event := realtime.NewRealtimeEvent(realtime.EventDataArrived, "task-1", "instance-1", nil)
 
 	event.WithCorrelationID("correlation-123")
 
@@ -56,7 +57,7 @@ func TestRealtimeEvent_WithCorrelationID(t *testing.T) {
 }
 
 func TestRealtimeEvent_JSON_Serialization(t *testing.T) {
-	payload := &DataArrivedPayload{
+	payload := &realtime.DataArrivedPayload{
 		Data:     map[string]interface{}{"field": "value"},
 		Source:   "test_source",
 		Size:     256,
@@ -64,15 +65,13 @@ func TestRealtimeEvent_JSON_Serialization(t *testing.T) {
 		BatchID:  "batch-001",
 	}
 
-	event := NewRealtimeEvent(EventDataArrived, "task-1", "instance-1", payload)
+	event := realtime.NewRealtimeEvent(realtime.EventDataArrived, "task-1", "instance-1", payload)
 	event.WithMetadata("env", "test").WithCorrelationID("corr-123")
 
-	// 序列化
 	data, err := json.Marshal(event)
 	require.NoError(t, err)
 
-	// 反序列化
-	var decoded RealtimeEvent
+	var decoded realtime.RealtimeEvent
 	err = json.Unmarshal(data, &decoded)
 	require.NoError(t, err)
 
@@ -85,7 +84,7 @@ func TestRealtimeEvent_JSON_Serialization(t *testing.T) {
 }
 
 func TestDataArrivedPayload_Fields(t *testing.T) {
-	payload := &DataArrivedPayload{
+	payload := &realtime.DataArrivedPayload{
 		Data:     []byte("raw data"),
 		Source:   "websocket://api.example.com",
 		Size:     1024,
@@ -101,7 +100,7 @@ func TestDataArrivedPayload_Fields(t *testing.T) {
 }
 
 func TestConnectionPayload_Fields(t *testing.T) {
-	payload := &ConnectionPayload{
+	payload := &realtime.ConnectionPayload{
 		Endpoint:   "wss://api.tushare.pro/ws",
 		Protocol:   "websocket",
 		RetryCount: 3,
@@ -115,7 +114,7 @@ func TestConnectionPayload_Fields(t *testing.T) {
 }
 
 func TestErrorPayload_Fields(t *testing.T) {
-	payload := &ErrorPayload{
+	payload := &realtime.ErrorPayload{
 		ErrorCode:   "E001",
 		Message:     "connection lost",
 		Stack:       "at main.go:123",
@@ -129,7 +128,7 @@ func TestErrorPayload_Fields(t *testing.T) {
 }
 
 func TestBackpressurePayload_Fields(t *testing.T) {
-	payload := &BackpressurePayload{
+	payload := &realtime.BackpressurePayload{
 		BufferUsage: 0.85,
 		QueueLength: 8500,
 		Threshold:   0.8,
@@ -143,7 +142,7 @@ func TestBackpressurePayload_Fields(t *testing.T) {
 }
 
 func TestTaskStatusPayload_Fields(t *testing.T) {
-	payload := &TaskStatusPayload{
+	payload := &realtime.TaskStatusPayload{
 		TaskID:    "task-123",
 		TaskName:  "quote_collector",
 		OldStatus: "running",
@@ -159,14 +158,14 @@ func TestTaskStatusPayload_Fields(t *testing.T) {
 }
 
 func TestEventSubscription_Fields(t *testing.T) {
-	subscription := EventSubscription{
-		EventType:   EventDataArrived,
+	subscription := realtime.EventSubscription{
+		EventType:   realtime.EventDataArrived,
 		HandlerName: "process_quote",
 		Filter:      "ts_code == '000001.SZ'",
 		Priority:    10,
 	}
 
-	assert.Equal(t, EventDataArrived, subscription.EventType)
+	assert.Equal(t, realtime.EventDataArrived, subscription.EventType)
 	assert.Equal(t, "process_quote", subscription.HandlerName)
 	assert.Equal(t, "ts_code == '000001.SZ'", subscription.Filter)
 	assert.Equal(t, 10, subscription.Priority)
@@ -174,10 +173,9 @@ func TestEventSubscription_Fields(t *testing.T) {
 
 func TestRealtimeEvent_TimestampIsRecent(t *testing.T) {
 	before := time.Now()
-	event := NewRealtimeEvent(EventDataArrived, "task-1", "instance-1", nil)
+	event := realtime.NewRealtimeEvent(realtime.EventDataArrived, "task-1", "instance-1", nil)
 	after := time.Now()
 
 	assert.True(t, event.Timestamp.After(before) || event.Timestamp.Equal(before))
 	assert.True(t, event.Timestamp.Before(after) || event.Timestamp.Equal(after))
 }
-

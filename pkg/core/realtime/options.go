@@ -1,13 +1,28 @@
 // Package realtime 提供实时数据采集任务的配置选项
 package realtime
 
-import "time"
+import (
+	"time"
+
+	"github.com/LENAX/task-engine/pkg/core/task"
+)
+
+// DataHandlerRegistry 用于 runStreamProcessor 按名获取并调用 DataHandler 的最小接口
+type DataHandlerRegistry interface {
+	GetByName(name string) task.JobFunctionType
+}
 
 // options 内部配置选项
 type options struct {
 	// 缓冲区配置
 	bufferSize            int
 	backpressureThreshold float64
+
+	// 采集器注册表（可选，用于 runDataCollector 按名查找）
+	collectorRegistry DataCollectorRegistry
+
+	// 函数注册表（可选，用于 runStreamProcessor 调用 DataHandler）
+	functionRegistry DataHandlerRegistry
 
 	// 日志配置
 	debug bool
@@ -56,6 +71,20 @@ func WithBackpressureThreshold(threshold float64) Option {
 		if threshold > 0 && threshold <= 1 {
 			o.backpressureThreshold = threshold
 		}
+	}
+}
+
+// WithCollectorRegistry 设置采集器注册表
+func WithCollectorRegistry(registry DataCollectorRegistry) Option {
+	return func(o *options) {
+		o.collectorRegistry = registry
+	}
+}
+
+// WithFunctionRegistry 设置函数注册表（用于 runStreamProcessor 调用 DataHandler）
+func WithFunctionRegistry(registry DataHandlerRegistry) Option {
+	return func(o *options) {
+		o.functionRegistry = registry
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/LENAX/task-engine/internal/storage"
 	"github.com/LENAX/task-engine/internal/storage/sqlite"
 	"github.com/LENAX/task-engine/pkg/config"
+	"github.com/LENAX/task-engine/pkg/core/realtime"
 	"github.com/LENAX/task-engine/pkg/core/task"
 	"github.com/LENAX/task-engine/pkg/plugin"
 )
@@ -27,10 +28,11 @@ type EngineBuilder struct {
 	jobFuncs                map[string]JobFunc
 	callbackFuncs           map[string]CallbackFunc
 	services                map[string]interface{}
-	functionMap             map[string]interface{}        // 函数映射表，用于函数恢复
-	restoreFunctionsOnStart bool                        // 是否在启动时自动恢复函数
-	plugins                 map[string]plugin.Plugin     // 已注册的插件
-	pluginBindings          []plugin.PluginBinding       // 插件绑定规则
+	dataCollectors          map[string]realtime.DataCollector // 实时采集器（name -> 实现）
+	functionMap             map[string]interface{}            // 函数映射表，用于函数恢复
+	restoreFunctionsOnStart bool                              // 是否在启动时自动恢复函数
+	plugins                 map[string]plugin.Plugin         // 已注册的插件
+	pluginBindings          []plugin.PluginBinding           // 插件绑定规则
 	err                     error
 }
 
@@ -41,6 +43,7 @@ func NewEngineBuilder(engineConfigPath string) *EngineBuilder {
 		jobFuncs:                make(map[string]JobFunc),
 		callbackFuncs:           make(map[string]CallbackFunc),
 		services:                make(map[string]interface{}),
+		dataCollectors:         make(map[string]realtime.DataCollector),
 		functionMap:             make(map[string]interface{}),
 		restoreFunctionsOnStart: false,
 		plugins:                 make(map[string]plugin.Plugin),
@@ -84,6 +87,19 @@ func (b *EngineBuilder) WithService(serviceKey string, service interface{}) *Eng
 		return b
 	}
 	b.services[serviceKey] = service
+	return b
+}
+
+// WithDataCollector 注册实时数据采集器（name 对应 RealtimeTaskBuilder.WithCollector(name)）
+func (b *EngineBuilder) WithDataCollector(name string, collector realtime.DataCollector) *EngineBuilder {
+	if b.err != nil {
+		return b
+	}
+	if name == "" || collector == nil {
+		b.err = errors.New("data collector name or instance is empty")
+		return b
+	}
+	b.dataCollectors[name] = collector
 	return b
 }
 
@@ -249,6 +265,17 @@ func (b *EngineBuilder) Build() (*Engine, error) {
 			// 依赖已存在时忽略错误（允许重复注册）
 			log.Printf("注册服务依赖 %s 失败（可能已存在）: %v", serviceKey, err)
 		}
+	}
+
+	// 9b. 创建并注入实时采集器注册表
+	if len(b.dataCollectors) > 0 {
+		collectorRegistry := realtime.NewDataCollectorRegistry()
+		for name, collector := range b.dataCollectors {
+			if err := collectorRegistry.Register(name, collector); err != nil {
+				return nil, fmt.Errorf("register data collector %s failed: %w", name, err)
+			}
+		}
+		engine.collectorRegistry = collectorRegistry
 	}
 
 	// 10. 如果提供了functionMap，保存到Engine中，供Start()时恢复使用

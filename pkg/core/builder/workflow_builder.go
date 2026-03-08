@@ -11,16 +11,28 @@ import (
 
 // WorkflowBuilder Workflow构建器（对外导出）
 type WorkflowBuilder struct {
-	wf    *workflow.Workflow
-	tasks []*task.Task // 临时存储Task列表，Build时处理
+	wf        *workflow.Workflow
+	tasks     []*task.Task                    // 临时存储Task列表，Build时处理
+	collectors map[string]realtime.DataCollector // 流式 Workflow 的 DataCollector 注册（name -> 实例），Build 时写入 Workflow
 }
 
 // NewWorkflowBuilder 创建构建器（对外导出）
 func NewWorkflowBuilder(name, desc string) *WorkflowBuilder {
 	return &WorkflowBuilder{
-		wf:    workflow.NewWorkflow(name, desc),
-		tasks: make([]*task.Task, 0),
+		wf:         workflow.NewWorkflow(name, desc),
+		tasks:      make([]*task.Task, 0),
+		collectors: make(map[string]realtime.DataCollector),
 	}
+}
+
+// WithDataCollector 为流式 Workflow 注册 DataCollector（对外导出）
+// 在 Build 时会合并为 DataCollectorRegistry 并设置到 Workflow，Engine 创建 RealtimeInstanceManager 时使用
+// name 对应 RealtimeTaskBuilder.WithCollector(name)
+func (b *WorkflowBuilder) WithDataCollector(name string, collector realtime.DataCollector) *WorkflowBuilder {
+	if name != "" && collector != nil {
+		b.collectors[name] = collector
+	}
+	return b
 }
 
 // WithName 设置Workflow的业务名称（链式构建，对外导出）
@@ -154,6 +166,17 @@ func (b *WorkflowBuilder) Build() (*workflow.Workflow, error) {
 	// 5. 校验Workflow合法性
 	if err := b.wf.Validate(); err != nil {
 		return nil, fmt.Errorf("Workflow校验失败: %w", err)
+	}
+
+	// 6. 若有注册的 DataCollector，合并为 DataCollectorRegistry 并设置到 Workflow（供 streaming 实例使用）
+	if len(b.collectors) > 0 {
+		reg := realtime.NewDataCollectorRegistry()
+		for name, c := range b.collectors {
+			if err := reg.Register(name, c); err != nil {
+				return nil, fmt.Errorf("注册 DataCollector %s 失败: %w", name, err)
+			}
+		}
+		b.wf.SetCollectorRegistry(reg)
 	}
 
 	return b.wf, nil

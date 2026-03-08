@@ -59,6 +59,7 @@ type Engine struct {
 	controllers             map[string]workflow.WorkflowController   // WorkflowInstance ID -> Controller映射
 	cronScheduler           *CronScheduler                           // 定时调度器
 	pluginManager           plugin.PluginManager                     // 插件管理器（接口）
+	collectorRegistry       realtime.DataCollectorRegistry          // 实时采集器注册表（可选）
 	mu                      sync.RWMutex
 	instanceManagerVersion  InstanceManagerVersion // InstanceManager版本，默认V2
 }
@@ -536,23 +537,43 @@ func (e *Engine) Stop() {
 		}
 	}
 
-	// 3. 等待所有WorkflowInstance完成终止流程（最多等待30秒）
-	// 使用WaitGroup等待所有Manager的协程完成
+	// 3. 等待所有 WorkflowInstance 完成终止流程（最多等待 30 秒）
+	// 对实现了 ShutdownOnTerminateOnly 的 Manager（如 RealtimeInstanceManager）只发 Terminate、不调 Shutdown，
+	// 由其内部 controlSignalHandler 自行 Shutdown，避免双处调用导致 wg 死锁；其余 Manager 由本处调用 Shutdown()。
+	var selfShutdownManagers []types.WorkflowInstanceManager
+	var otherManagers []types.WorkflowInstanceManager
+	for _, manager := range instances {
+		if v, ok := manager.(realtime.ShutdownOnTerminateOnly); ok && v.ShutdownOnTerminateOnly() {
+			selfShutdownManagers = append(selfShutdownManagers, manager)
+		} else {
+			otherManagers = append(otherManagers, manager)
+		}
+	}
 	done := make(chan struct{})
 	go func() {
-		for _, manager := range instances {
+		for _, manager := range otherManagers {
 			manager.Shutdown()
 		}
 		close(done)
 	}()
 
+	shutdownTimeout := 30 * time.Second
 	select {
 	case <-done:
-		// 所有Manager已完成关闭
-		log.Println("所有WorkflowInstance已关闭")
-	case <-time.After(30 * time.Second):
-		// 超时，记录日志
-		log.Println("等待WorkflowInstance关闭超时")
+		log.Println("所有需主动 Shutdown 的 WorkflowInstance 已关闭")
+	case <-time.After(shutdownTimeout):
+		log.Println("等待 WorkflowInstance 关闭超时")
+	}
+
+	// 轮询“仅由 Terminate 触发关闭”的实例，直到 Stopped 或超时
+	deadline := time.Now().Add(shutdownTimeout)
+	for _, manager := range selfShutdownManagers {
+		for time.Now().Before(deadline) && manager.GetStatus() != "Stopped" {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if manager.GetStatus() != "Stopped" {
+			log.Printf("WorkflowInstance %s 在 Terminate 后未在超时内变为 Stopped", manager.GetInstanceID())
+		}
 	}
 
 	// 4. 保存所有Running状态的WorkflowInstance的断点数据
@@ -1292,14 +1313,31 @@ func (e *Engine) createRealtimeInstanceManager(
 		return nil, fmt.Errorf("Workflow 执行模式必须为 'streaming'，当前: %s", wf.GetExecutionMode())
 	}
 
-	// 创建 RealtimeInstanceManager
+	opts := []realtime.Option{
+		realtime.WithBufferSize(10000),
+		realtime.WithBackpressureThreshold(0.8),
+	}
+	// 优先使用 Workflow 在 Builder 处注册的 DataCollectorRegistry，否则回退到 Engine 级
+	var collectorReg realtime.DataCollectorRegistry
+	if r := wf.GetCollectorRegistry(); r != nil {
+		if reg, ok := r.(realtime.DataCollectorRegistry); ok {
+			collectorReg = reg
+		}
+	}
+	if collectorReg == nil {
+		collectorReg = e.collectorRegistry
+	}
+	if collectorReg != nil {
+		opts = append(opts, realtime.WithCollectorRegistry(collectorReg))
+	}
+	if e.registry != nil {
+		opts = append(opts, realtime.WithFunctionRegistry(e.registry))
+	}
 	return realtime.NewRealtimeInstanceManager(
 		instance,
 		wf,
 		e.workflowInstanceRepo,
-		// 选项配置
-		realtime.WithBufferSize(10000),
-		realtime.WithBackpressureThreshold(0.8),
+		opts...,
 	)
 }
 

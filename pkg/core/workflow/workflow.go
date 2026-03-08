@@ -44,6 +44,9 @@ type Workflow struct {
 	CronEnabled           bool         `json:"cron_enabled"`             // 是否启用定时调度
 	ExecutionMode         string       `json:"execution_mode"`           // 执行模式（batch/streaming），默认batch
 	fieldsMu              sync.RWMutex // 保护 SubTaskErrorTolerance, Transactional, TransactionMode, MaxConcurrentTask, CronExpr, CronEnabled, ExecutionMode 字段
+
+	// collectorRegistry 仅 streaming 时使用，由 WorkflowBuilder.WithDataCollector + Build 设置
+	collectorRegistry interface{}
 }
 
 // BreakpointData 断点数据（对外导出）
@@ -760,6 +763,18 @@ func (w *Workflow) IsStreamingMode() bool {
 // IsBatchMode 检查是否为批处理模式（对外导出，线程安全）
 func (w *Workflow) IsBatchMode() bool {
 	return w.GetExecutionMode() == ExecutionModeBatch
+}
+
+// GetCollectorRegistry 获取流式 Workflow 的 DataCollector 注册表（对外导出）
+// 由 WorkflowBuilder.WithDataCollector + Build 设置，Engine 创建 RealtimeInstanceManager 时使用
+// 返回类型在 realtime 包中断言为 realtime.DataCollectorRegistry
+func (w *Workflow) GetCollectorRegistry() interface{} {
+	return w.collectorRegistry
+}
+
+// SetCollectorRegistry 设置 DataCollector 注册表（对外导出，仅由 WorkflowBuilder.Build 调用）
+func (w *Workflow) SetCollectorRegistry(registry interface{}) {
+	w.collectorRegistry = registry
 }
 
 // ReplaceWorkflowParams 仅替换Workflow级别的参数占位符（不替换Task参数）（对外导出，线程安全）

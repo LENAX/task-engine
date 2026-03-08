@@ -21,6 +21,12 @@ import (
 	"github.com/LENAX/task-engine/pkg/storage"
 )
 
+// ShutdownOnTerminateOnly 表示该 Manager 在收到 Terminate 后由内部 controlSignalHandler 自行调用 Shutdown，
+// 外部（如 Engine.Stop）不应再对其调用 Shutdown()，否则可能造成 wg 死锁。Engine 应只发 Terminate 并轮询 GetStatus() 直到 Stopped。
+type ShutdownOnTerminateOnly interface {
+	ShutdownOnTerminateOnly() bool
+}
+
 // RealtimeInstanceManager 实时实例管理器接口
 // 继承 types.WorkflowInstanceManager 接口，并扩展实时特定功能
 type RealtimeInstanceManager interface {
@@ -46,6 +52,9 @@ type RealtimeInstanceManager interface {
 
 	// GetMetrics 获取运行指标
 	GetMetrics() *RealtimeMetrics
+
+	// GetDataBuffer 获取数据缓冲区（供测试或监控使用）
+	GetDataBuffer() *DataBuffer
 }
 
 // RealtimeMetrics 运行指标
@@ -84,6 +93,12 @@ type realtimeInstanceManagerImpl struct {
 	// 数据缓冲（背压控制）
 	dataBuffer *DataBuffer
 
+	// 采集器注册表（可选）
+	collectorRegistry DataCollectorRegistry
+
+	// 函数注册表（可选，用于 runStreamProcessor 调用 DataHandler）
+	functionRegistry DataHandlerRegistry
+
 	// 状态管理
 	state atomic.Value // ContinuousTaskState
 
@@ -94,6 +109,9 @@ type realtimeInstanceManagerImpl struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// shutdownMu 保证同一时间只有一个 Shutdown 执行，避免 Engine.Stop 与 handleTerminate 并发调用导致 wg.Wait 死锁
+	shutdownMu sync.Mutex
 
 	// 通道
 	controlSignalChan chan workflow.ControlSignal
@@ -164,6 +182,8 @@ func NewRealtimeInstanceManager(
 		router:            msgRouter,
 		logger:            logger,
 		dataBuffer:        NewDataBuffer(options.bufferSize, options.backpressureThreshold),
+		collectorRegistry: options.collectorRegistry,
+		functionRegistry:  options.functionRegistry,
 		stateStore:        stateStore,
 		ctx:               ctx,
 		cancel:            cancel,
@@ -279,12 +299,32 @@ func (m *realtimeInstanceManagerImpl) Start() {
 		}
 	}
 
-	// 启动消息路由器
+	// 启动消息路由器：watermill Router.Run(ctx) 在部分版本中不会随 ctx 取消而立即返回，
+	// 故由本 goroutine 在 ctx.Done() 时主动 Close() 并等待 Run 返回；若 Run 未在超时内返回则本 goroutine 仍退出，避免 wg.Wait 死锁
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		if err := m.router.Run(m.ctx); err != nil {
-			log.Printf("消息路由器退出: %v", err)
+		runDone := make(chan struct{})
+		go func() {
+			if err := m.router.Run(m.ctx); err != nil {
+				log.Printf("消息路由器退出: %v", err)
+			}
+			close(runDone)
+		}()
+		select {
+		case <-m.ctx.Done():
+			// 在后台触发 Close，避免本 goroutine 卡在 router.Close() 内导致 wg.Wait 死锁
+			go func() { _ = m.router.Close() }()
+			routerWait := 2 * time.Second
+			if m.opts.shutdownTimeout > 0 && m.opts.shutdownTimeout < routerWait {
+				routerWait = m.opts.shutdownTimeout
+			}
+			select {
+			case <-runDone:
+			case <-time.After(routerWait):
+				log.Printf("RealtimeInstance %s: 等待 router.Run 退出超时", m.instance.ID)
+			}
+		case <-runDone:
 		}
 	}()
 
@@ -400,26 +440,34 @@ func (m *realtimeInstanceManagerImpl) runContinuousTask(taskID string, ct *Conti
 }
 
 // executeTaskLogic 执行任务逻辑
+// TaskTypeDataCollector 与 TaskTypeScheduledPoller 统一走 runDataCollector，由 Config.Mode 与用户实现区分 push/pull
 func (m *realtimeInstanceManagerImpl) executeTaskLogic(ct *ContinuousTask) error {
 	switch ct.Config.Type {
-	case TaskTypeDataCollector:
+	case TaskTypeDataCollector, TaskTypeScheduledPoller:
 		return m.runDataCollector(ct)
 	case TaskTypeStreamProcessor:
 		return m.runStreamProcessor(ct)
 	case TaskTypeEventListener:
 		return m.runEventListener(ct)
-	case TaskTypeScheduledPoller:
-		return m.runScheduledPoller(ct)
 	default:
 		return fmt.Errorf("未知任务类型: %s", ct.Config.Type)
 	}
 }
 
-// runDataCollector 运行数据采集器
+// runDataCollector 运行数据采集器（唯一生产者路径；DataCollector 与 ScheduledPoller 均走此逻辑）
 func (m *realtimeInstanceManagerImpl) runDataCollector(ct *ContinuousTask) error {
-	// 这里是数据采集的占位实现
-	// 实际实现需要根据 ct.Config.Protocol 连接到数据源
-	time.Sleep(100 * time.Millisecond) // 模拟数据采集间隔
+	if m.collectorRegistry != nil && ct.Config.CollectorName != "" {
+		collector, ok := m.collectorRegistry.Get(ct.Config.CollectorName)
+		if !ok {
+			return fmt.Errorf("未注册的采集器: %s", ct.Config.CollectorName)
+		}
+		publish := func(event *RealtimeEvent) error {
+			return m.PublishEvent(m.ctx, event)
+		}
+		return collector.Run(ct.Context(), &ct.Config, publish)
+	}
+	// 占位：未配置采集器时短 sleep
+	time.Sleep(100 * time.Millisecond)
 	return nil
 }
 
@@ -434,6 +482,19 @@ func (m *realtimeInstanceManagerImpl) runStreamProcessor(ct *ContinuousTask) err
 
 	ct.IncrementDataCount()
 	ct.UpdateLastDataTime()
+
+	// 若配置了 DataHandler 且注册表可用，则调用 Job 函数处理数据
+	if ct.Config.DataHandler != "" && m.functionRegistry != nil {
+		if fn := m.functionRegistry.GetByName(ct.Config.DataHandler); fn != nil {
+			params := map[string]interface{}{"data": data}
+			taskCtx := task.NewTaskContext(m.ctx, ct.Config.ID, ct.Config.Name, m.wf.GetID(), m.instance.ID, params)
+			stateCh := fn(taskCtx)
+			if state := <-stateCh; state.Status == "Failed" && state.Error != nil {
+				log.Printf("Task %s DataHandler %s 执行失败: %v", ct.Config.ID, ct.Config.DataHandler, state.Error)
+				ct.IncrementErrorCount()
+			}
+		}
+	}
 
 	// 发布数据处理完成事件
 	m.PublishEvent(m.ctx, NewRealtimeEvent(
@@ -454,17 +515,6 @@ func (m *realtimeInstanceManagerImpl) runStreamProcessor(ct *ContinuousTask) err
 func (m *realtimeInstanceManagerImpl) runEventListener(ct *ContinuousTask) error {
 	// 等待事件
 	time.Sleep(100 * time.Millisecond)
-	return nil
-}
-
-// runScheduledPoller 运行定时轮询器
-func (m *realtimeInstanceManagerImpl) runScheduledPoller(ct *ContinuousTask) error {
-	// 按配置的间隔轮询
-	interval := ct.Config.FlushInterval
-	if interval <= 0 {
-		interval = time.Second
-	}
-	time.Sleep(interval)
 	return nil
 }
 
@@ -549,11 +599,19 @@ func (m *realtimeInstanceManagerImpl) reconnect(ct *ContinuousTask) error {
 
 // Shutdown 优雅关闭
 func (m *realtimeInstanceManagerImpl) Shutdown() {
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+	if m.state.Load() == StateStopped {
+		return
+	}
 	log.Printf("RealtimeInstance %s: 开始关闭...", m.instance.ID)
-
 	m.state.Store(StateStopping)
 
-	// 停止所有持续任务
+	// 先取消上下文，使 router 包装 goroutine、metricsCollector 以及依赖 m.ctx 的 task 能立即收到 Done 并退出，
+	// 避免本函数卡在 taskWg.Wait() 或 wg.Wait() 导致永远无法执行到 cancel()
+	m.cancel()
+
+	// 停止所有持续任务（ct.Stop 取消任务上下文，配合上面 m.cancel() 使 task 尽快退出）
 	m.continuousTasks.Range(func(key, value interface{}) bool {
 		ct := value.(*ContinuousTask)
 		ct.Stop()
@@ -573,25 +631,35 @@ func (m *realtimeInstanceManagerImpl) Shutdown() {
 	case <-time.After(m.opts.shutdownTimeout):
 		log.Printf("RealtimeInstance %s: 任务停止超时", m.instance.ID)
 	}
-
-	// 关闭路由器
+	// 再关闭路由器与 Pub/Sub（若 Run 未随 ctx 退出，Close 会令其返回）
 	if err := m.router.Close(); err != nil {
 		log.Printf("关闭路由器失败: %v", err)
 	}
-
-	// 关闭 Pub/Sub
 	if err := m.pubsub.Close(); err != nil {
 		log.Printf("关闭 Pub/Sub 失败: %v", err)
 	}
 
-	// 取消上下文
-	m.cancel()
+	// 等待其他 goroutine（router 包装、metricsCollector）退出，带超时以防 watermill 未及时响应 cancel/Close
+	wgDone := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(wgDone)
+	}()
+	wgWait := 3 * time.Second
+	if m.opts.shutdownTimeout > 0 && m.opts.shutdownTimeout < wgWait {
+		wgWait = m.opts.shutdownTimeout
+	}
+	select {
+	case <-wgDone:
+	case <-time.After(wgWait):
+		log.Printf("RealtimeInstance %s: 等待 router/metrics 退出超时", m.instance.ID)
+	}
 
-	// 等待其他 goroutine
-	m.wg.Wait()
-
-	// 更新状态
+	// 更新状态（含 instance.Status 以便 Engine.Stop 轮询 GetStatus() 能见到 Stopped）
 	m.state.Store(StateStopped)
+	m.mu.Lock()
+	m.instance.Status = "Stopped"
+	m.mu.Unlock()
 
 	// 持久化最终状态
 	ctx := context.Background()
@@ -1139,6 +1207,11 @@ func (m *realtimeInstanceManagerImpl) metricsCollector() {
 
 // handleDataArrived 处理数据到达事件
 func (m *realtimeInstanceManagerImpl) handleDataArrived(msg *message.Message) error {
+	select {
+	case <-m.ctx.Done():
+		return nil
+	default:
+	}
 	var event RealtimeEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
 		return err
@@ -1163,6 +1236,11 @@ func (m *realtimeInstanceManagerImpl) handleDataArrived(msg *message.Message) er
 
 // handleConnectionLost 处理连接断开事件
 func (m *realtimeInstanceManagerImpl) handleConnectionLost(msg *message.Message) error {
+	select {
+	case <-m.ctx.Done():
+		return nil
+	default:
+	}
 	var event RealtimeEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
 		return err
@@ -1181,6 +1259,11 @@ func (m *realtimeInstanceManagerImpl) handleConnectionLost(msg *message.Message)
 
 // handleError 处理错误事件
 func (m *realtimeInstanceManagerImpl) handleError(msg *message.Message) error {
+	select {
+	case <-m.ctx.Done():
+		return nil
+	default:
+	}
 	var event RealtimeEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
 		return err
@@ -1202,6 +1285,11 @@ func (m *realtimeInstanceManagerImpl) handleError(msg *message.Message) error {
 
 // handleBackpressure 处理背压事件
 func (m *realtimeInstanceManagerImpl) handleBackpressure(msg *message.Message) error {
+	select {
+	case <-m.ctx.Done():
+		return nil
+	default:
+	}
 	var event RealtimeEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
 		return err
@@ -1225,4 +1313,9 @@ func (m *realtimeInstanceManagerImpl) PushData(data interface{}) bool {
 // GetDataBuffer 获取数据缓冲区（供测试使用）
 func (m *realtimeInstanceManagerImpl) GetDataBuffer() *DataBuffer {
 	return m.dataBuffer
+}
+
+// ShutdownOnTerminateOnly 实现 ShutdownOnTerminateOnly 接口，Engine.Stop 将只发 Terminate 并轮询状态，不调用 Shutdown()
+func (m *realtimeInstanceManagerImpl) ShutdownOnTerminateOnly() bool {
+	return true
 }

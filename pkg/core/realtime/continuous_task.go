@@ -18,6 +18,12 @@ const (
 	TaskTypeScheduledPoller ContinuousTaskType = "scheduled_poller" // 定时轮询器
 )
 
+// 采集器 Mode 常量（push=推送/长连接，pull=拉取/定时轮询）
+const (
+	CollectorModePush = "push"
+	CollectorModePull = "pull"
+)
+
 // ContinuousTaskState 持续任务状态
 type ContinuousTaskState string
 
@@ -56,6 +62,10 @@ type ContinuousTaskConfig struct {
 	Name string             `json:"name"`
 	Type ContinuousTaskType `json:"type"`
 
+	// 采集器：注册名与 Mode（push/pull），空表示不使用注册的采集器
+	CollectorName string `json:"collector_name"` // 注册的 DataCollector 名称
+	Mode          string `json:"mode"`            // 推送(push)或拉取(pull)，默认 push
+
 	// 连接配置
 	Endpoint string `json:"endpoint"` // 连接端点
 	Protocol string `json:"protocol"` // 协议（ws/wss/tcp/http）
@@ -91,6 +101,8 @@ func NewContinuousTaskConfig(id, name string, taskType ContinuousTaskType) *Cont
 		ID:                    id,
 		Name:                  name,
 		Type:                  taskType,
+		CollectorName:         "",
+		Mode:                  CollectorModePush,
 		ReconnectEnabled:      true,
 		ReconnectBackoff:      DefaultReconnectBackoffConfig(),
 		MaxReconnectAttempts:  0, // 无限重连

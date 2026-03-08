@@ -1,4 +1,4 @@
-package realtime
+package unit
 
 import (
 	"sync"
@@ -7,56 +7,51 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/LENAX/task-engine/pkg/core/realtime"
 )
 
 func TestNewDataBuffer_DefaultValues(t *testing.T) {
-	buffer := NewDataBuffer(0, 0)
+	buffer := realtime.NewDataBuffer(0, 0)
 
-	assert.Equal(t, 10000, buffer.capacity)
-	assert.Equal(t, 0.8, buffer.threshold)
+	assert.Equal(t, 10000, buffer.Cap())
+	assert.Equal(t, 0.8, buffer.GetThreshold())
 }
 
 func TestNewDataBuffer_CustomValues(t *testing.T) {
-	buffer := NewDataBuffer(5000, 0.9)
+	buffer := realtime.NewDataBuffer(5000, 0.9)
 
-	assert.Equal(t, 5000, buffer.capacity)
-	assert.Equal(t, 0.9, buffer.threshold)
+	assert.Equal(t, 5000, buffer.Cap())
+	assert.Equal(t, 0.9, buffer.GetThreshold())
 }
 
 func TestDataBuffer_Push_NonBlocking(t *testing.T) {
-	buffer := NewDataBuffer(10, 0.8)
+	buffer := realtime.NewDataBuffer(10, 0.8)
 
-	// 应该成功推入
 	for i := 0; i < 10; i++ {
 		ok := buffer.Push(i)
 		assert.True(t, ok, "Push should succeed for item %d", i)
 	}
 
-	// 缓冲区已满，应该失败
 	ok := buffer.Push(100)
 	assert.False(t, ok, "Push should fail when buffer is full")
 
-	// 检查统计
 	assert.Equal(t, int64(10), buffer.GetTotalIn())
 	assert.Equal(t, int64(1), buffer.GetDropped())
 }
 
 func TestDataBuffer_Pop_NonBlocking(t *testing.T) {
-	buffer := NewDataBuffer(10, 0.8)
+	buffer := realtime.NewDataBuffer(10, 0.8)
 
-	// 空缓冲区弹出应该失败
 	_, ok := buffer.Pop()
 	assert.False(t, ok, "Pop should fail on empty buffer")
 
-	// 推入数据
 	buffer.Push("test")
 
-	// 应该成功弹出
 	item, ok := buffer.Pop()
 	assert.True(t, ok, "Pop should succeed")
 	assert.Equal(t, "test", item)
 
-	// 再次弹出应该失败
 	_, ok = buffer.Pop()
 	assert.False(t, ok, "Pop should fail on empty buffer")
 
@@ -64,9 +59,8 @@ func TestDataBuffer_Pop_NonBlocking(t *testing.T) {
 }
 
 func TestDataBuffer_PushBlocking(t *testing.T) {
-	buffer := NewDataBuffer(10, 0.8)
+	buffer := realtime.NewDataBuffer(10, 0.8)
 
-	// 异步推入
 	done := make(chan struct{})
 	go func() {
 		buffer.PushBlocking("blocking-test")
@@ -75,7 +69,6 @@ func TestDataBuffer_PushBlocking(t *testing.T) {
 
 	select {
 	case <-done:
-		// 成功
 	case <-time.After(time.Second):
 		t.Fatal("PushBlocking should not block when buffer has space")
 	}
@@ -86,19 +79,16 @@ func TestDataBuffer_PushBlocking(t *testing.T) {
 }
 
 func TestDataBuffer_PopBlocking(t *testing.T) {
-	buffer := NewDataBuffer(10, 0.8)
+	buffer := realtime.NewDataBuffer(10, 0.8)
 
-	// 异步弹出（会阻塞直到有数据）
 	done := make(chan interface{})
 	go func() {
 		item := buffer.PopBlocking()
 		done <- item
 	}()
 
-	// 等待一小段时间确保 goroutine 已启动
 	time.Sleep(50 * time.Millisecond)
 
-	// 推入数据
 	buffer.Push("blocking-pop-test")
 
 	select {
@@ -110,10 +100,9 @@ func TestDataBuffer_PopBlocking(t *testing.T) {
 }
 
 func TestDataBuffer_TryPopWithDone(t *testing.T) {
-	buffer := NewDataBuffer(10, 0.8)
+	buffer := realtime.NewDataBuffer(10, 0.8)
 	done := make(chan struct{})
 
-	// 测试 done 通道关闭的情况
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		close(done)
@@ -123,7 +112,6 @@ func TestDataBuffer_TryPopWithDone(t *testing.T) {
 	assert.False(t, ok)
 	assert.True(t, cancelled)
 
-	// 测试有数据的情况
 	buffer.Push("test")
 	done2 := make(chan struct{})
 	item, ok, cancelled := buffer.TryPopWithDone(done2)
@@ -133,7 +121,7 @@ func TestDataBuffer_TryPopWithDone(t *testing.T) {
 }
 
 func TestDataBuffer_Usage(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.8)
+	buffer := realtime.NewDataBuffer(100, 0.8)
 
 	assert.Equal(t, 0.0, buffer.Usage())
 
@@ -149,27 +137,23 @@ func TestDataBuffer_Usage(t *testing.T) {
 }
 
 func TestDataBuffer_Backpressure(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.8)
+	buffer := realtime.NewDataBuffer(100, 0.8)
 
-	// 初始状态不应该是背压
 	assert.False(t, buffer.IsBackpressure())
 
-	// 填充到背压阈值
 	for i := 0; i < 80; i++ {
 		buffer.Push(i)
 	}
 	assert.True(t, buffer.IsBackpressure(), "Should be in backpressure state when usage >= threshold")
 
-	// 消费到阈值的一半以下
 	for i := 0; i < 50; i++ {
 		buffer.Pop()
 	}
-	// 使用率现在是 30/100 = 0.3，小于 0.8 * 0.5 = 0.4，应该解除背压
 	assert.False(t, buffer.IsBackpressure(), "Backpressure should be relieved when usage < threshold * 0.5")
 }
 
 func TestDataBuffer_BackpressureCallback(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.8)
+	buffer := realtime.NewDataBuffer(100, 0.8)
 
 	var backpressureTriggered int32
 	var backpressureRelieved int32
@@ -182,34 +166,28 @@ func TestDataBuffer_BackpressureCallback(t *testing.T) {
 		atomic.AddInt32(&backpressureRelieved, 1)
 	})
 
-	// 触发背压
 	for i := 0; i < 80; i++ {
 		buffer.Push(i)
 	}
 
-	// 等待回调执行
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&backpressureTriggered))
 
-	// 解除背压
 	for i := 0; i < 50; i++ {
 		buffer.Pop()
 	}
 
-	// 等待回调执行
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&backpressureRelieved))
 }
 
 func TestDataBuffer_Stats(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.8)
+	buffer := realtime.NewDataBuffer(100, 0.8)
 
-	// 推入一些数据
 	for i := 0; i < 30; i++ {
 		buffer.Push(i)
 	}
 
-	// 弹出一些数据
 	for i := 0; i < 10; i++ {
 		buffer.Pop()
 	}
@@ -219,11 +197,11 @@ func TestDataBuffer_Stats(t *testing.T) {
 	assert.Equal(t, int64(30), totalIn)
 	assert.Equal(t, int64(10), totalOut)
 	assert.Equal(t, int64(0), dropped)
-	assert.Equal(t, 0.2, usage) // 20/100
+	assert.Equal(t, 0.2, usage)
 }
 
 func TestDataBuffer_Clear(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.8)
+	buffer := realtime.NewDataBuffer(100, 0.8)
 
 	for i := 0; i < 50; i++ {
 		buffer.Push(i)
@@ -235,7 +213,7 @@ func TestDataBuffer_Clear(t *testing.T) {
 }
 
 func TestDataBuffer_Reset(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.8)
+	buffer := realtime.NewDataBuffer(100, 0.8)
 
 	for i := 0; i < 50; i++ {
 		buffer.Push(i)
@@ -251,7 +229,7 @@ func TestDataBuffer_Reset(t *testing.T) {
 }
 
 func TestDataBuffer_Drain(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.8)
+	buffer := realtime.NewDataBuffer(100, 0.8)
 
 	for i := 0; i < 5; i++ {
 		buffer.Push(i)
@@ -265,10 +243,9 @@ func TestDataBuffer_Drain(t *testing.T) {
 }
 
 func TestDataBuffer_Concurrent(t *testing.T) {
-	buffer := NewDataBuffer(1000, 0.8)
+	buffer := realtime.NewDataBuffer(1000, 0.8)
 	var wg sync.WaitGroup
 
-	// 并发写入
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -279,7 +256,6 @@ func TestDataBuffer_Concurrent(t *testing.T) {
 		}(i)
 	}
 
-	// 并发读取
 	var readCount int64
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
@@ -296,14 +272,13 @@ func TestDataBuffer_Concurrent(t *testing.T) {
 
 	wg.Wait()
 
-	// 验证统计
 	totalIn, totalOut, _, _ := buffer.Stats()
 	assert.Equal(t, int64(1000), totalIn)
 	assert.Equal(t, readCount, totalOut)
 }
 
 func TestDataBuffer_LenAndCap(t *testing.T) {
-	buffer := NewDataBuffer(50, 0.8)
+	buffer := realtime.NewDataBuffer(50, 0.8)
 
 	assert.Equal(t, 50, buffer.Cap())
 	assert.Equal(t, 0, buffer.Len())
@@ -317,7 +292,6 @@ func TestDataBuffer_LenAndCap(t *testing.T) {
 }
 
 func TestDataBuffer_GetThreshold(t *testing.T) {
-	buffer := NewDataBuffer(100, 0.75)
+	buffer := realtime.NewDataBuffer(100, 0.75)
 	assert.Equal(t, 0.75, buffer.GetThreshold())
 }
-

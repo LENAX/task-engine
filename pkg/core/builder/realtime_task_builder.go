@@ -49,11 +49,36 @@ func (b *RealtimeTaskBuilder) WithEndpoint(endpoint, protocol string) *RealtimeT
 }
 
 // WithTaskType 设置持续任务类型
+// 当设为 TaskTypeScheduledPoller 且 Mode 未显式设置时，自动设为 CollectorModePull
 func (b *RealtimeTaskBuilder) WithTaskType(taskType realtime.ContinuousTaskType) *RealtimeTaskBuilder {
 	if b.continuousConfig == nil {
 		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", taskType)
 	} else {
 		b.continuousConfig.Type = taskType
+	}
+	if taskType == realtime.TaskTypeScheduledPoller && b.continuousConfig.Mode == realtime.CollectorModePush {
+		b.continuousConfig.Mode = realtime.CollectorModePull
+	}
+	return b
+}
+
+// WithCollector 设置采集器名称（对应 WorkflowBuilder.WithDataCollector 注册的名称）
+func (b *RealtimeTaskBuilder) WithCollector(name string) *RealtimeTaskBuilder {
+	if b.continuousConfig == nil {
+		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeDataCollector)
+	}
+	b.continuousConfig.CollectorName = name
+	return b
+}
+
+// WithMode 设置采集器 Mode：push（推送/长连接）或 pull（拉取/定时轮询）
+// 仅当 mode 为 CollectorModePush 或 CollectorModePull 时写入，否则保持原值
+func (b *RealtimeTaskBuilder) WithMode(mode string) *RealtimeTaskBuilder {
+	if b.continuousConfig == nil {
+		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeDataCollector)
+	}
+	if mode == realtime.CollectorModePush || mode == realtime.CollectorModePull {
+		b.continuousConfig.Mode = mode
 	}
 	return b
 }
@@ -158,9 +183,15 @@ func (b *RealtimeTaskBuilder) SubscribeEventWithFilter(eventType realtime.EventT
 	return b
 }
 
-// WithJobFunction 设置 Job 函数（代理到基础构建器）
+// WithJobFunction 设置 Job 函数（代理到基础构建器，并同步到 DataHandler 供 runStreamProcessor 调用）
 func (b *RealtimeTaskBuilder) WithJobFunction(jobFuncName string, params map[string]interface{}) *RealtimeTaskBuilder {
 	b.baseBuilder.WithJobFunction(jobFuncName, params)
+	if jobFuncName != "" {
+		if b.continuousConfig == nil {
+			b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeDataCollector)
+		}
+		b.continuousConfig.DataHandler = jobFuncName
+	}
 	return b
 }
 

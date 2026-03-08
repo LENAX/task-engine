@@ -63,10 +63,13 @@ Workflow (ExecutionMode=streaming)
 
 1. **数据采集任务**（如行情 WebSocket）收到数据后，应发布 `EventDataArrived`，payload 为 `DataArrivedPayload`（或兼容的 `map`）。
 2. 内部处理器 `handleDataArrived` 将 `Payload.Data` 推入 **DataBuffer**（`Push`）；若因背压丢弃则计入失败指标。
-3. **流处理任务**（`TaskTypeStreamProcessor`）在 `runStreamProcessor` 中从 DataBuffer `Pop` 消费，并发布 `EventDataProcessed`。
+3. **流处理任务**（`TaskTypeStreamProcessor`）在 `runStreamProcessor` 中从 DataBuffer `Pop` 消费；若配置了 **DataHandler** 且 Engine 传入了 FunctionRegistry，会以 `params["data"]` 调用该 Job 函数，再发布 `EventDataProcessed`。
 4. 背压：缓冲区使用率超过配置阈值时发布 `EventBackpressure`，低于一半阈值时发布 `EventBackpressureRelieved`。
 
-当前仓库中 **DataCollector 的具体连接与拉取逻辑是占位实现**（如 `runDataCollector` 仅 `time.Sleep`）。你需要在自己的业务代码中实现真实的数据源连接（如 WebSocket/HTTP 客户端），在收到行情或新闻数据时，通过 **RealtimeInstanceManager.PublishEvent** 发布 `EventDataArrived`，才能把数据注入引擎的缓冲与流处理链路。
+数据采集的两种方式（二选一或组合）：
+
+- **推荐：Workflow 内注册采集器**：实现 `realtime.DataCollector` 接口，在 **WorkflowBuilder** 上使用 **WithDataCollector(name, collector)** 注册（与 WithRealtimeTask 同处构建），在 RealtimeTaskBuilder 上使用 **WithCollector(name)**。引擎在运行时会调用 `collector.Run(ctx, config, publish)`，你在收到数据时调用 `publish(NewRealtimeEvent(EventDataArrived, ...))` 即可把数据写入缓冲。若需在采集端打印或打点，可在 `publish` 前加日志。消费端由 **StreamProcessor** 任务从 buffer Pop 并调用 DataHandler（见 3.5、3.8）。**兼容**：也可在 **EngineBuilder.WithDataCollector** 处注册，Engine 在 Workflow 未带注册表时会回退使用。
+- **可选：用户侧 PublishEvent**：在业务侧持有 RealtimeInstanceManager 引用，自行建连（WebSocket/HTTP），在收到数据时调用 **RealtimeInstanceManager.PublishEvent** 发布 `EventDataArrived`。无注册采集器时，任务会走占位逻辑（如 sleep），你可在外部注入数据。
 
 ---
 
@@ -80,17 +83,15 @@ Workflow (ExecutionMode=streaming)
 
 ### 3.2 注册函数（Registry）
 
-数据处理、错误处理、事件处理等若通过“函数名”配置，需在 Engine 的 **FunctionRegistry** 中注册，例如：
+流处理任务使用的 DataHandler、以及采集/事件处理等若通过“函数名”配置，需在 Engine 的 **FunctionRegistry** 中注册。Engine 创建 RealtimeInstanceManager 时会传入该 Registry（`WithFunctionRegistry`），供 `runStreamProcessor` 按名调用 DataHandler。
 
 ```go
-eng, err := engine.NewEngineBuilder("./configs/engine.yaml").
-    WithJobFunc("handleQuote", handleQuoteFunc).
-    WithJobFunc("handleNews", handleNewsFunc).
-    WithJobFunc("onError", errorHandlerFunc).
-    Build()
+registry := eng.GetRegistry()
+_, _ = registry.Register(ctx, "print_data_job", printDataJob, "打印收到的数据")
+// 流处理任务通过 WithJobFunction("print_data_job", nil) 引用；WithJobFunction 会同步设置 DataHandler
 ```
 
-Builder 里通过 **WithDataHandler("handleQuote")**、**WithErrorHandler("onError")** 等引用这些名字。
+DataHandler 函数签名为 `func(ctx *task.TaskContext) error`，从 `ctx.Params["data"]` 取缓冲中 Pop 出的单条数据。
 
 ### 3.3 定义行情采集任务（示例）
 
@@ -134,22 +135,21 @@ if err != nil {
 }
 ```
 
-- **TaskTypeScheduledPoller**：按 `FlushInterval` 周期执行（当前实现里 `runScheduledPoller` 仅 sleep 该间隔，真实 HTTP 拉取需在业务代码中实现，并同样通过 **PublishEvent(EventDataArrived, ...)** 写入缓冲）。
+- **TaskTypeScheduledPoller**：与 DataCollector 统一走 **runDataCollector**，由 **Mode=pull** 与 `FlushInterval` 等配置区分；真实拉取需实现 **DataCollector** 并在 `Run` 内按间隔请求后 **publish(EventDataArrived, ...)**（或使用用户侧 PublishEvent）。
 
 ### 3.5 定义流处理任务（消费缓冲数据）
 
-若希望由引擎的 DataBuffer 统一接收数据，再由“流处理任务”消费（如落库、告警），可增加一个 **StreamProcessor** 任务：
+若希望由引擎的 DataBuffer 统一接收数据，再由“流处理任务”消费（如落库、告警、打印），可增加一个 **StreamProcessor** 任务。使用 **WithJobFunction(name, nil)** 即可，会同步设置 DataHandler，供 `runStreamProcessor` 从 buffer Pop 后按名调用：
 
 ```go
 streamTask, err := builder.NewRealtimeTaskBuilder("quote_stream_processor", "行情流处理", registry).
     WithContinuousMode().
     WithTaskType(realtime.TaskTypeStreamProcessor).
-    WithBuffer(10000, 100).
-    WithDataHandler("handleQuote").
+    WithJobFunction("handleQuote", nil).   // 同步设置 DataHandler，runStreamProcessor 会以 params["data"] 调用
     Build()
 ```
 
-- **TaskTypeStreamProcessor**：在 `runStreamProcessor` 中从 `DataBuffer.Pop` 取数据，并调用你配置的 DataHandler（需在 Registry 中注册）；数据来源即其他任务通过 `EventDataArrived` 推进缓冲区的内容。
+- **TaskTypeStreamProcessor**：在 `runStreamProcessor` 中从 `DataBuffer.Pop` 取数据；若配置了 DataHandler 且 Engine 传入了 FunctionRegistry，会构造 `params["data"] = 单条数据` 并调用该 Job 函数，再发布 `EventDataProcessed`。
 
 ### 3.6 事件订阅（可选）
 
@@ -167,12 +167,15 @@ quoteTask, err = builder.NewRealtimeTaskBuilder(...).
 
 ### 3.7 组装 Workflow 并提交
 
+流式 Workflow 的 **DataCollector 注册在 WorkflowBuilder 处完成**：**WithDataCollector(name, collector)**，name 与 RealtimeTaskBuilder.WithCollector(name) 一致。
+
 ```go
 wf, err := builder.NewWorkflowBuilder("realtime_market", "实时行情与新闻同步").
-    WithStreamingMode().           // 必须：流式执行
-    WithRealtimeTask(quoteTask).   // 行情采集
-    WithRealtimeTask(newsTask).    // 新闻轮询
-    WithRealtimeTask(streamTask).  // 可选：流处理
+    WithStreamingMode().             // 必须：流式执行
+    WithDataCollector("quote_ws", quoteCollector).  // 推荐：在此处注册采集器
+    WithRealtimeTask(quoteTask).     // 行情采集
+    WithRealtimeTask(newsTask).     // 新闻轮询
+    WithRealtimeTask(streamTask).   // 可选：流处理
     Build()
 if err != nil {
     return err
@@ -186,6 +189,247 @@ if err != nil {
 ```
 
 注意：**WithRealtimeTask** 会向 Workflow 加入该实时任务，并保证 Workflow 以 **streaming** 模式运行（参见 `workflow_builder.go`）。
+
+### 3.8 完整示例（基于 E2E 用例）
+
+以下三种模式对应 `test/e2e/realtime_collector_e2e_test.go` 中的用例，可直接参考或裁剪使用。
+
+**示例一：有限次 publish 采集器 + 流处理（最小闭环）**
+
+采集器在 `Run` 内发布 N 条后 return，流处理任务从 buffer 消费并调用 DataHandler（如打印）：
+
+```go
+// 1) 实现 DataCollector：有限次 publish
+type finitePublishCollector struct {
+    maxPublish int32
+    published  int32
+}
+func (c *finitePublishCollector) Run(ctx context.Context, config *realtime.ContinuousTaskConfig, publish realtime.PublishFunc) error {
+    taskID := ""
+    if config != nil {
+        taskID = config.ID
+    }
+    for atomic.LoadInt32(&c.published) < c.maxPublish {
+        select {
+        case <-ctx.Done():
+            return nil
+        default:
+        }
+        n := atomic.AddInt32(&c.published, 1)
+        e := realtime.NewRealtimeEvent(realtime.EventDataArrived, taskID, "", &realtime.DataArrivedPayload{
+            Data: n, Source: "e2e_finite",
+        })
+        _ = publish(e)
+        time.Sleep(10 * time.Millisecond)
+    }
+    return nil
+}
+
+// 2) DataHandler：从 ctx.Params["data"] 取单条数据（流处理时由 runStreamProcessor 注入）
+func printDataJob(ctx *task.TaskContext) error {
+    if len(ctx.Params) > 0 {
+        b, _ := json.Marshal(ctx.Params)
+        log.Printf("[printDataJob] TaskID=%s 收到数据: %s", ctx.TaskID, string(b))
+    }
+    return nil
+}
+
+// 3) 构建引擎、注册 DataHandler，再在 WorkflowBuilder 处注册采集器并组装 Workflow
+eng, _ := engine.NewEngineBuilder(configPath).Build()
+registry := eng.GetRegistry()
+registry.Register(ctx, "print_data_job", printDataJob, "打印收到的数据")
+
+collector := &finitePublishCollector{maxPublish: 5}
+collectorTask, _ := builder.NewRealtimeTaskBuilder("e2e_collector", "e2e", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeDataCollector).
+    WithCollector("e2e_finite").
+    WithJobFunction("print_data_job", nil).
+    Build()
+
+streamTask, _ := builder.NewRealtimeTaskBuilder("e2e_stream_processor", "流处理", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeStreamProcessor).
+    WithJobFunction("print_data_job", nil).
+    Build()
+
+wf, _ := builder.NewWorkflowBuilder("e2e_realtime_wf", "e2e").
+    WithStreamingMode().
+    WithDataCollector("e2e_finite", collector).
+    WithRealtimeTask(collectorTask).
+    WithRealtimeTask(streamTask).
+    Build()
+ctrl, _ := eng.SubmitWorkflow(ctx, wf)
+```
+
+**示例二：Pull 采集器（HTTP 分页）+ 流处理**
+
+采集器按 `FlushInterval` 轮询 HTTP 接口（如 `GET /api/stk_mins?offset=0&limit=100`），逐条 publish；流处理任务同上。
+
+```go
+// 采集器：HTTP 分页拉取并 publish
+type stkMinsPullCollector struct {
+    client     *http.Client
+    published  int32
+    maxPublish int32
+}
+func (c *stkMinsPullCollector) Run(ctx context.Context, config *realtime.ContinuousTaskConfig, publish realtime.PublishFunc) error {
+    taskID := config.ID
+    baseURL := config.Endpoint
+    interval := config.FlushInterval
+    if interval <= 0 {
+        interval = 200 * time.Millisecond
+    }
+    cli := c.client
+    if cli == nil {
+        cli = &http.Client{Timeout: 10 * time.Second}
+    }
+    offset := 0
+    limit := 100
+    for {
+        select {
+        case <-ctx.Done():
+            return nil
+        default:
+        }
+        req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+            baseURL+"/api/stk_mins?offset="+strconv.Itoa(offset)+"&limit="+strconv.Itoa(limit), nil)
+        resp, err := cli.Do(req)
+        if err != nil {
+            return err
+        }
+        var body struct {
+            Data  []YourRow `json:"data"`
+            Total int       `json:"total"`
+        }
+        _ = json.NewDecoder(resp.Body).Decode(&body)
+        resp.Body.Close()
+        for i := range body.Data {
+            if c.maxPublish > 0 && atomic.LoadInt32(&c.published) >= c.maxPublish {
+                return nil
+            }
+            e := realtime.NewRealtimeEvent(realtime.EventDataArrived, taskID, "", &realtime.DataArrivedPayload{
+                Data: body.Data[i], Source: "stk_mins_pull",
+            })
+            _ = publish(e)
+            atomic.AddInt32(&c.published, 1)
+        }
+        if len(body.Data) < limit {
+            offset = 0
+        } else {
+            offset += len(body.Data)
+        }
+        select {
+        case <-ctx.Done():
+            return nil
+        case <-time.After(interval):
+        }
+    }
+}
+
+// 任务与 Workflow（采集器在 WorkflowBuilder 处注册）
+eng, _ := engine.NewEngineBuilder(configPath).Build()
+registry := eng.GetRegistry()
+registry.Register(ctx, "print_data_job", printDataJob, "打印收到的数据")
+
+pullCollector := &stkMinsPullCollector{maxPublish: 50}
+collectorTask, _ := builder.NewRealtimeTaskBuilder("stk_pull", "stk_mins_pull", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeDataCollector).
+    WithCollector("stk_mins_pull").
+    WithMode(realtime.CollectorModePull).
+    WithEndpoint(serverURL, "http").
+    WithFlushInterval(300 * time.Millisecond).
+    WithJobFunction("print_data_job", nil).
+    Build()
+
+streamTask, _ := builder.NewRealtimeTaskBuilder("stk_pull_processor", "流处理", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeStreamProcessor).
+    WithJobFunction("print_data_job", nil).
+    Build()
+
+wf, _ := builder.NewWorkflowBuilder("e2e_stk_pull_wf", "e2e").
+    WithStreamingMode().
+    WithDataCollector("stk_mins_pull", pullCollector).
+    WithRealtimeTask(collectorTask).
+    WithRealtimeTask(streamTask).
+    Build()
+```
+
+**示例三：Push 采集器（WebSocket）+ 流处理**
+
+采集器连接 WebSocket，循环 `conn.ReadJSON(&row)`，每收到一条就 `publish(EventDataArrived, row)`；流处理任务同上。
+
+```go
+// 采集器：WebSocket 长连接收包并 publish
+type stkMinsPushCollector struct {
+    maxPublish int32
+    published  int32
+}
+func (c *stkMinsPushCollector) Run(ctx context.Context, config *realtime.ContinuousTaskConfig, publish realtime.PublishFunc) error {
+    taskID := config.ID
+    wsURL := config.Endpoint
+    dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+    conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+    for {
+        select {
+        case <-ctx.Done():
+            return nil
+        default:
+        }
+        if c.maxPublish > 0 && atomic.LoadInt32(&c.published) >= c.maxPublish {
+            return nil
+        }
+        var row YourRow
+        if err := conn.ReadJSON(&row); err != nil {
+            if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+                return nil
+            }
+            return err
+        }
+        e := realtime.NewRealtimeEvent(realtime.EventDataArrived, taskID, "", &realtime.DataArrivedPayload{
+            Data: row, Source: "stk_mins_push",
+        })
+        _ = publish(e)
+        atomic.AddInt32(&c.published, 1)
+    }
+}
+
+// 任务与 Workflow（采集器在 WorkflowBuilder 处注册）
+eng, _ := engine.NewEngineBuilder(configPath).Build()
+registry := eng.GetRegistry()
+registry.Register(ctx, "print_data_job", printDataJob, "打印收到的数据")
+
+pushCollector := &stkMinsPushCollector{maxPublish: 100}
+collectorTask, _ := builder.NewRealtimeTaskBuilder("stk_push", "stk_mins_push", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeDataCollector).
+    WithCollector("stk_mins_push").
+    WithMode(realtime.CollectorModePush).
+    WithEndpoint(wsURL, "ws").
+    WithJobFunction("print_data_job", nil).
+    Build()
+
+streamTask, _ := builder.NewRealtimeTaskBuilder("stk_push_processor", "流处理", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeStreamProcessor).
+    WithJobFunction("print_data_job", nil).
+    Build()
+
+wf, _ := builder.NewWorkflowBuilder("e2e_stk_push_wf", "e2e").
+    WithStreamingMode().
+    WithDataCollector("stk_mins_push", pushCollector).
+    WithRealtimeTask(collectorTask).
+    WithRealtimeTask(streamTask).
+    Build()
+```
+
+三种模式共性：**采集器在 WorkflowBuilder 上通过 WithDataCollector(name, collector) 注册**，与 WithRealtimeTask 同处构建；**采集任务**（DataCollector）负责拉取/接收并 `publish(EventDataArrived)`，**流处理任务**（StreamProcessor）从 buffer 消费并执行 DataHandler。Engine 创建 RealtimeInstanceManager 时优先使用 Workflow 自带的 DataCollectorRegistry，并传入 `WithFunctionRegistry(e.registry)`，runStreamProcessor 才能按名调用 DataHandler。
 
 ---
 
@@ -211,10 +455,12 @@ Engine 在创建 **RealtimeInstanceManager** 时使用的选项在 `pkg/core/rea
 
 - **WithBufferSize(size)**：默认 10000。
 - **WithBackpressureThreshold(threshold)**：默认 0.8。
+- **WithCollectorRegistry(registry)**：采集器注册表，供 runDataCollector 按名查找。
+- **WithFunctionRegistry(registry)**：函数注册表（需实现 `DataHandlerRegistry`，如 Engine 的 `e.registry`），供 runStreamProcessor 按 DataHandler 名调用 Job 函数。
 - **WithShutdownTimeout(timeout)**：优雅关闭等待时间。
 - **WithReconnectTimeout(timeout)**：单次重连尝试超时。
 
-这些由 Engine 在 `createRealtimeInstanceManager` 中写死或从配置传入，你只需知道“实例级”缓冲与背压受这些影响即可；若将来 Engine 暴露配置入口，可在此处扩展。
+Engine 在 `createRealtimeInstanceManager` 中会传入 `WithCollectorRegistry(e.collectorRegistry)` 与 `WithFunctionRegistry(e.registry)`，因此流处理任务的 DataHandler 只需在 Engine 的 Registry 中注册即可被调用。
 
 ---
 
@@ -273,26 +519,69 @@ Engine 在创建 **RealtimeInstanceManager** 时使用的选项在 `pkg/core/rea
 
 ## 8. 实现“真实”的行情与新闻采集
 
-当前引擎内 **runDataCollector / runScheduledPoller** 仅为占位（sleep 或空逻辑），**不会**真正建连或发 HTTP 请求。你需要：
+### 8.1 推荐方式：引擎内 DataCollector 注册
 
-1. **在业务侧维护 RealtimeInstanceManager 的引用**  
-   例如在 SubmitWorkflow 后，用 `GetInstanceManager(ctrl.InstanceID())` 得到 manager，保存到你的业务结构体，供采集 goroutine 使用。
+引擎统一用一种“数据采集”抽象 **DataCollector**，通过配置中的 **Mode（push/pull）+ Endpoint + Config** 区分行为，不再在执行层区分 DataCollector 与 ScheduledPoller 两条分支。
 
-2. **实现行情采集**  
-   - 在单独 goroutine 中建立 WebSocket 到 `ContinuousTaskConfig.Endpoint`。  
-   - 收到行情消息后，反序列化为你的结构体，再构造 **realtime.NewRealtimeEvent(realtime.EventDataArrived, taskID, instanceID, &realtime.DataArrivedPayload{Data: yourStruct, Source: endpoint, Sequence: seq})**。  
-   - 调用 **manager.PublishEvent(ctx, event)**，数据即进入 DataBuffer，供 **TaskTypeStreamProcessor** 消费。
+- **接口**：`realtime.DataCollector`，唯一方法 `Run(ctx context.Context, config *ContinuousTaskConfig, publish PublishFunc) error`。  
+  `publish` 由引擎注入，签名为 `func(event *RealtimeEvent) error`；收到数据后调用 `publish(NewRealtimeEvent(EventDataArrived, taskID, instanceID, &DataArrivedPayload{...}))` 即可写入缓冲。
+- **注册（推荐）**：在 **WorkflowBuilder** 上 **WithDataCollector("quote_ws", myCollector)**，与 WithRealtimeTask 同处构建；任务侧用 **RealtimeTaskBuilder.WithCollector("quote_ws")** 引用。Engine 创建 RealtimeInstanceManager 时优先使用 Workflow 自带的注册表。**兼容**：也可在 **EngineBuilder.WithDataCollector** 注册，Workflow 未带注册表时会回退使用。
+- **Mode**：`ContinuousTaskConfig.Mode` 为 **push**（长连接收包）或 **pull**（按间隔拉取）。常量 `realtime.CollectorModePush` / `realtime.CollectorModePull`，或 Builder 上 **WithMode("push")** / **WithMode("pull")**。实现者在 `Run()` 内根据 `config.Mode`、`config.Endpoint`、`config.FlushInterval`/`Params` 决定逻辑；空串视为 push。
 
-3. **实现新闻拉取**  
-   - 定时（如按 FlushInterval）用 HTTP 请求新闻 API。  
-   - 将返回的列表或单条新闻封装为 **DataArrivedPayload**，同样 **PublishEvent(EventDataArrived, ...)**。  
-   - 若希望“轮询任务”只负责调度，也可在 **TaskTypeScheduledPoller** 的周期逻辑里只发“拉取请求”，由另一个 HTTP 客户端 goroutine 收到响应后再 PublishEvent。
+**最小示例（收到一条就 publish 一次）**：
 
-4. **错误与重连**  
-   - 连接断开时发布 **EventDisconnected**，并可选发布 **EventError**（Recoverable=true）。  
-   - 实例管理器内部会根据 **ReconnectEnabled** 和 **handleReconnect** 做退避重连；你只需在重连成功后重新建连并继续 PublishEvent 即可。
+```go
+type myCollector struct{}
 
-这样，**引擎负责缓冲、背压、事件总线和任务调度**，**你负责数据源协议与 PublishEvent**，即可完成“实时同步股票行情和新闻数据”的闭环。
+func (c *myCollector) Run(ctx context.Context, config *realtime.ContinuousTaskConfig, publish realtime.PublishFunc) error {
+    // 根据 config.Mode 选择 push（阻塞 read 循环）或 pull（按 FlushInterval 请求）
+    taskID := config.ID
+    if taskID == "" {
+        taskID = config.CollectorName
+    }
+    event := realtime.NewRealtimeEvent(
+        realtime.EventDataArrived,
+        taskID,
+        "", // instanceID 可由 manager 注入，此处可留空
+        &realtime.DataArrivedPayload{Data: yourData, Source: config.Endpoint},
+    )
+    return publish(event)
+}
+```
+
+**Push 骨架（WebSocket 长连接）**：在 `Run` 内建连 `config.Endpoint`，循环 `conn.ReadMessage()`，收到则 `publish(NewRealtimeEvent(EventDataArrived, ...))`，`ctx.Done()` 时退出并 return。
+
+**Pull 骨架（定时 HTTP）**：在 `Run` 内 for + select，`case <-time.After(config.FlushInterval)` 时发 HTTP 请求，将结果封装为 `DataArrivedPayload` 并 `publish(...)`，`ctx.Done()` 时 return。
+
+构建引擎与 Workflow 示例（采集器在 WorkflowBuilder 处注册）：
+
+```go
+eng, _ := engine.NewEngineBuilder(configPath).Build()
+quoteCollector := &myCollector{}
+
+quoteTask, _ := builder.NewRealtimeTaskBuilder("quote", "行情", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeDataCollector).
+    WithCollector("quote_ws").
+    WithMode(realtime.CollectorModePush).  // 或 WithMode("pull")
+    WithEndpoint("wss://...", "ws").
+    Build()
+
+wf, _ := builder.NewWorkflowBuilder("realtime_market", "行情").
+    WithStreamingMode().
+    WithDataCollector("quote_ws", quoteCollector).
+    WithRealtimeTask(quoteTask).
+    Build()
+```
+
+### 8.2 可选方式：用户侧 PublishEvent
+
+若不使用注册采集器，可在业务侧维护 **RealtimeInstanceManager** 引用（例如 `GetInstanceManager(ctrl.InstanceID())`），自行建连（WebSocket/HTTP），在收到数据时调用 **manager.PublishEvent(ctx, NewRealtimeEvent(EventDataArrived, ...))** 注入数据。此时任务若配置了 `WithCollector("")` 或未设置 CollectorName，会走占位逻辑（如 sleep），由你在外部驱动数据。
+
+### 8.3 错误与重连
+
+- 连接断开时发布 **EventDisconnected**，并可选 **EventError**（Recoverable=true）。
+- 实例管理器根据 **ReconnectEnabled** 与 **handleReconnect** 做退避重连；采集器在重连成功后继续在 `Run` 内建连并 `publish` 即可。
 
 ---
 
@@ -300,13 +589,14 @@ Engine 在创建 **RealtimeInstanceManager** 时使用的选项在 `pkg/core/rea
 
 | 文件 | 作用 |
 |------|------|
-| `pkg/core/builder/realtime_task_builder.go` | 实时任务构建器（端点、类型、缓冲、重连、事件订阅等） |
+| `pkg/core/realtime/collector.go` | DataCollector 接口、PublishFunc、DataCollectorRegistry 与默认实现 |
+| `pkg/core/builder/realtime_task_builder.go` | 实时任务构建器（WithCollector、WithMode、端点、类型、缓冲、重连等） |
 | `pkg/core/builder/workflow_builder.go` | Workflow 构建器，WithStreamingMode / WithRealtimeTask |
-| `pkg/core/realtime/continuous_task.go` | 持续任务状态与配置（ContinuousTaskConfig、ContinuousTask） |
+| `pkg/core/realtime/continuous_task.go` | 持续任务状态与配置（CollectorName、Mode、ContinuousTaskConfig、ContinuousTask） |
 | `pkg/core/realtime/buffer.go` | DataBuffer、背压 |
-| `pkg/core/realtime/realtime_instance_manager.go` | 实例管理、持续任务调度、事件发布/订阅、缓冲消费 |
+| `pkg/core/realtime/realtime_instance_manager.go` | 实例管理、runDataCollector 唯一生产者路径、事件发布/订阅、缓冲消费 |
 | `pkg/core/realtime/events.go` | 事件类型、Payload 结构、EventHandler |
-| `pkg/core/realtime/options.go` | RealtimeInstanceManager 选项（缓冲、背压、超时等） |
+| `pkg/core/realtime/options.go` | RealtimeInstanceManager 选项（WithCollectorRegistry、WithFunctionRegistry、缓冲、背压、超时等） |
 | `pkg/core/realtime/realtime_task.go` | RealtimeTask、执行模式、ExtractRealtimeTask |
 
 ---
@@ -314,8 +604,11 @@ Engine 在创建 **RealtimeInstanceManager** 时使用的选项在 `pkg/core/rea
 ## 10. 小结
 
 - 使用 **Streaming** Workflow + **RealtimeTaskBuilder** 定义行情/新闻的**采集任务**与**流处理任务**。
-- 通过 **ContinuousTaskConfig** 配置端点、类型、缓冲、重连、背压；通过 **WithDataHandler/WithErrorHandler** 和 Registry 绑定处理函数。
-- 数据由业务侧**真实连接**（WebSocket/HTTP）产生，通过 **PublishEvent(EventDataArrived, DataArrivedPayload)** 注入引擎，经 **DataBuffer** 与 **TaskTypeStreamProcessor** 消费。
+- **推荐**：实现 **realtime.DataCollector**，在 **WorkflowBuilder.WithDataCollector(name, collector)** 处注册（与 WithRealtimeTask 同处构建），任务上 **WithCollector(name)**；在 `Run(ctx, config, publish)` 内根据 **Mode（push/pull）+ Endpoint + Config** 建连并调用 **publish(NewRealtimeEvent(EventDataArrived, ...))** 注入数据。**兼容**：EngineBuilder.WithDataCollector 仍可用，Workflow 未带注册表时回退使用。
+- **流处理**：增加 **TaskTypeStreamProcessor** 任务，用 **WithJobFunction(handlerName, nil)** 指定 DataHandler（会同步写入 ContinuousTaskConfig.DataHandler）；Engine 创建实例时传入 **WithFunctionRegistry(e.registry)**，runStreamProcessor 从 buffer Pop 后以 **params["data"]** 调用该函数。
+- **可选**：业务侧持有 RealtimeInstanceManager，自行建连并通过 **PublishEvent(EventDataArrived, ...)** 注入。
+- 通过 **ContinuousTaskConfig** 配置端点、Mode、缓冲、重连、背压；DataHandler 需在 Engine 的 Registry 中注册，签名为 `func(ctx *task.TaskContext) error`，从 `ctx.Params["data"]` 取单条数据。
+- 完整可运行示例见 **3.8 完整示例（基于 E2E 用例）**，对应 `test/e2e/realtime_collector_e2e_test.go` 中三种场景：有限次 publish、Pull（HTTP 分页）、Push（WebSocket）。
 - 利用 **事件订阅**、**GetMetrics**、**GetContinuousTask** 做监控与运维，用 **Pause/Resume/Terminate** 做生命周期控制。
 
 按上述方式即可在 Task Engine 上搭建“实时同步股票行情和新闻数据”的完整流水线；若某一步需要更细的代码示例（例如某交易所 WebSocket 协议或新闻 API 的封装），可以在本指南基础上按模块补充。
