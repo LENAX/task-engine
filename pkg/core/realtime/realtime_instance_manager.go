@@ -55,6 +55,9 @@ type RealtimeInstanceManager interface {
 
 	// GetDataBuffer 获取数据缓冲区（供测试或监控使用）
 	GetDataBuffer() *DataBuffer
+
+	// SetSubscriberFilter 运行时更新指定订阅者的过滤字段名与值列表；field 为空则用 "code"，values 为 nil/空表示全量，仅对开启广播的订阅者有效
+	SetSubscriberFilter(ctx context.Context, subscriberName string, field string, values []string) error
 }
 
 // RealtimeMetrics 运行指标
@@ -66,6 +69,13 @@ type RealtimeMetrics struct {
 	BufferUsage     float64       `json:"buffer_usage"`
 	AverageLatency  time.Duration `json:"average_latency"`
 	Uptime          time.Duration `json:"uptime"`
+	// 广播与 WAL
+	BroadcastedEventsTotal int64             `json:"broadcasted_events_total"`
+	WalAppendedTotal       int64             `json:"wal_appended_total"`
+	WalAckedTotal          int64             `json:"wal_acked_total"`
+	WalReplayedTotal       int64             `json:"wal_replayed_total"`
+	SubscriberBufferUsage  map[string]float64 `json:"subscriber_buffer_usage,omitempty"`
+	SubscriberDroppedTotal map[string]int64   `json:"subscriber_dropped_total,omitempty"`
 }
 
 // realtimeInstanceManagerImpl RealtimeInstanceManager 实现
@@ -90,8 +100,11 @@ type realtimeInstanceManagerImpl struct {
 	subscriptions  sync.Map // subscriptionID -> *subscription
 	subscriptionID int64    // atomic，订阅ID生成器
 
-	// 数据缓冲（背压控制）
+	// 数据缓冲（背压控制）；广播关闭时唯一缓冲，广播开启时仅用于未绑定订阅者的任务
 	dataBuffer *DataBuffer
+
+	// 多订阅者广播：name -> Subscriber，nil 表示未启用广播
+	subscribers map[string]*Subscriber
 
 	// 采集器注册表（可选）
 	collectorRegistry DataCollectorRegistry
@@ -124,7 +137,27 @@ type realtimeInstanceManagerImpl struct {
 	// 配置选项
 	opts *options
 
+	// 多订阅者广播 + WAL：全局递增序号，用于 WAL 与 ack
+	sequenceCounter int64
+	// 广播/WAL 指标
+	walAppendedTotal  int64
+	walAckedTotal     int64
+	walReplayedTotal  int64
+	broadcastedTotal  int64
+
 	mu sync.RWMutex
+}
+
+// bufferItemWithSeq 带序号缓冲项，用于 WAL 确认与重放时携带 SequenceID
+type bufferItemWithSeq struct {
+	Data       interface{}
+	SequenceID int64
+}
+
+// bufferItemWithRetry 重试入队时携带已重试次数，用于 DataHandler 失败后重新入队并限制最大重试
+type bufferItemWithRetry struct {
+	Data       interface{}
+	RetryCount int
 }
 
 // subscription 内部订阅结构
@@ -151,6 +184,14 @@ func NewRealtimeInstanceManager(
 	options := defaultOptions()
 	for _, opt := range opts {
 		opt(options)
+	}
+	// 若启用 WAL 但未注入 Store 且提供了路径，则创建 Badger WAL
+	if options.walEnabled && options.walStore == nil && options.walPath != "" {
+		store, err := NewBadgerWalStore(options.walPath)
+		if err != nil {
+			return nil, fmt.Errorf("创建 WAL 存储失败: %w", err)
+		}
+		options.walStore = store
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -206,6 +247,14 @@ func NewRealtimeInstanceManager(
 		}
 	}
 
+	// 若启用广播，根据实时任务中的 SubscriberName/BufferPolicy 构建订阅者
+	if options.broadcastEnabled {
+		manager.subscribers = buildSubscribersFromWorkflow(wf, options.backpressureThreshold)
+		for name := range manager.subscribers {
+			log.Printf("RealtimeInstance 广播订阅者: %s", name)
+		}
+	}
+
 	// 注册内部事件处理器
 	if err := manager.registerInternalHandlers(); err != nil {
 		cancel()
@@ -244,6 +293,47 @@ func NewRealtimeInstanceManager(
 	return manager, nil
 }
 
+// buildSubscribersFromWorkflow 根据 Workflow 中 StreamProcessor 的 SubscriberName/BufferPolicy/SubscriberFilterField/SubscriberFilterCodes 构建订阅者
+func buildSubscribersFromWorkflow(wf *workflow.Workflow, backpressureThreshold float64) map[string]*Subscriber {
+	// name -> policy（首个绑定该名的任务决定策略）
+	policyByName := make(map[string]BufferPolicy)
+	filterFieldByName := make(map[string]string)
+	filterValuesByName := make(map[string][]string)
+	allTasks := wf.GetTasks()
+	for _, t := range allTasks {
+		rt := ExtractRealtimeTask(t)
+		if rt == nil || rt.ContinuousConfig == nil {
+			continue
+		}
+		cfg := rt.ContinuousConfig
+		if cfg.Type != TaskTypeStreamProcessor || cfg.SubscriberName == "" {
+			continue
+		}
+		name := cfg.SubscriberName
+		if _, ok := policyByName[name]; ok {
+			continue
+		}
+		var policy BufferPolicy
+		if cfg.BufferPolicy != nil {
+			policy = *cfg.BufferPolicy
+		} else {
+			policy = BufferPolicy{Mode: BufferModeNonBlockingDrop, Capacity: 5000}
+		}
+		policyByName[name] = policy
+		field := cfg.SubscriberFilterField
+		if field == "" {
+			field = "code"
+		}
+		filterFieldByName[name] = field
+		filterValuesByName[name] = cfg.SubscriberFilterCodes
+	}
+	out := make(map[string]*Subscriber, len(policyByName))
+	for name, policy := range policyByName {
+		out[name] = NewSubscriberWithFilter(name, policy, backpressureThreshold, filterFieldByName[name], filterValuesByName[name])
+	}
+	return out
+}
+
 // registerInternalHandlers 注册内部事件处理器
 func (m *realtimeInstanceManagerImpl) registerInternalHandlers() error {
 	// 数据到达处理器
@@ -278,6 +368,14 @@ func (m *realtimeInstanceManagerImpl) registerInternalHandlers() error {
 		m.handleBackpressure,
 	)
 
+	// data.processed 仅用于可选观测，无业务消费时由空处理器消费以免 watermill 打 "No subscribers"
+	m.router.AddNoPublisherHandler(
+		"data_processed_noop",
+		string(EventDataProcessed),
+		m.pubsub,
+		m.handleDataProcessedNoOp,
+	)
+
 	return nil
 }
 
@@ -297,6 +395,11 @@ func (m *realtimeInstanceManagerImpl) Start() {
 		if err := m.stateStore.UpdateStatus(ctx, m.instance.ID, "Running"); err != nil {
 			log.Printf("更新状态失败: %v", err)
 		}
+	}
+
+	// 若启用 WAL 且有多订阅者，先回放未确认记录到各订阅者 Buffer，再启动任务
+	if m.opts.walEnabled && m.opts.walStore != nil && m.subscribers != nil {
+		m.replayWalUnacked(ctx)
 	}
 
 	// 启动消息路由器：watermill Router.Run(ctx) 在部分版本中不会随 ctx 取消而立即返回，
@@ -330,6 +433,24 @@ func (m *realtimeInstanceManagerImpl) Start() {
 
 	// 启动持续任务
 	m.startContinuousTasks()
+
+	// 若启用 WAL，启动后台 GC 协程定期清理已确认记录
+	if m.opts.walEnabled && m.opts.walStore != nil {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-m.ctx.Done():
+					return
+				case <-ticker.C:
+					_ = m.opts.walStore.GC(m.ctx, m.instance.ID)
+				}
+			}
+		}()
+	}
 
 	// 启动控制信号处理
 	m.wg.Add(1)
@@ -365,6 +486,11 @@ func (m *realtimeInstanceManagerImpl) startContinuousTasks() {
 			ct := NewContinuousTask(*rtTask.ContinuousConfig)
 			ct.Start(m.ctx)
 			m.continuousTasks.Store(taskID, ct)
+			if m.subscribers != nil && rtTask.ContinuousConfig.SubscriberName != "" {
+				if sub, ok := m.subscribers[rtTask.ContinuousConfig.SubscriberName]; ok {
+					sub.AddProcessor(taskID, ct)
+				}
+			}
 
 			// 启动任务运行 goroutine
 			m.taskWg.Add(1)
@@ -473,8 +599,12 @@ func (m *realtimeInstanceManagerImpl) runDataCollector(ct *ContinuousTask) error
 
 // runStreamProcessor 运行流处理器
 func (m *realtimeInstanceManagerImpl) runStreamProcessor(ct *ContinuousTask) error {
-	// 从缓冲区获取数据并处理
-	data, ok := m.dataBuffer.Pop()
+	buf := m.getBufferForStreamProcessor(ct)
+	// 优先用 TryPopWithDone 以支持 ctx 取消时及时退出
+	data, ok, done := buf.TryPopWithDone(m.ctx.Done())
+	if done {
+		return nil
+	}
 	if !ok {
 		time.Sleep(10 * time.Millisecond)
 		return nil
@@ -483,15 +613,56 @@ func (m *realtimeInstanceManagerImpl) runStreamProcessor(ct *ContinuousTask) err
 	ct.IncrementDataCount()
 	ct.UpdateLastDataTime()
 
+	// 解析缓冲项：可能是 bufferItemWithRetry（重试入队）、bufferItemWithSeq（广播+WAL）或原始 data
+	var innerData interface{}
+	var retryCount int
+	if withRetry, ok := data.(*bufferItemWithRetry); ok {
+		innerData = withRetry.Data
+		retryCount = withRetry.RetryCount
+	} else {
+		innerData = data
+		retryCount = 0
+	}
+	var payloadData interface{}
+	var sequenceID int64
+	if withSeq, ok := innerData.(*bufferItemWithSeq); ok {
+		payloadData = withSeq.Data
+		sequenceID = withSeq.SequenceID
+	} else {
+		payloadData = innerData
+	}
+
 	// 若配置了 DataHandler 且注册表可用，则调用 Job 函数处理数据
 	if ct.Config.DataHandler != "" && m.functionRegistry != nil {
 		if fn := m.functionRegistry.GetByName(ct.Config.DataHandler); fn != nil {
-			params := map[string]interface{}{"data": data}
+			params := map[string]interface{}{"data": payloadData, "sequence_id": sequenceID}
 			taskCtx := task.NewTaskContext(m.ctx, ct.Config.ID, ct.Config.Name, m.wf.GetID(), m.instance.ID, params)
 			stateCh := fn(taskCtx)
-			if state := <-stateCh; state.Status == "Failed" && state.Error != nil {
-				log.Printf("Task %s DataHandler %s 执行失败: %v", ct.Config.ID, ct.Config.DataHandler, state.Error)
-				ct.IncrementErrorCount()
+			state := <-stateCh
+			if state.Status == "Failed" && state.Error != nil {
+				maxRetries := ct.Config.DataHandlerMaxRetries
+				if maxRetries > 0 && retryCount < maxRetries {
+					item := &bufferItemWithRetry{Data: innerData, RetryCount: retryCount + 1}
+					if buf.Push(item) {
+						log.Printf("Task %s DataHandler %s 执行失败，重试入队 (第 %d/%d 次): %v", ct.Config.ID, ct.Config.DataHandler, retryCount+1, maxRetries, state.Error)
+					} else {
+						log.Printf("Task %s DataHandler %s 执行失败且重试入队时缓冲区已满，丢弃: %v", ct.Config.ID, ct.Config.DataHandler, state.Error)
+						ct.IncrementErrorCount()
+					}
+				} else {
+					if maxRetries > 0 {
+						log.Printf("Task %s DataHandler %s 执行失败，已达最大重试次数 %d，丢弃: %v", ct.Config.ID, ct.Config.DataHandler, maxRetries, state.Error)
+					} else {
+						log.Printf("Task %s DataHandler %s 执行失败: %v", ct.Config.ID, ct.Config.DataHandler, state.Error)
+					}
+					ct.IncrementErrorCount()
+				}
+				return nil
+			}
+			// 成功时做 WAL 确认
+			if sequenceID > 0 && m.opts.walEnabled && m.opts.walStore != nil {
+				_ = m.opts.walStore.MarkAcked(m.ctx, m.instance.ID, sequenceID)
+				atomic.AddInt64(&m.walAckedTotal, 1)
 			}
 		}
 	}
@@ -502,13 +673,61 @@ func (m *realtimeInstanceManagerImpl) runStreamProcessor(ct *ContinuousTask) err
 		ct.Config.ID,
 		m.instance.ID,
 		&DataArrivedPayload{
-			Data:     data,
+			Data:     payloadData,
 			Source:   ct.Config.Endpoint,
 			Sequence: ct.GetDataCount(),
 		},
 	))
 
 	return nil
+}
+
+// replayWalUnacked 将 WAL 中未确认记录回放到各订阅者 Buffer（先补历史再收新数据）
+func (m *realtimeInstanceManagerImpl) replayWalUnacked(ctx context.Context) {
+	instanceID := m.instance.ID
+	var replayed int
+	err := m.opts.walStore.IterateUnacked(ctx, instanceID, func(rec *WalRecord) error {
+		var rawData interface{}
+		if err := json.Unmarshal(rec.Data, &rawData); err != nil {
+			log.Printf("WAL 回放反序列化失败 seq=%d: %v", rec.SequenceID, err)
+			return nil
+		}
+		item := &bufferItemWithSeq{Data: rawData, SequenceID: rec.SequenceID}
+		for _, sub := range m.subscribers {
+			if !sub.Accept(ExtractFieldFromRawData(rawData, sub.GetFilterField())) {
+				continue
+			}
+			if sub.Policy.Mode == BufferModeBlocking {
+				sub.Buffer.PushBlocking(item)
+			} else {
+				_ = sub.Buffer.Push(item)
+			}
+		}
+		replayed++
+		return nil
+	})
+	if err != nil {
+		log.Printf("WAL 回放失败: %v", err)
+		return
+	}
+	if replayed > 0 {
+		atomic.AddInt64(&m.walReplayedTotal, int64(replayed))
+		log.Printf("RealtimeInstance %s: WAL 回放 %d 条未确认记录", instanceID, replayed)
+		m.PublishEvent(ctx, NewRealtimeEvent(EventWalReplayed, "", instanceID, map[string]interface{}{
+			"instance_id": instanceID,
+			"replayed":    replayed,
+		}))
+	}
+}
+
+// getBufferForStreamProcessor 返回该 StreamProcessor 应使用的 DataBuffer（广播时为订阅者缓冲，否则为全局）
+func (m *realtimeInstanceManagerImpl) getBufferForStreamProcessor(ct *ContinuousTask) *DataBuffer {
+	if m.subscribers != nil && ct.Config.SubscriberName != "" {
+		if sub, ok := m.subscribers[ct.Config.SubscriberName]; ok {
+			return sub.Buffer
+		}
+	}
+	return m.dataBuffer
 }
 
 // runEventListener 运行事件监听器
@@ -597,7 +816,7 @@ func (m *realtimeInstanceManagerImpl) reconnect(ct *ContinuousTask) error {
 	return nil
 }
 
-// Shutdown 优雅关闭
+// Shutdown 优雅关闭：先标记停止接收新数据，取消 ctx 使采集器停止，等待流处理 drain 或超时，最后关闭 WAL/路由
 func (m *realtimeInstanceManagerImpl) Shutdown() {
 	m.shutdownMu.Lock()
 	defer m.shutdownMu.Unlock()
@@ -607,29 +826,33 @@ func (m *realtimeInstanceManagerImpl) Shutdown() {
 	log.Printf("RealtimeInstance %s: 开始关闭...", m.instance.ID)
 	m.state.Store(StateStopping)
 
-	// 先取消上下文，使 router 包装 goroutine、metricsCollector 以及依赖 m.ctx 的 task 能立即收到 Done 并退出，
-	// 避免本函数卡在 taskWg.Wait() 或 wg.Wait() 导致永远无法执行到 cancel()
+	// 先取消上下文：DataCollector 与 runStreamProcessor 的 TryPopWithDone 会收到 Done，不再接收/拉取新数据；
+	// 已从 Buffer Pop 出的数据会由当前 handler 执行完毕并做 WAL 确认
 	m.cancel()
 
-	// 停止所有持续任务（ct.Stop 取消任务上下文，配合上面 m.cancel() 使 task 尽快退出）
+	// 停止所有持续任务（ct.Stop 取消任务上下文）
 	m.continuousTasks.Range(func(key, value interface{}) bool {
 		ct := value.(*ContinuousTask)
 		ct.Stop()
 		return true
 	})
 
-	// 等待任务完成（带超时）
+	// 等待任务完成（带超时）：StreamProcessor 会在当前条处理完后因 ctx.Done 退出
 	done := make(chan struct{})
 	go func() {
 		m.taskWg.Wait()
 		close(done)
 	}()
 
+	shutdownTimeout := m.opts.shutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 30 * time.Second
+	}
 	select {
 	case <-done:
 		log.Printf("RealtimeInstance %s: 所有任务已停止", m.instance.ID)
-	case <-time.After(m.opts.shutdownTimeout):
-		log.Printf("RealtimeInstance %s: 任务停止超时", m.instance.ID)
+	case <-time.After(shutdownTimeout):
+		log.Printf("RealtimeInstance %s: 任务停止超时，强制退出", m.instance.ID)
 	}
 	// 再关闭路由器与 Pub/Sub（若 Run 未随 ctx 退出，Close 会令其返回）
 	if err := m.router.Close(); err != nil {
@@ -653,6 +876,12 @@ func (m *realtimeInstanceManagerImpl) Shutdown() {
 	case <-wgDone:
 	case <-time.After(wgWait):
 		log.Printf("RealtimeInstance %s: 等待 router/metrics 退出超时", m.instance.ID)
+	}
+
+	// 关闭前做一次 WAL GC，再关闭 WAL 存储
+	if m.opts.walStore != nil {
+		_ = m.opts.walStore.GC(context.Background(), m.instance.ID)
+		_ = m.opts.walStore.Close()
 	}
 
 	// 更新状态（含 instance.Status 以便 Engine.Stop 轮询 GetStatus() 能见到 Stopped）
@@ -819,15 +1048,29 @@ func (m *realtimeInstanceManagerImpl) GetMetrics() *RealtimeMetrics {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	return &RealtimeMetrics{
-		TotalEvents:     atomic.LoadInt64(&m.metrics.TotalEvents),
-		ProcessedEvents: atomic.LoadInt64(&m.metrics.ProcessedEvents),
-		FailedEvents:    atomic.LoadInt64(&m.metrics.FailedEvents),
-		ActiveTasks:     m.metrics.ActiveTasks,
-		BufferUsage:     m.dataBuffer.Usage(),
-		AverageLatency:  m.metrics.AverageLatency,
-		Uptime:          time.Since(m.startTime),
+	metrics := &RealtimeMetrics{
+		TotalEvents:             atomic.LoadInt64(&m.metrics.TotalEvents),
+		ProcessedEvents:         atomic.LoadInt64(&m.metrics.ProcessedEvents),
+		FailedEvents:            atomic.LoadInt64(&m.metrics.FailedEvents),
+		ActiveTasks:             m.metrics.ActiveTasks,
+		BufferUsage:             m.dataBuffer.Usage(),
+		AverageLatency:          m.metrics.AverageLatency,
+		Uptime:                  time.Since(m.startTime),
+		BroadcastedEventsTotal:  atomic.LoadInt64(&m.broadcastedTotal),
+		WalAppendedTotal:        atomic.LoadInt64(&m.walAppendedTotal),
+		WalAckedTotal:           atomic.LoadInt64(&m.walAckedTotal),
+		WalReplayedTotal:        atomic.LoadInt64(&m.walReplayedTotal),
 	}
+	if m.subscribers != nil {
+		metrics.SubscriberBufferUsage = make(map[string]float64)
+		metrics.SubscriberDroppedTotal = make(map[string]int64)
+		for name, sub := range m.subscribers {
+			metrics.SubscriberBufferUsage[name] = sub.Buffer.Usage()
+			_, _, dropped, _ := sub.Buffer.Stats()
+			metrics.SubscriberDroppedTotal[name] = dropped
+		}
+	}
+	return metrics
 }
 
 // ============================================
@@ -1205,33 +1448,95 @@ func (m *realtimeInstanceManagerImpl) metricsCollector() {
 	}
 }
 
-// handleDataArrived 处理数据到达事件
+// handleDataArrived 处理数据到达事件：未开广播时写单一 Buffer；开广播时先 WAL 再广播到各订阅者
 func (m *realtimeInstanceManagerImpl) handleDataArrived(msg *message.Message) error {
 	select {
 	case <-m.ctx.Done():
 		return nil
 	default:
 	}
+	// graceful shutdown：已进入关闭流程则不再接受新数据
+	if m.state.Load() == StateStopping || m.state.Load() == StateStopped {
+		return nil
+	}
 	var event RealtimeEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
 		return err
 	}
 
-	// 更新指标
 	atomic.AddInt64(&m.metrics.ProcessedEvents, 1)
 
-	// 将数据推入缓冲区（带背压控制）
+	var rawData interface{}
 	if payload, ok := event.Payload.(*DataArrivedPayload); ok {
-		if !m.dataBuffer.Push(payload.Data) {
-			atomic.AddInt64(&m.metrics.FailedEvents, 1)
-		}
+		rawData = payload.Data
 	} else if payloadMap, ok := event.Payload.(map[string]interface{}); ok {
-		if !m.dataBuffer.Push(payloadMap) {
-			atomic.AddInt64(&m.metrics.FailedEvents, 1)
+		if d, ok := payloadMap["data"]; ok {
+			rawData = d
+		} else {
+			rawData = payloadMap
 		}
+	} else {
+		rawData = event.Payload
 	}
 
+	if m.subscribers != nil {
+		m.handleDataArrivedBroadcast(rawData)
+		return nil
+	}
+
+	// 未开广播：写入单一缓冲区
+	if !m.dataBuffer.Push(rawData) {
+		atomic.AddInt64(&m.metrics.FailedEvents, 1)
+	}
 	return nil
+}
+
+// handleDataArrivedBroadcast 生成序号、可选写 WAL、再广播到各订阅者
+func (m *realtimeInstanceManagerImpl) handleDataArrivedBroadcast(rawData interface{}) {
+	seqID := atomic.AddInt64(&m.sequenceCounter, 1)
+	instanceID := m.instance.ID
+
+	if m.opts.walEnabled && m.opts.walStore != nil {
+		dataBytes, err := json.Marshal(rawData)
+		if err != nil {
+			log.Printf("WAL 序列化失败: %v", err)
+			atomic.AddInt64(&m.metrics.FailedEvents, 1)
+			return
+		}
+		rec := &WalRecord{
+			InstanceID: instanceID,
+			SequenceID: seqID,
+			Data:       dataBytes,
+			Acked:      false,
+		}
+		if err := m.opts.walStore.Append(m.ctx, rec); err != nil {
+			log.Printf("WAL Append 失败: %v", err)
+			atomic.AddInt64(&m.metrics.FailedEvents, 1)
+			return
+		}
+		atomic.AddInt64(&m.walAppendedTotal, 1)
+	}
+
+	atomic.AddInt64(&m.broadcastedTotal, 1)
+	m.broadcastToSubscribers(rawData, seqID)
+}
+
+// broadcastToSubscribers 按各订阅者 BufferPolicy 推入数据（Blocking 阻塞，NonBlockingDrop 满则丢弃）；带过滤的订阅者仅接收指定字段值在列表内的数据
+func (m *realtimeInstanceManagerImpl) broadcastToSubscribers(rawData interface{}, seqID int64) {
+	item := &bufferItemWithSeq{Data: rawData, SequenceID: seqID}
+	for _, sub := range m.subscribers {
+		fieldValue := ExtractFieldFromRawData(rawData, sub.GetFilterField())
+		if !sub.Accept(fieldValue) {
+			continue
+		}
+		if sub.Policy.Mode == BufferModeBlocking {
+			sub.Buffer.PushBlocking(item)
+		} else {
+			if !sub.Buffer.Push(item) {
+				atomic.AddInt64(&m.metrics.FailedEvents, 1)
+			}
+		}
+	}
 }
 
 // handleConnectionLost 处理连接断开事件
@@ -1305,6 +1610,11 @@ func (m *realtimeInstanceManagerImpl) handleBackpressure(msg *message.Message) e
 	return nil
 }
 
+// handleDataProcessedNoOp 消费 data.processed 事件，避免 watermill 打 "No subscribers"
+func (m *realtimeInstanceManagerImpl) handleDataProcessedNoOp(msg *message.Message) error {
+	return nil
+}
+
 // PushData 推送数据到缓冲区（供外部调用）
 func (m *realtimeInstanceManagerImpl) PushData(data interface{}) bool {
 	return m.dataBuffer.Push(data)
@@ -1313,6 +1623,19 @@ func (m *realtimeInstanceManagerImpl) PushData(data interface{}) bool {
 // GetDataBuffer 获取数据缓冲区（供测试使用）
 func (m *realtimeInstanceManagerImpl) GetDataBuffer() *DataBuffer {
 	return m.dataBuffer
+}
+
+// SetSubscriberFilter 运行时更新指定订阅者的过滤字段名与值列表；field 为空则用 "code"，values 为 nil/空表示全量
+func (m *realtimeInstanceManagerImpl) SetSubscriberFilter(ctx context.Context, subscriberName string, field string, values []string) error {
+	if m.subscribers == nil {
+		return fmt.Errorf("broadcast not enabled, no subscribers")
+	}
+	sub, ok := m.subscribers[subscriberName]
+	if !ok {
+		return fmt.Errorf("subscriber %q not found", subscriberName)
+	}
+	sub.SetFilter(field, values)
+	return nil
 }
 
 // ShutdownOnTerminateOnly 实现 ShutdownOnTerminateOnly 接口，Engine.Stop 将只发 Terminate 并轮询状态，不调用 Shutdown()

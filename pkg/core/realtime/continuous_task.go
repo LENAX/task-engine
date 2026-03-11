@@ -88,8 +88,15 @@ type ContinuousTaskConfig struct {
 	SubscribedEvents []EventType `json:"subscribed_events"` // 订阅的事件类型
 
 	// 处理函数
-	DataHandler  string `json:"data_handler"`  // 数据处理函数名
-	ErrorHandler string `json:"error_handler"` // 错误处理函数名
+	DataHandler           string `json:"data_handler"`            // 数据处理函数名
+	DataHandlerMaxRetries int    `json:"data_handler_max_retries"` // DataHandler 失败时最大重试次数，0=不重试
+	ErrorHandler          string `json:"error_handler"`           // 错误处理函数名
+
+	// 多订阅者广播：StreamProcessor 绑定到某订阅者时使用
+	SubscriberName         string        `json:"subscriber_name,omitempty"`          // 订阅者名，空表示使用全局 dataBuffer
+	BufferPolicy           *BufferPolicy `json:"buffer_policy,omitempty"`            // 该订阅者缓冲策略（仅首个绑定该名的任务生效）
+	SubscriberFilterField  string        `json:"subscriber_filter_field,omitempty"`  // 过滤字段名（如 code、symbol），空默认 "code"
+	SubscriberFilterCodes  []string      `json:"subscriber_filter_codes,omitempty"`  // 允许的字段值列表（空表示全量）
 
 	// 自定义参数
 	Params map[string]interface{} `json:"params"`

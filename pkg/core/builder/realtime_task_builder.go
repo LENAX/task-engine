@@ -145,6 +145,18 @@ func (b *RealtimeTaskBuilder) WithDataHandler(handlerName string) *RealtimeTaskB
 	return b
 }
 
+// WithDataHandlerMaxRetries 设置 DataHandler 失败时最大重试次数，0 表示不重试（失败即丢弃）
+func (b *RealtimeTaskBuilder) WithDataHandlerMaxRetries(maxRetries int) *RealtimeTaskBuilder {
+	if b.continuousConfig == nil {
+		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeDataCollector)
+	}
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	b.continuousConfig.DataHandlerMaxRetries = maxRetries
+	return b
+}
+
 // WithErrorHandler 设置错误处理函数名
 func (b *RealtimeTaskBuilder) WithErrorHandler(handlerName string) *RealtimeTaskBuilder {
 	if b.continuousConfig == nil {
@@ -180,6 +192,54 @@ func (b *RealtimeTaskBuilder) SubscribeEventWithFilter(eventType realtime.EventT
 		HandlerName: handlerName,
 		Filter:      filter,
 	})
+	return b
+}
+
+// WithSubscriberName 设置订阅者名（多订阅者广播时，该 StreamProcessor 绑定到此订阅者）
+func (b *RealtimeTaskBuilder) WithSubscriberName(name string) *RealtimeTaskBuilder {
+	if b.continuousConfig == nil {
+		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeStreamProcessor)
+	}
+	b.continuousConfig.SubscriberName = name
+	return b
+}
+
+// WithSubscriberFilter 设置订阅者过滤：按 data[field] 过滤，仅接收值在 values 内的数据；field 为空用 "code"，values 为空表示全量
+func (b *RealtimeTaskBuilder) WithSubscriberFilter(field string, values []string) *RealtimeTaskBuilder {
+	if b.continuousConfig == nil {
+		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeStreamProcessor)
+	}
+	b.continuousConfig.SubscriberFilterField = field
+	b.continuousConfig.SubscriberFilterCodes = values
+	return b
+}
+
+// WithSubscriberFilterCodes 设置订阅者仅接收的代码列表（按 data.code 过滤，空表示全量），等价于 WithSubscriberFilter("code", codes)
+func (b *RealtimeTaskBuilder) WithSubscriberFilterCodes(codes []string) *RealtimeTaskBuilder {
+	return b.WithSubscriberFilter("code", codes)
+}
+
+// WithBufferPolicyBlocking 设置该订阅者缓冲策略为阻塞 + 容量（关键下游如 DB）
+func (b *RealtimeTaskBuilder) WithBufferPolicyBlocking(capacity int) *RealtimeTaskBuilder {
+	if b.continuousConfig == nil {
+		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeStreamProcessor)
+	}
+	b.continuousConfig.BufferPolicy = &realtime.BufferPolicy{
+		Mode:     realtime.BufferModeBlocking,
+		Capacity: capacity,
+	}
+	return b
+}
+
+// WithBufferPolicyNonBlockingDrop 设置该订阅者缓冲策略为非阻塞满则丢弃（如前端推送）
+func (b *RealtimeTaskBuilder) WithBufferPolicyNonBlockingDrop(capacity int) *RealtimeTaskBuilder {
+	if b.continuousConfig == nil {
+		b.continuousConfig = realtime.NewContinuousTaskConfig("", "", realtime.TaskTypeStreamProcessor)
+	}
+	b.continuousConfig.BufferPolicy = &realtime.BufferPolicy{
+		Mode:     realtime.BufferModeNonBlockingDrop,
+		Capacity: capacity,
+	}
 	return b
 }
 

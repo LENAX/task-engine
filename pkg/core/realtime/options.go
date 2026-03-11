@@ -34,8 +34,14 @@ type options struct {
 	defaultReconnectBackoff     ReconnectBackoffConfig
 
 	// 超时配置
-	shutdownTimeout time.Duration
+	shutdownTimeout  time.Duration
 	reconnectTimeout time.Duration
+
+	// 多订阅者广播与 WAL
+	broadcastEnabled bool
+	walEnabled       bool
+	walStore         WalStore
+	walPath          string // 未设置 walStore 时用此路径创建 Badger（如按 instanceID 分目录）
 }
 
 // defaultOptions 返回默认配置
@@ -138,6 +144,34 @@ func WithReconnectTimeout(timeout time.Duration) Option {
 		if timeout > 0 {
 			o.reconnectTimeout = timeout
 		}
+	}
+}
+
+// WithBroadcast 启用/禁用多订阅者广播
+func WithBroadcast(enabled bool) Option {
+	return func(o *options) {
+		o.broadcastEnabled = enabled
+	}
+}
+
+// WithWalEnabled 启用/禁用 WAL
+func WithWalEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.walEnabled = enabled
+	}
+}
+
+// WithWalStore 设置 WAL 存储（启用 WAL 时使用）
+func WithWalStore(store WalStore) Option {
+	return func(o *options) {
+		o.walStore = store
+	}
+}
+
+// WithWalPath 设置 WAL 存储路径（当未设置 WalStore 时，创建 Badger 使用）
+func WithWalPath(path string) Option {
+	return func(o *options) {
+		o.walPath = path
 	}
 }
 

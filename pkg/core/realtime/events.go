@@ -35,6 +35,9 @@ const (
 	// 背压事件
 	EventBackpressure         EventType = "backpressure.triggered" // 背压触发
 	EventBackpressureRelieved EventType = "backpressure.relieved"  // 背压解除
+
+	// WAL 事件
+	EventWalReplayed EventType = "wal.replayed" // WAL 回放完成
 )
 
 // RealtimeEvent 实时事件基础结构

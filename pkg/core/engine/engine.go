@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -1332,6 +1334,14 @@ func (e *Engine) createRealtimeInstanceManager(
 	}
 	if e.registry != nil {
 		opts = append(opts, realtime.WithFunctionRegistry(e.registry))
+	}
+	// 从 Workflow 参数读取广播与 WAL 开关（由 WorkflowBuilder.WithBroadcastEnabled/WithWalEnabled 写入）
+	if v, ok := wf.GetParam("broadcast_enabled"); ok && v == "true" {
+		opts = append(opts, realtime.WithBroadcast(true))
+	}
+	if v, ok := wf.GetParam("wal_enabled"); ok && v == "true" {
+		opts = append(opts, realtime.WithWalEnabled(true))
+		opts = append(opts, realtime.WithWalPath(filepath.Join(os.TempDir(), "task_engine_wal", instance.ID)))
 	}
 	return realtime.NewRealtimeInstanceManager(
 		instance,

@@ -11,9 +11,11 @@ import (
 
 // WorkflowBuilder Workflow构建器（对外导出）
 type WorkflowBuilder struct {
-	wf        *workflow.Workflow
-	tasks     []*task.Task                    // 临时存储Task列表，Build时处理
-	collectors map[string]realtime.DataCollector // 流式 Workflow 的 DataCollector 注册（name -> 实例），Build 时写入 Workflow
+	wf               *workflow.Workflow
+	tasks            []*task.Task                       // 临时存储Task列表，Build时处理
+	collectors       map[string]realtime.DataCollector   // 流式 Workflow 的 DataCollector 注册（name -> 实例），Build 时写入 Workflow
+	broadcastEnabled bool
+	walEnabled       bool
 }
 
 // NewWorkflowBuilder 创建构建器（对外导出）
@@ -68,6 +70,12 @@ func (b *WorkflowBuilder) WithRealtimeTask(rtTask *realtime.RealtimeTask) *Workf
 		rtTask.Task.SetParam("execution_mode", string(rtTask.ExecutionMode))
 		if rtTask.ContinuousConfig != nil {
 			rtTask.Task.SetParam("continuous_config", rtTask.ContinuousConfig)
+			if rtTask.ContinuousConfig.SubscriberName != "" {
+				rtTask.Task.SetParam("subscriber_name", rtTask.ContinuousConfig.SubscriberName)
+			}
+			if rtTask.ContinuousConfig.BufferPolicy != nil {
+				rtTask.Task.SetParam("buffer_policy", rtTask.ContinuousConfig.BufferPolicy)
+			}
 		}
 		if len(rtTask.EventSubscriptions) > 0 {
 			rtTask.Task.SetParam("event_subscriptions", rtTask.EventSubscriptions)
@@ -82,6 +90,18 @@ func (b *WorkflowBuilder) WithRealtimeTask(rtTask *realtime.RealtimeTask) *Workf
 // Engine 会根据此字段自动选择 RealtimeInstanceManager
 func (b *WorkflowBuilder) WithStreamingMode() *WorkflowBuilder {
 	b.wf.SetExecutionMode(workflow.ExecutionModeStreaming)
+	return b
+}
+
+// WithBroadcastEnabled 启用多订阅者广播（流式 Workflow 下生效）
+func (b *WorkflowBuilder) WithBroadcastEnabled(enabled bool) *WorkflowBuilder {
+	b.broadcastEnabled = enabled
+	return b
+}
+
+// WithWalEnabled 启用 WAL（进程内 at-least-once，需同时开启广播）
+func (b *WorkflowBuilder) WithWalEnabled(enabled bool) *WorkflowBuilder {
+	b.walEnabled = enabled
 	return b
 }
 
@@ -177,6 +197,18 @@ func (b *WorkflowBuilder) Build() (*workflow.Workflow, error) {
 			}
 		}
 		b.wf.SetCollectorRegistry(reg)
+	}
+
+	// 7. 广播与 WAL 开关写入 Workflow 参数，供 Engine 创建 RealtimeInstanceManager 时读取
+	if b.broadcastEnabled {
+		b.wf.SetParam("broadcast_enabled", "true")
+	} else {
+		b.wf.SetParam("broadcast_enabled", "false")
+	}
+	if b.walEnabled {
+		b.wf.SetParam("wal_enabled", "true")
+	} else {
+		b.wf.SetParam("wal_enabled", "false")
 	}
 
 	return b.wf, nil

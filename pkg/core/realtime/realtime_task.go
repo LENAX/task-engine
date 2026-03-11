@@ -159,6 +159,17 @@ func ExtractRealtimeTask(t interface{}) *RealtimeTask {
 				rtTask.ContinuousConfig = config
 			}
 		}
+		// 订阅者名与缓冲策略（用于广播模式）
+		if name, ok := params["subscriber_name"]; ok {
+			if s, ok := name.(string); ok && rtTask.ContinuousConfig != nil {
+				rtTask.ContinuousConfig.SubscriberName = s
+			}
+		}
+		if policy, ok := params["buffer_policy"]; ok {
+			if p, ok := policy.(*BufferPolicy); ok && rtTask.ContinuousConfig != nil {
+				rtTask.ContinuousConfig.BufferPolicy = p
+			}
+		}
 
 		return rtTask
 	}

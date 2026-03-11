@@ -88,3 +88,38 @@ func TestRealtimeTaskBuilder_WithTaskType_ScheduledPoller_SetsModePull(t *testin
 	assert.Equal(t, realtime.TaskTypeScheduledPoller, rt.ContinuousConfig.Type)
 	assert.Equal(t, realtime.CollectorModePull, rt.ContinuousConfig.Mode)
 }
+
+func TestRealtimeTaskBuilder_WithSubscriberFilter(t *testing.T) {
+	registry := task.NewFunctionRegistry(nil, nil)
+	ctx := context.Background()
+	registry.Register(ctx, "job1", func(ctx context.Context) error { return nil }, "job1")
+
+	rt, err := builder.NewRealtimeTaskBuilder("t1", "task1", registry).
+		WithContinuousMode().
+		WithTaskType(realtime.TaskTypeStreamProcessor).
+		WithSubscriberName("fe").
+		WithSubscriberFilter("symbol", []string{"AAPL", "MSFT"}).
+		WithJobFunction("job1", nil).
+		Build()
+	require.NoError(t, err)
+	require.NotNil(t, rt.ContinuousConfig)
+	assert.Equal(t, "symbol", rt.ContinuousConfig.SubscriberFilterField)
+	assert.Equal(t, []string{"AAPL", "MSFT"}, rt.ContinuousConfig.SubscriberFilterCodes)
+}
+
+func TestRealtimeTaskBuilder_WithSubscriberFilterCodes_DefaultCode(t *testing.T) {
+	registry := task.NewFunctionRegistry(nil, nil)
+	ctx := context.Background()
+	registry.Register(ctx, "job1", func(ctx context.Context) error { return nil }, "job1")
+
+	rt, err := builder.NewRealtimeTaskBuilder("t1", "task1", registry).
+		WithContinuousMode().
+		WithSubscriberName("fe").
+		WithSubscriberFilterCodes([]string{"600863.SH", "601169.SH"}).
+		WithJobFunction("job1", nil).
+		Build()
+	require.NoError(t, err)
+	require.NotNil(t, rt.ContinuousConfig)
+	assert.Equal(t, "code", rt.ContinuousConfig.SubscriberFilterField)
+	assert.Equal(t, []string{"600863.SH", "601169.SH"}, rt.ContinuousConfig.SubscriberFilterCodes)
+}
