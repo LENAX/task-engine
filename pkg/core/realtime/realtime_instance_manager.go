@@ -636,7 +636,14 @@ func (m *realtimeInstanceManagerImpl) runStreamProcessor(ct *ContinuousTask) err
 	if ct.Config.DataHandler != "" && m.functionRegistry != nil {
 		if fn := m.functionRegistry.GetByName(ct.Config.DataHandler); fn != nil {
 			params := map[string]interface{}{"data": payloadData, "sequence_id": sequenceID}
-			taskCtx := task.NewTaskContext(m.ctx, ct.Config.ID, ct.Config.Name, m.wf.GetID(), m.instance.ID, params)
+			taskContextBase := m.ctx
+			// 对齐普通 executor：若注册表支持依赖注入，则先将依赖注入到 context
+			if depRegistry, ok := m.functionRegistry.(interface {
+				WithDependencies(context.Context) context.Context
+			}); ok {
+				taskContextBase = depRegistry.WithDependencies(taskContextBase)
+			}
+			taskCtx := task.NewTaskContext(taskContextBase, ct.Config.ID, ct.Config.Name, m.wf.GetID(), m.instance.ID, params)
 			stateCh := fn(taskCtx)
 			state := <-stateCh
 			if state.Status == "Failed" && state.Error != nil {

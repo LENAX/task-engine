@@ -169,6 +169,17 @@ streamTask, err := builder.NewRealtimeTaskBuilder("quote_stream_processor", "行
 
 - **TaskTypeStreamProcessor**：在 `runStreamProcessor` 中从 `DataBuffer.Pop` 取数据；若配置了 DataHandler 且 Engine 传入了 FunctionRegistry，会构造 `params["data"] = 单条数据` 并调用该 Job 函数，再发布 `EventDataProcessed`。
 
+**DataHandler 失败重试（可选）**：若希望写入/处理失败时由框架自动重试，可链式调用 **WithDataHandlerMaxRetries(n)**（n 为最大重试次数）。失败时当前消息会重新入队，直到成功或达到 n 次重试；超限或重新入队时缓冲区已满则丢弃并计入错误。不设置或设为 0 时行为与旧版一致（失败即丢弃该条）。
+
+```go
+streamTask, err := builder.NewRealtimeTaskBuilder("quote_stream_processor", "行情流处理", registry).
+    WithContinuousMode().
+    WithTaskType(realtime.TaskTypeStreamProcessor).
+    WithJobFunction("db_batch_write_job", nil).
+    WithDataHandlerMaxRetries(3).   // 失败时最多重试 3 次
+    Build()
+```
+
 ### 3.6 事件订阅（可选）
 
 若要对“数据到达”“背压”“连接断开”等做监控或联动，可在 Builder 上订阅事件：
@@ -467,6 +478,7 @@ wf, _ := builder.NewWorkflowBuilder("e2e_stk_push_wf", "e2e").
 | BackpressureThreshold      | 背压阈值 (0~1)                                 | 0.8                         |
 | BackpressureAction         | drop / block / throttle                    | throttle 较稳妥                |
 | DataHandler / ErrorHandler | 处理函数名                                      | 在 Registry 中注册              |
+| DataHandlerMaxRetries      | DataHandler 失败时最大重试次数，0=不重试（失败即丢弃）           | 落库等关键路径可设 3～5              |
 
 
 ### 4.2 RealtimeInstanceManager 选项（创建实例时）
@@ -605,7 +617,16 @@ wf, _ := builder.NewWorkflowBuilder("realtime_market", "行情").
 - 连接断开时发布 **EventDisconnected**，并可选 **EventError**（Recoverable=true）。
 - 实例管理器根据 **ReconnectEnabled** 与 **handleReconnect** 做退避重连；采集器在重连成功后继续在 `Run` 内建连并 `publish` 即可。
 
-### 8.4 让 Workflow 持续运行（24x7 模式）
+### 8.4 DataHandler 失败重试
+
+流处理任务在调用 DataHandler（如落库、写外部服务）时，若 Job 返回 **Failed**，默认行为是**丢弃该条数据**并计入错误，不重新入队。若需在进程内自动重试，可配置 **DataHandlerMaxRetries**（通过 Builder 的 **WithDataHandlerMaxRetries(n)**）：
+
+- **n > 0**：单条消息最多被处理 **1 + n 次**（首次执行 + 最多 n 次重试）。每次失败后，该条会以带重试计数的内部结构重新推回当前 StreamProcessor 的 Buffer 尾部；再次被 Pop 时会重新执行 DataHandler。达到 n 次重试后仍失败，或重新入队时 Buffer 已满，则丢弃并打日志。
+- **n = 0**（默认）：不重试，与旧版一致。
+
+适用场景：下游短暂不可用（如 DB 连接池满、限流）时，通过有限次重试提高送达率。若已开启 WAL，未确认的记录在**实例重启**后也会通过回放再次投递，可作为“重启级”的补充重试。
+
+### 8.5 让 Workflow 持续运行（24x7 模式）
 
 很多上层业务希望把行情 / 新闻 Workflow 当作“常驻服务”来用，例如：
 

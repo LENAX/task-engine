@@ -69,6 +69,10 @@ func (c *finitePublishCollector) Run(ctx context.Context, config *realtime.Conti
 	return nil
 }
 
+type realtimeDependencyProbe struct {
+	called int32
+}
+
 // TestRealtimeCollector_E2E_StreamingWorkflow 完整链路：Engine 注册有限次 publish 采集器 → 提交 Streaming Workflow → 断言 Run 被调用与数据/指标
 func TestRealtimeCollector_E2E_StreamingWorkflow(t *testing.T) {
 	t.Cleanup(func() { t.Logf("[E2E] 入库数据量: N/A (本测试无 DB 写入)") })
@@ -142,6 +146,90 @@ task-engine:
 	published := atomic.LoadInt32(&collector.published)
 	assert.GreaterOrEqual(t, runCount, int32(1), "collector Run should have been called")
 	assert.GreaterOrEqual(t, published, int32(1), "at least one event should have been published")
+}
+
+// TestRealtimeCollector_E2E_StreamProcessorInjectsDependencies 回归测试：
+// 验证 realtime 路径调用 DataHandler 时，TaskContext.Context() 中包含 registry.WithDependencies 注入的依赖
+func TestRealtimeCollector_E2E_StreamProcessorInjectsDependencies(t *testing.T) {
+	tmpDir := t.TempDir()
+	frameworkConfigPath := filepath.Join(tmpDir, "framework.yaml")
+	dsn := filepath.Join(tmpDir, "e2e_di.db")
+	frameworkConfig := `
+task-engine:
+  general:
+    instance_name: "e2e-engine-di"
+    log_level: "info"
+    env: "test"
+  storage:
+    database:
+      type: "sqlite"
+      dsn: "` + dsn + `"
+      max_open_conns: 5
+  execution:
+    default_task_timeout: "60s"
+    worker_concurrency: 2
+`
+	require.NoError(t, os.WriteFile(frameworkConfigPath, []byte(frameworkConfig), 0644))
+
+	collector := &finitePublishCollector{maxPublish: 3}
+	eng, err := engine.NewEngineBuilder(frameworkConfigPath).Build()
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, eng.Start(ctx))
+	defer eng.Stop()
+
+	registry := eng.GetRegistry()
+	probe := &realtimeDependencyProbe{}
+	require.NoError(t, registry.RegisterDependency(probe))
+
+	dataHandler := func(tc *task.TaskContext) error {
+		dep, ok := task.GetDependencyFromContext[*realtimeDependencyProbe](tc.Context())
+		if !ok || dep == nil {
+			return fmt.Errorf("未注入 realtimeDependencyProbe")
+		}
+		atomic.AddInt32(&dep.called, 1)
+		return nil
+	}
+
+	_, err = registry.Register(ctx, "di_data_handler", dataHandler, "验证 realtime DataHandler 依赖注入")
+	require.NoError(t, err)
+	_, err = registry.Register(ctx, "dummy_job", func(ctx context.Context) error { return nil }, "dummy")
+	require.NoError(t, err)
+
+	collectorTask, err := builder.NewRealtimeTaskBuilder("e2e_di_collector", "e2e-di", registry).
+		WithContinuousMode().
+		WithTaskType(realtime.TaskTypeDataCollector).
+		WithCollector("e2e_di_finite").
+		WithJobFunction("dummy_job", nil).
+		Build()
+	require.NoError(t, err)
+
+	streamTask, err := builder.NewRealtimeTaskBuilder("e2e_di_stream_processor", "流处理-依赖注入", registry).
+		WithContinuousMode().
+		WithTaskType(realtime.TaskTypeStreamProcessor).
+		WithJobFunction("di_data_handler", nil).
+		Build()
+	require.NoError(t, err)
+
+	wf, err := builder.NewWorkflowBuilder("e2e_realtime_di_wf", "e2e-di").
+		WithStreamingMode().
+		WithDataCollector("e2e_di_finite", collector).
+		WithRealtimeTask(collectorTask).
+		WithRealtimeTask(streamTask).
+		Build()
+	require.NoError(t, err)
+
+	ctrl, err := eng.SubmitWorkflow(ctx, wf)
+	require.NoError(t, err)
+	require.NotEmpty(t, ctrl.InstanceID())
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && atomic.LoadInt32(&probe.called) < 1 {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	assert.GreaterOrEqual(t, atomic.LoadInt32(&probe.called), int32(1), "DataHandler 应能读取到已注入依赖并执行")
 }
 
 // stkMinsPullResponse 拉取接口返回结构
