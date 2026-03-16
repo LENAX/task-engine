@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -1203,8 +1204,8 @@ func (e *Engine) TerminateWorkflowInstance(ctx context.Context, instanceID strin
 		currentStatus = instance.Status
 	}
 
-	// 检查状态是否允许终止
-	if currentStatus == "Terminated" || currentStatus == "Success" || currentStatus == "Failed" {
+	// 检查状态是否允许终止（状态大小写不敏感）
+	if strings.EqualFold(currentStatus, "Terminated") || strings.EqualFold(currentStatus, "Success") || strings.EqualFold(currentStatus, "Failed") {
 		return fmt.Errorf("WorkflowInstance %s 当前状态为 %s，无法终止", instanceID, currentStatus)
 	}
 

@@ -646,7 +646,7 @@ func (m *realtimeInstanceManagerImpl) runStreamProcessor(ct *ContinuousTask) err
 			taskCtx := task.NewTaskContext(taskContextBase, ct.Config.ID, ct.Config.Name, m.wf.GetID(), m.instance.ID, params)
 			stateCh := fn(taskCtx)
 			state := <-stateCh
-			if state.Status == "Failed" && state.Error != nil {
+			if task.IsFailedStatus(state.Status) && state.Error != nil {
 				maxRetries := ct.Config.DataHandlerMaxRetries
 				if maxRetries > 0 && retryCount < maxRetries {
 					item := &bufferItemWithRetry{Data: innerData, RetryCount: retryCount + 1}

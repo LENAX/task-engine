@@ -27,14 +27,13 @@ func ExecuteTaskHandler(registry FunctionRegistry, task workflow.Task, status st
 		return fmt.Errorf("Task实例为空")
 	}
 
-	// 检查是否有配置该状态的Handler（使用接口方法）
+	// 检查是否有配置该状态的Handler（使用接口方法）；状态查找对大小写不敏感
 	statusHandlers := task.GetStatusHandlers()
 	if len(statusHandlers) == 0 {
 		return nil // 没有配置Handler，直接返回
 	}
-
-	// 获取该状态对应的Handler ID列表
-	handlerIDs, exists := statusHandlers[status]
+	normStatus := NormalizeTaskStatus(status)
+	handlerIDs, exists := statusHandlers[normStatus]
 	if !exists || len(handlerIDs) == 0 {
 		return nil // 该状态没有配置Handler，直接返回
 	}
@@ -64,8 +63,8 @@ func ExecuteTaskHandler(registry FunctionRegistry, task workflow.Task, status st
 			params[k] = v
 		}
 
-		// 根据状态添加特定数据
-		switch status {
+		// 根据状态添加特定数据（使用规范化状态）
+		switch normStatus {
 		case TaskStatusSuccess:
 			if resultData != nil {
 				params["result"] = resultData
@@ -78,7 +77,7 @@ func ExecuteTaskHandler(registry FunctionRegistry, task workflow.Task, status st
 			}
 		}
 
-		// 添加状态信息
+		// 添加状态信息（保留原始传入的 status，便于 handler 内使用）
 		params["_status"] = status
 		params["_previous_status"] = task.GetStatus()
 
@@ -119,14 +118,13 @@ func ExecuteTaskHandlerSync(registry FunctionRegistry, task workflow.Task, statu
 		return fmt.Errorf("Task实例为空")
 	}
 
-	// 检查是否有配置该状态的Handler（使用接口方法）
+	// 检查是否有配置该状态的Handler（使用接口方法）；状态查找对大小写不敏感
 	statusHandlers := task.GetStatusHandlers()
 	if len(statusHandlers) == 0 {
 		return nil
 	}
-
-	// 获取该状态对应的Handler ID列表
-	handlerIDs, exists := statusHandlers[status]
+	normStatus := NormalizeTaskStatus(status)
+	handlerIDs, exists := statusHandlers[normStatus]
 	if !exists || len(handlerIDs) == 0 {
 		return nil
 	}
@@ -140,8 +138,8 @@ func ExecuteTaskHandlerSync(registry FunctionRegistry, task workflow.Task, statu
 		params[k] = v
 	}
 
-	// 根据状态添加特定数据
-	switch status {
+	// 根据状态添加特定数据（使用规范化状态）
+	switch normStatus {
 	case TaskStatusSuccess:
 		if resultData != nil {
 			params["result"] = resultData
@@ -214,13 +212,12 @@ func ExecuteTaskHandlerWithContext(
 		return fmt.Errorf("Task实例为空")
 	}
 
-	// 检查是否有配置该状态的Handler
+	// 检查是否有配置该状态的Handler；状态查找对大小写不敏感
 	if len(task.StatusHandlers) == 0 {
 		return nil
 	}
-
-	// 获取该状态对应的Handler ID列表
-	handlerIDs, exists := task.StatusHandlers[status]
+	normStatus := NormalizeTaskStatus(status)
+	handlerIDs, exists := task.StatusHandlers[normStatus]
 	if !exists || len(handlerIDs) == 0 {
 		return nil
 	}
@@ -237,8 +234,8 @@ func ExecuteTaskHandlerWithContext(
 		params[k] = v
 	}
 
-	// 根据状态添加特定数据
-	switch status {
+	// 根据状态添加特定数据（使用规范化状态）
+	switch normStatus {
 	case TaskStatusSuccess:
 		if resultData != nil {
 			params["result"] = resultData

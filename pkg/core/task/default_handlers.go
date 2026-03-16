@@ -141,7 +141,7 @@ func DefaultAggregateSubTaskResults(ctx *TaskContext) {
 	var totalData interface{}
 
 	for _, result := range results {
-		if result.Status == TaskStatusSuccess {
+		if IsSuccessStatus(result.Status) {
 			successCount++
 			// 尝试聚合数据量
 			if result.Data != nil {

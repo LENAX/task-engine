@@ -22,6 +22,36 @@ const (
 	TaskStatusPaused    = "PAUSED"
 )
 
+// NormalizeTaskStatus 将状态字符串规范化为常量形式，便于 map 查找与比较；对大小写不敏感。
+// 返回 "SUCCESS"|"FAILED"|"TIMEOUT" 或原字符串（未知状态）。
+func NormalizeTaskStatus(s string) string {
+	switch {
+	case strings.EqualFold(s, "success"):
+		return TaskStatusSuccess
+	case strings.EqualFold(s, "failed"):
+		return TaskStatusFailed
+	case strings.EqualFold(s, "timeout"):
+		return TaskStatusTimeout
+	default:
+		return s
+	}
+}
+
+// IsSuccessStatus 判断是否为成功状态（大小写不敏感）
+func IsSuccessStatus(s string) bool {
+	return strings.EqualFold(s, "success")
+}
+
+// IsFailedStatus 判断是否为失败状态（大小写不敏感）
+func IsFailedStatus(s string) bool {
+	return strings.EqualFold(s, "failed")
+}
+
+// IsTimeoutStatus 判断是否为超时状态（大小写不敏感）
+func IsTimeoutStatus(s string) bool {
+	return strings.EqualFold(s, "timeout")
+}
+
 type Task struct {
 	ID                   string
 	Name                 string

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -485,7 +486,7 @@ func (e *executorImpl) executeTask(pendingTask *PendingTask, domainPool *domainP
 			Duration: duration,
 		}
 
-		if state.Status == "Success" {
+		if task.IsSuccessStatus(state.Status) {
 			t.SetStatus("SUCCESS")
 			log.Printf("✅ [函数执行成功] TaskID=%s, TaskName=%s, JobFuncName=%s, 耗时=%dms, 结果=%s",
 				t.GetID(), t.GetName(), t.GetJobFuncName(), duration, truncateLogValue(state.Data))
@@ -546,9 +547,9 @@ func (e *executorImpl) sendStatusEvent(pendingTask *PendingTask, result *TaskRes
 		return
 	}
 
-	// 确定状态字符串
+	// 确定状态字符串（大小写不敏感）
 	status := result.Status
-	if status == "TimeoutFailed" {
+	if task.IsTimeoutStatus(status) || strings.EqualFold(status, "TimeoutFailed") {
 		status = "Timeout"
 	}
 

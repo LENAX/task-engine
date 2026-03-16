@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -637,9 +638,9 @@ func (m *WorkflowInstanceManager) checkDependencyFailed(t workflow.Task) string 
 			continue
 		}
 
-		// 检查依赖任务是否失败
+		// 检查依赖任务是否失败（状态大小写不敏感）
 		if depTask, exists := m.workflow.GetTasks()[depTaskID]; exists {
-			if depTask.GetStatus() == task.TaskStatusFailed {
+			if task.IsFailedStatus(depTask.GetStatus()) {
 				return depName
 			}
 		}
@@ -1012,8 +1013,8 @@ func (m *WorkflowInstanceManager) recoverPendingTasks() {
 			// 添加到就绪任务集合
 			m.readyTasksSet.Store(taskID, t)
 			recoveredCount++
-			// 如果任务状态是Failed，重置为Pending以便重试
-			if ti.Status == "Failed" {
+			// 如果任务状态是Failed，重置为Pending以便重试（状态大小写不敏感）
+			if task.IsFailedStatus(ti.Status) {
 				_ = m.taskRepo.UpdateStatus(ctx, taskID, "Pending")
 				log.Printf("✅ WorkflowInstance %s: 恢复Failed任务 %s (%s) 到就绪任务集合并重置为Pending", m.instance.ID, taskID, ti.Name)
 			} else {
@@ -1087,14 +1088,14 @@ func (m *WorkflowInstanceManager) saveAllTaskStatuses(ctx context.Context) {
 			}
 		}
 
-		// 如果状态没有变化，跳过
-		if existingTask.Status == currentStatus {
+		// 如果状态没有变化，跳过（大小写不敏感）
+		if strings.EqualFold(existingTask.Status, currentStatus) {
 			continue
 		}
 
 		// 更新任务状态
 		var updateErr error
-		if currentStatus == "Failed" {
+		if task.IsFailedStatus(currentStatus) {
 			// 如果是失败状态，尝试获取错误信息
 			errorKey := fmt.Sprintf("%s:error", taskID)
 			errorMsg := ""

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -695,12 +696,12 @@ func (m *WorkflowInstanceManagerV2) processBatch(batch []TaskStatusEvent) {
 	}
 }
 
-// getStatsType 获取统计类型
+// getStatsType 获取统计类型（状态大小写不敏感）
 func getStatsType(status string) string {
-	switch status {
-	case "Success":
+	switch {
+	case task.IsSuccessStatus(status):
 		return "task_completed"
-	case "Failed", "Timeout":
+	case task.IsFailedStatus(status), task.IsTimeoutStatus(status):
 		return "task_failed"
 	default:
 		return ""
@@ -764,15 +765,15 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 			m.tryAdvanceLevel()
 
 		case event := <-m.queueUpdateChan:
-			// 根据事件类型处理
-			switch event.Status {
-			case "Success", "Failed", "Timeout":
-				// 处理任务完成事件
+			// 根据事件类型处理（状态大小写不敏感）
+			norm := task.NormalizeTaskStatus(event.Status)
+			switch norm {
+			case task.TaskStatusSuccess, task.TaskStatusFailed, task.TaskStatusTimeout:
 				m.handleTaskCompletion(event)
-				// 注意：任务在初始化时已经按层级添加到队列中，不需要在这里再添加
 			case "ready":
-				// 处理就绪任务事件（保留，但可能不需要）
-				// 注意：任务在初始化时已经按层级添加到队列中，不需要在这里再添加
+				// 就绪任务事件：任务已在初始化时按层级加入队列
+			default:
+				// 其他状态忽略
 			}
 
 			// 先添加新任务，再检查层级推进
@@ -830,11 +831,11 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 					hasFailedTask := false
 					allTasks := m.workflow.GetTasks()
 					log.Printf("🔍 [Workflow完成检查] 开始检查失败任务，总任务数: %d", len(allTasks))
-					for taskID, task := range allTasks {
-						taskStatus := task.GetStatus()
-						taskName := task.GetName()
+					for taskID, wfTask := range allTasks {
+						taskStatus := wfTask.GetStatus()
+						taskName := wfTask.GetName()
 						log.Printf("🔍 [Workflow完成检查] 检查任务: TaskID=%s, TaskName=%s, Status=%s", taskID, taskName, taskStatus)
-						if taskStatus == "FAILED" {
+						if task.IsFailedStatus(taskStatus) {
 							log.Printf("🔍 [Workflow完成检查] ✅ 发现失败任务: TaskID=%s, TaskName=%s, Status=%s", taskID, taskName, taskStatus)
 							hasFailedTask = true
 							break
@@ -850,16 +851,16 @@ func (m *WorkflowInstanceManagerV2) queueManagerGoroutine() {
 					// 也检查运行时任务（动态添加的子任务）
 					if !hasFailedTask {
 						m.runtimeTasks.Range(func(key, value interface{}) bool {
-							if task, ok := value.(workflow.Task); ok {
-								if task.GetStatus() == "FAILED" {
-									log.Printf("🔍 [Workflow完成检查] 发现失败运行时任务: TaskID=%s, TaskName=%s", task.GetID(), task.GetName())
+							if wfTask, ok := value.(workflow.Task); ok {
+								if task.IsFailedStatus(wfTask.GetStatus()) {
+									log.Printf("🔍 [Workflow完成检查] 发现失败运行时任务: TaskID=%s, TaskName=%s", wfTask.GetID(), wfTask.GetName())
 									hasFailedTask = true
 									return false // 停止遍历
 								}
 								// 检查 contextData 中的错误信息
-								errorKey := fmt.Sprintf("%s:error", task.GetID())
+								errorKey := fmt.Sprintf("%s:error", wfTask.GetID())
 								if _, hasError := m.contextData.Load(errorKey); hasError {
-									log.Printf("🔍 [Workflow完成检查] 发现失败运行时任务（通过errorKey）: TaskID=%s, TaskName=%s", task.GetID(), task.GetName())
+									log.Printf("🔍 [Workflow完成检查] 发现失败运行时任务（通过errorKey）: TaskID=%s, TaskName=%s", wfTask.GetID(), wfTask.GetName())
 									hasFailedTask = true
 									return false // 停止遍历
 								}
@@ -1047,14 +1048,14 @@ func (m *WorkflowInstanceManagerV2) handleTaskCompletion(event TaskStatusEvent) 
 		}
 	}
 
-	// 处理任务失败重试逻辑
-	if event.Status == "Failed" {
+	// 处理任务失败重试逻辑（状态大小写不敏感）
+	if task.IsFailedStatus(event.Status) {
 		m.handleTaskFailure(event)
 		return
 	}
 
 	// 处理任务成功逻辑
-	if event.Status == "Success" {
+	if task.IsSuccessStatus(event.Status) {
 		m.handleTaskSuccess(event)
 	}
 }
@@ -1435,11 +1436,12 @@ func (m *WorkflowInstanceManagerV2) drainQueueUpdateChan() {
 	for {
 		select {
 		case event := <-m.queueUpdateChan:
-			switch event.Status {
-			case "Success", "Failed", "Timeout":
+			norm := task.NormalizeTaskStatus(event.Status)
+			switch norm {
+			case task.TaskStatusSuccess, task.TaskStatusFailed, task.TaskStatusTimeout:
 				m.handleTaskCompletion(event)
 			case "ready":
-				// 注意：任务在初始化时已经按层级添加到队列中，不需要在这里再添加
+				// 就绪任务事件
 			}
 		case <-timeout:
 			log.Printf("WorkflowInstance %s: 处理剩余事件超时", m.instance.ID)
@@ -1587,7 +1589,7 @@ func (m *WorkflowInstanceManagerV2) checkDependencyFailed(t workflow.Task) strin
 			depTask = runtimeTask.(workflow.Task)
 		}
 
-		if depTask != nil && depTask.GetStatus() == "FAILED" {
+		if depTask != nil && task.IsFailedStatus(depTask.GetStatus()) {
 			return depName
 		}
 
@@ -2471,7 +2473,7 @@ func (m *WorkflowInstanceManagerV2) handleAtomicAddSubTasks(event AtomicAddSubTa
 		// 对于模板任务，检查状态来判断是否已完成（Job Function 正在执行中的竞态情况）
 		if parentTask.IsTemplate() {
 			parentStatus := parentTask.GetStatus()
-			if parentStatus == "SUCCESS" || parentStatus == "Success" {
+			if task.IsSuccessStatus(parentStatus) {
 				// 模板任务状态是 SUCCESS，依赖已满足（但不标记为已处理，让 createTaskCompleteHandler 处理）
 				// allDepsProcessed = true (保持为 true)
 			} else {
@@ -3078,12 +3080,12 @@ func (m *WorkflowInstanceManagerV2) saveAllTaskStatuses(ctx context.Context) {
 			}
 		}
 
-		if existingTask.Status == currentStatus {
+		if strings.EqualFold(existingTask.Status, currentStatus) {
 			continue
 		}
 
 		var updateErr error
-		if currentStatus == "Failed" {
+		if task.IsFailedStatus(currentStatus) {
 			errorKey := fmt.Sprintf("%s:error", taskID)
 			errorMsg := ""
 			if errorValue, hasError := m.contextData.Load(errorKey); hasError {
@@ -3306,7 +3308,7 @@ func (m *WorkflowInstanceManagerV2) aggregateSubTaskResults(parentTaskID string,
 				"result":    result.Result,
 				"error":     result.Error,
 			})
-			if result.Status != "Success" {
+			if !task.IsSuccessStatus(result.Status) {
 				allSucceeded = false
 			}
 		}

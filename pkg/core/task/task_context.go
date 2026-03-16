@@ -381,9 +381,14 @@ type SubTaskResult struct {
 	Error    string                 // 错误信息（仅失败时有值）
 }
 
-// IsSuccess 判断子任务是否成功
+// IsSuccess 判断子任务是否成功（大小写不敏感，支持 "Success"/"SUCCESS"/"success" 等）
 func (r *SubTaskResult) IsSuccess() bool {
-	return r.Status == "Success"
+	return IsSuccessStatus(r.Status)
+}
+
+// IsFailed 判断子任务是否失败（大小写不敏感，支持 "Failed"/"FAILED"/"failed" 等）
+func (r *SubTaskResult) IsFailed() bool {
+	return IsFailedStatus(r.Status)
 }
 
 // GetResultValue 从子任务结果中获取指定字段

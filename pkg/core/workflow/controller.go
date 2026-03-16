@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -166,9 +167,9 @@ func (c *workflowController) Wait(timeout ...time.Duration) error {
 	}
 }
 
-// isFinalStatus 检查状态是否为最终状态（完成/失败/终止）
+// isFinalStatus 检查状态是否为最终状态（完成/失败/终止）；状态大小写不敏感
 func isFinalStatus(status string) bool {
-	return status == "Success" || status == "Failed" || status == "Terminated"
+	return strings.EqualFold(status, "Success") || strings.EqualFold(status, "Failed") || strings.EqualFold(status, "Terminated")
 }
 
 // GetStatus 查询WorkflowInstance状态（对外导出）
